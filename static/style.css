@@ -1387,6 +1387,10 @@ details.block-unknown-tag > summary { color: #ffd43b; }
 .md h3 { font-size: 14.5px; }
 .md ul { margin: 6px 0; padding-left: 22px; }
 .md ol { margin: 6px 0; padding-left: 30px; }
+.md li > ul,
+.md li > ol {
+  margin: 3px 0;
+}
 .trunc-badge {
   font-weight: 800;
   background: rgba(255, 212, 59, 0.28);
@@ -1399,6 +1403,16 @@ details.block-unknown-tag > summary { color: #ffd43b; }
 .step.type-CHECKPOINT .md ol {
   list-style: none;
   padding-left: 4px;
+}
+.step.type-CHECKPOINT .md li > ul {
+  padding-left: 22px;
+}
+.step.type-CHECKPOINT .md ol > li > ul {
+  padding-left: 50px;
+}
+.step.type-CHECKPOINT .md li > ol {
+  padding-left: 22px;
+  margin: 4px 0;
 }
 .step.type-CHECKPOINT .md ol > li {
   margin: 6px 0;
