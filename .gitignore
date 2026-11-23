@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+.commit_msg.txt
+.DS_Store
+Thumbs.db
