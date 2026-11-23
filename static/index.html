@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Antigravity Transcript Viewer</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M12 4h28l14 14v42H12z' fill='%23ffe01b' stroke='%235c4300' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M40 4v14h14' fill='%23ffb700' stroke='%235c4300' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M20 28h24M20 38h24M20 48h16' stroke='%232b1f00' stroke-width='4.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <span>Transcripts</span>
+          <span class="count-badge" id="transcriptCount">0</span>
+        </div>
+        <div class="sidebar-btns">
+          <button class="icon-btn" id="refreshListBtn" title="Обновить список">↻</button>
+          <button class="icon-btn" id="collapseSidebarBtn" title="Свернуть панель проектов">«</button>
+        </div>
+      </div>
+
+      <div class="sidebar-controls">
+        <input type="search" id="sidebarSearch" class="input" placeholder="Поиск по названию, проекту, ID…">
+        <select id="projectFilter" class="select">
+          <option value="">Все проекты</option>
+        </select>
+      </div>
+
+      <div class="transcript-list" id="transcriptList">
+        <div class="empty-hint">Загрузка списка…</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar" id="topbar">
+        <div class="topbar-left-wrap">
+          <button class="icon-btn hidden" id="expandSidebarBtn" title="Показать панель проектов">☰</button>
+          <div class="topbar-left">
+            <div class="conv-title" id="convTitle">Выберите транскрипт слева</div>
+            <div class="conv-meta" id="convMeta"></div>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <button class="btn-sm theme-btn" id="themeToggle" title="Переключить тему (День / Ночь)">☀️ День</button>
+          <div class="live-pill" id="livePill" title="Статус SSE-подключения">
+            <span class="live-dot"></span>
+            <span id="liveText">Ожидание</span>
+          </div>
+          <label class="toggle-btn" title="Автоматически прокручивать вниз при новых шагах">
+            <input type="checkbox" id="followToggle" checked>
+            <span>Follow</span>
+          </label>
+          <button class="icon-btn" id="collapseHeaderBtn" title="Свернуть верхнюю панель и кнопки">▲</button>
+        </div>
+      </header>
+
+      <div class="floating-top-bar hidden" id="floatingTopBar">
+        <button class="btn-sm floating-pill hidden" id="floatingSidebarBtn" title="Показать панель проектов">☰ Проекты</button>
+        <button class="btn-sm floating-pill" id="expandHeaderBtn" title="Развернуть верхнюю панель">▼ Панель</button>
+      </div>
+
+      <div class="toolbar" id="toolbar">
+        <div class="filter-group" role="group">
+          <button class="filter-btn active" data-filter="all" title="Показать все шаги лога: переписку, tool_calls, ответы инструментов GENERIC и системные события">Все</button>
+          <button class="filter-btn" data-filter="dialog" title="Только чистый диалог: запросы пользователя, финальные ответы ИИ, чекпоинты и ошибки">Диалог</button>
+          <button class="filter-btn" data-filter="errors" title="Только шаги с ошибками (ERROR_MESSAGE, status=ERROR и команды с ненулевым кодом)">Ошибки</button>
+        </div>
+
+        <label class="toggle-btn" title="Показать только команды и шаги, завершившиеся ошибками (ненулевой exit-код или ERROR)">
+          <input type="checkbox" id="onlyCmdErrorsToggle">
+          <span>⚠ Ошибки команд</span>
+        </label>
+
+        <input type="search" id="stepSearch" class="input search-steps" placeholder="Фильтр внутри лога (текст, инструмент, шаг)…">
+
+        <div class="toolbar-actions">
+          <button class="btn-sm" id="expandAllBtn" title="Развернуть все блоки thinking и tool_calls">Развернуть все</button>
+          <button class="btn-sm" id="collapseAllBtn" title="Свернуть все блоки thinking и tool_calls">Свернуть все</button>
+          <button class="btn-sm" id="jumpMapBtn" title="Перейти к оглавлению и карте кэша в начале беседы">📑 Оглавление</button>
+          <button class="btn-sm" id="openCmdMapBtn" title="Открыть карту всех выполненных команд со статистикой и отображением на зарубках справа">📊 Карта команд</button>
+        </div>
+
+        <div class="session-stats" id="sessionStats"></div>
+      </div>
+
+      <div class="feed-stage">
+        <div class="feed-wrap" id="feedWrap" tabindex="-1">
+          <div class="feed" id="feed">
+            <div class="welcome">
+              <h2>Antigravity Transcript Viewer</h2>
+              <p>Выберите сессию в левой панели. Файл читается инкрементально без блокировки записи и обновляется в реальном времени.</p>
+            </div>
+          </div>
+        </div>
+        <div class="prompt-minimap" id="promptMinimap" title="Вопросы пользователя — наведите для предпросмотра, кликните для перехода"></div>
+      </div>
+
+      <div class="minimap-preview hidden" id="minimapPreview"></div>
+      <button class="jump-top hidden" id="jumpTopBtn" title="Прокрутить в самое начало">↑ Вверх</button>
+      <button class="jump-bottom hidden" id="jumpBottomBtn">↓ К новому сообщению</button>
+
+      <form class="composer" id="composerForm">
+        <div class="composer-resizer" id="composerResizer" title="Потяните вверх или вниз, чтобы изменить высоту поля ввода"></div>
+        <div class="composer-inner">
+          <textarea id="promptInput" class="composer-input" rows="3" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Напишите сообщение… (Enter — вставить в Antigravity без отправки, Shift+Enter — новая строка)"></textarea>
+          <div class="composer-actions">
+            <div class="composer-top-row">
+              <span class="composer-status" id="composerStatus"></span>
+              <button type="button" class="icon-btn" id="collapseComposerBtn" title="Свернуть поле ввода">▼</button>
+            </div>
+            <button type="submit" class="btn-sm composer-send" id="composerSendBtn" title="Скопировать текст, активировать окно Antigravity.exe и вставить (Enter не нажимается)">Вставить в Antigravity ↗</button>
+          </div>
+        </div>
+      </form>
+      <button type="button" class="btn-sm floating-pill expand-composer-btn hidden" id="expandComposerBtn" title="Развернуть поле ввода">▲ Написать</button>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="cmdMapModal">
+    <div class="modal-card cmd-map-card">
+      <div class="modal-head">
+        <span>📊 Карта всех выполненных команд и событий</span>
+        <div class="modal-actions">
+          <label class="toggle-btn" title="Если включено — в ленте останутся только отмеченные здесь типы и команды">
+            <input type="checkbox" id="cmdMapFilterOnly">
+            <span>Показывать только выбранные</span>
+          </label>
+          <button type="button" class="btn-sm" id="cmdMapSelectAll">Выбрать все</button>
+          <button type="button" class="btn-sm" id="cmdMapClear">Сбросить</button>
+          <button type="button" class="btn-sm" id="cmdMapClose">✕ Закрыть</button>
+        </div>
+      </div>
+      <div class="cmd-map-body" id="cmdMapBody"></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="fileOpenModal">
+    <div class="modal-card file-open-card">
+      <div class="modal-head">
+        <span id="fileOpenTitle">Открыть файл</span>
+        <div class="modal-actions">
+          <button type="button" class="btn-sm" id="fileOpenCopyPathBtn" title="Скопировать путь в буфер обмена">📋 Копировать путь</button>
+          <button type="button" class="btn-sm" id="fileOpenCloseBtn">✕ Закрыть</button>
+        </div>
+      </div>
+      <div class="file-open-body">
+        <div class="file-open-path" id="fileOpenPathPreview"></div>
+        <div class="file-open-choices">
+          <button type="button" class="file-choice-btn" data-file-mode="browser_fmt">
+            <span class="file-choice-title">🌐 В браузере с форматированием</span>
+            <span class="file-choice-desc">HTML-страницы, Markdown, красивый JSON, код и текст с нумерацией строк</span>
+          </button>
+          <button type="button" class="file-choice-btn" data-file-mode="browser_raw">
+            <span class="file-choice-title">📄 В браузере как текст (Raw)</span>
+            <span class="file-choice-desc">Чистый неформатированный исходный текст (text/plain) без рендеринга HTML/Markdown</span>
+          </button>
+          <button type="button" class="file-choice-btn" id="fileOpenSystemChoice" data-file-mode="system">
+            <span class="file-choice-title">🖥️ В системной программе</span>
+            <span class="file-choice-desc" id="fileOpenSystemDesc">Открыть в программе по умолчанию для этого типа файла (редактор, IDE, просмотрщик)</span>
+          </button>
+        </div>
+        <label class="file-remember-check">
+          <input type="checkbox" id="fileOpenRememberCheck">
+          <span>Запомнить выбор для всех файлов (изменить или сбросить можно в настройках под 📑 Оглавлением)</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="lightbox hidden" id="lightbox">
+    <img id="lightboxImg" alt="Attachment preview">
+  </div>
+
+  <div class="tooltip hidden" id="tooltip"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
