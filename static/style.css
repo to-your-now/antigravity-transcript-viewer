@@ -1385,10 +1385,14 @@ details.block-unknown-tag > summary { color: #ffd43b; }
 .md h1 { font-size: 18px; }
 .md h2 { font-size: 16px; }
 .md h3 { font-size: 14.5px; }
-.md ul { margin: 6px 0; padding-left: 22px; }
-.md ol { margin: 6px 0; padding-left: 30px; }
-.md li > ul,
+.md ul { margin: 6px 0; padding-left: 32px; }
+.md ol { margin: 6px 0; padding-left: 32px; }
+.md li > ul {
+  padding-left: 24px;
+  margin: 3px 0;
+}
 .md li > ol {
+  padding-left: 26px;
   margin: 3px 0;
 }
 .trunc-badge {
@@ -1405,13 +1409,13 @@ details.block-unknown-tag > summary { color: #ffd43b; }
   padding-left: 4px;
 }
 .step.type-CHECKPOINT .md li > ul {
-  padding-left: 22px;
+  padding-left: 24px;
 }
 .step.type-CHECKPOINT .md ol > li > ul {
   padding-left: 50px;
 }
 .step.type-CHECKPOINT .md li > ol {
-  padding-left: 22px;
+  padding-left: 24px;
   margin: 4px 0;
 }
 .step.type-CHECKPOINT .md ol > li {
@@ -2129,7 +2133,7 @@ a.link-auto:hover {
 .floating-top-bar {
   position: fixed;
   top: 8px;
-  right: 22px;
+  right: 54px;
   display: flex;
   align-items: center;
   gap: 6px;
