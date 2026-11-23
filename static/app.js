@@ -1168,6 +1168,41 @@
     text = escHtml(text);
 
     const inline = (s) => formatInlineMdHtml(s);
+    const measureIndent = (ws) => {
+      let col = 0;
+      for (let k = 0; k < ws.length; k++) {
+        col += ws[k] === "\t" ? (4 - (col % 4)) : 1;
+      }
+      return col;
+    };
+    const matchListLine = (ln) => {
+      const m = ln.match(/^([ \t]*)(?:([-*])\s+(.*)|(\d+)\.\s+(.*))$/);
+      if (!m) return null;
+      const indent = measureIndent(m[1]);
+      if (m[2] !== undefined) {
+        return { type: "ul", indent, text: m[3], num: null };
+      }
+      return { type: "ol", indent, text: m[5], num: Number(m[4]) || 1 };
+    };
+    const renderListNode = (node) => {
+      const itemsHtml = node.items.map((it) => {
+        const bodyParts = [it.textHtml];
+        if (it.contParts.length) {
+          bodyParts.push(`<br>${it.contParts.join("<br>")}`);
+        }
+        const childrenHtml = it.children.map(renderListNode).join("");
+        if (node.type === "ol") {
+          const itemNum = it.num;
+          const prefixNum = opts.highlightOlNums ? `<span class="compaction-num">${itemNum}.</span>` : "";
+          return `<li value="${itemNum}">${prefixNum}${bodyParts.join("")}${childrenHtml}</li>`;
+        }
+        return `<li>${bodyParts.join("")}${childrenHtml}</li>`;
+      }).join("");
+      if (node.type === "ol") {
+        return `<ol start="${node.startNum}">${itemsHtml}</ol>`;
+      }
+      return `<ul>${itemsHtml}</ul>`;
+    };
 
     const lines = text.split("\n");
     const out = [];
@@ -1240,30 +1275,131 @@
         continue;
       }
 
-      // Unordered list
-      if (/^\s*[-*]\s+/.test(line)) {
-        const items = [];
-        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-          items.push(`<li>${inline(lines[i].replace(/^\s*[-*]\s+/, ""))}</li>`);
-          i++;
-        }
-        out.push(`<ul>${items.join("")}</ul>`);
-        continue;
-      }
+      // Hierarchical Unordered / Ordered Lists (supports nested ul/ol & indented continuations)
+      const firstItem = matchListLine(line);
+      if (firstItem) {
+        const root = {
+          type: firstItem.type,
+          indent: firstItem.indent,
+          startNum: firstItem.num || 1,
+          items: [{
+            textHtml: inline(firstItem.text),
+            num: firstItem.num,
+            contParts: [],
+            children: [],
+          }],
+        };
+        const stack = [root];
+        i++;
 
-      // Ordered list (preserve exact Markdown numbers even across nested paragraphs/bullets)
-      const olStartMatch = line.match(/^\s*(\d+)\.\s+/);
-      if (olStartMatch) {
-        const startNum = Number(olStartMatch[1]) || 1;
-        const items = [];
-        let mItem;
-        while (i < lines.length && (mItem = lines[i].match(/^\s*(\d+)\.\s+(.*)$/))) {
-          const itemNum = Number(mItem[1]) || 1;
-          const prefixNum = opts.highlightOlNums ? `<span class="compaction-num">${itemNum}.</span>` : "";
-          items.push(`<li value="${itemNum}">${prefixNum}${inline(mItem[2])}</li>`);
-          i++;
+        while (i < lines.length) {
+          let nextIdx = i;
+          let skippedBlank = false;
+          while (nextIdx < lines.length && lines[nextIdx].trim() === "") {
+            skippedBlank = true;
+            nextIdx++;
+          }
+          if (nextIdx >= lines.length) break;
+
+          const curLine = lines[nextIdx];
+
+          // Never absorb non-list block boundaries
+          if (
+            /^\u0000CB\d+\u0000$/.test(curLine.trim()) ||
+            /^\s*(?:---+|___+|\*\*\*+)\s*$/.test(curLine) ||
+            /^(#{1,6})\s+/.test(curLine) ||
+            /^\s*&gt;(?:\s|$)/.test(curLine) ||
+            (curLine.includes("|") && nextIdx + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[nextIdx + 1]))
+          ) {
+            break;
+          }
+
+          const lm = matchListLine(curLine);
+          if (lm) {
+            while (stack.length > 1 && lm.indent < stack[stack.length - 1].indent) {
+              stack.pop();
+            }
+            const top = stack[stack.length - 1];
+
+            if (lm.indent > top.indent) {
+              const parentItem = top.items[top.items.length - 1];
+              const subList = {
+                type: lm.type,
+                indent: lm.indent,
+                startNum: lm.num || 1,
+                items: [{
+                  textHtml: inline(lm.text),
+                  num: lm.num,
+                  contParts: [],
+                  children: [],
+                }],
+              };
+              parentItem.children.push(subList);
+              stack.push(subList);
+              i = nextIdx + 1;
+              continue;
+            }
+
+            if (lm.indent < top.indent) {
+              break;
+            }
+
+            if (lm.type !== top.type) {
+              if (stack.length === 1) {
+                break;
+              }
+              stack.pop();
+              const outerTop = stack[stack.length - 1];
+              const outerItem = outerTop.items[outerTop.items.length - 1];
+              const subList = {
+                type: lm.type,
+                indent: lm.indent,
+                startNum: lm.num || 1,
+                items: [{
+                  textHtml: inline(lm.text),
+                  num: lm.num,
+                  contParts: [],
+                  children: [],
+                }],
+              };
+              outerItem.children.push(subList);
+              stack.push(subList);
+              i = nextIdx + 1;
+              continue;
+            }
+
+            top.items.push({
+              textHtml: inline(lm.text),
+              num: lm.num,
+              contParts: [],
+              children: [],
+            });
+            i = nextIdx + 1;
+            continue;
+          }
+
+          // Indented continuation line inside the current list item
+          const lineIndent = measureIndent((curLine.match(/^[ \t]*/) || [""])[0]);
+          const top = stack[stack.length - 1];
+          let targetList = null;
+          if (skippedBlank) {
+            for (let s = stack.length - 1; s >= 0; s--) {
+              if (lineIndent >= stack[s].indent + 2) {
+                targetList = stack[s];
+                break;
+              }
+            }
+          } else if (lineIndent >= top.indent + 2) {
+            targetList = top;
+          }
+          if (!targetList) break;
+          const targetItem = targetList.items[targetList.items.length - 1];
+          if (targetItem.children.length > 0) break;
+          targetItem.contParts.push(inline(curLine.trim()));
+          i = nextIdx + 1;
         }
-        out.push(`<ol start="${startNum}">${items.join("")}</ol>`);
+
+        out.push(renderListNode(root));
         continue;
       }
 
