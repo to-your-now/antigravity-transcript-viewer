@@ -5302,21 +5302,41 @@
     const desiredTop = opts.topOffset !== undefined ? opts.topOffset : 4;
     const subStepKey = opts.toolOutStep !== undefined && opts.toolOutStep !== null ? String(opts.toolOutStep) : "";
     const toolIdxKey = opts.toolIdx !== undefined && opts.toolIdx !== null ? String(opts.toolIdx) : "";
+    const subAnchor = opts.subAnchor && typeof opts.subAnchor === "object" ? opts.subAnchor : null;
     const topCard = ensureRealVElement(item);
     // Warm immediate +/- 2 neighbors cleanly before scroll
     for (let k = Math.max(0, item.idx - 2); k <= Math.min(_vItems.length - 1, item.idx + 2); k++) {
       ensureRealVElement(_vItems[k]);
     }
 
+    const queryByIdx = (root, sel, idx) => {
+      if (!root || !sel) return null;
+      try {
+        const list = root.querySelectorAll(sel);
+        const i = Number.isFinite(idx) ? idx : 0;
+        return list[i] || list[0] || null;
+      } catch (_) {
+        return null;
+      }
+    };
+
     const resolveTarget = () => {
-      if (subStepKey) {
-        const sub = topCard.querySelector(`[data-step-index="${CSS.escape(subStepKey)}"]`);
-        if (sub) return sub;
+      const resEl = subStepKey ? topCard.querySelector(`[data-step-index="${CSS.escape(subStepKey)}"]`) : null;
+      const tcEl = !resEl && toolIdxKey ? topCard.querySelector(`.tool-card[data-tool-idx="${CSS.escape(toolIdxKey)}"]`) : null;
+      if (subAnchor && subAnchor.sel) {
+        if (subAnchor.scope === "res" && resEl) {
+          const hit = queryByIdx(resEl, subAnchor.sel, subAnchor.idx);
+          if (hit) return hit;
+        } else if (subAnchor.scope === "tc" && tcEl) {
+          const hit = queryByIdx(tcEl, subAnchor.sel, subAnchor.idx);
+          if (hit) return hit;
+        } else if (subAnchor.scope === "card") {
+          const hit = queryByIdx(topCard, subAnchor.sel, subAnchor.idx);
+          if (hit) return hit;
+        }
       }
-      if (toolIdxKey) {
-        const tc = topCard.querySelector(`.tool-card[data-tool-idx="${CSS.escape(toolIdxKey)}"]`);
-        if (tc) return tc;
-      }
+      if (resEl) return resEl;
+      if (tcEl) return tcEl;
       return topCard.querySelector(`[data-step-index="${CSS.escape(key)}"]`) || topCard;
     };
 
@@ -5359,7 +5379,8 @@
     els.feedWrap.scrollTop = Math.max(0, baseTop + item.offsetY - desiredTop);
     _lastScrollFrameTop = els.feedWrap.scrollTop;
 
-    for (let pass = 0; pass < 3; pass++) {
+    let lastDelta = 0;
+    for (let pass = 0; pass < 5; pass++) {
       syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
       measureMountedVWindowNow();
       target = resolveTarget();
@@ -5368,15 +5389,29 @@
         if (p.tagName === "DETAILS" && !p.open) p.open = true;
         p = p.parentElement;
       }
-      const delta = alignToTarget();
-      if (Math.abs(delta) <= 4) break;
+      lastDelta = alignToTarget();
+      if (Math.abs(lastDelta) <= 2) break;
+    }
+    if (Math.abs(lastDelta) > 2) {
+      syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+      measureMountedVWindowNow();
+      target = resolveTarget();
+      alignToTarget();
     }
 
     requestAnimationFrame(() => {
-      if (_activeJumpLock === jumpLock) alignToTarget();
+      if (_activeJumpLock !== jumpLock) return;
+      syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+      measureMountedVWindowNow();
+      target = resolveTarget();
+      alignToTarget();
     });
     setTimeout(() => {
-      if (_activeJumpLock === jumpLock && performance.now() < jumpLock.expiresAt) alignToTarget();
+      if (_activeJumpLock !== jumpLock || performance.now() >= jumpLock.expiresAt) return;
+      syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+      measureMountedVWindowNow();
+      target = resolveTarget();
+      alignToTarget();
     }, 90);
 
     target.classList.remove("step-flash");
@@ -6398,7 +6433,7 @@
     }
   }
 
-  function renderFullFeed() {
+  function renderFullFeed(opts = {}) {
     _activeAnchorLock = null;
     _activeJumpLock = null;
     cancelVirtualTimers();
@@ -6426,8 +6461,9 @@
       _tocBaseCache = null;
       _cardRenderConfigKey = cfgKey;
     }
+    const curSearchTrim = Boolean(state.stepQuery && state.searchFocusedOnly);
     els.feed.classList.toggle("is-read-full", state.readDisplayMode === "full" || state.expandAllOutputs);
-    els.feed.classList.toggle("is-search-focused", Boolean(state.stepQuery && state.searchFocusedOnly));
+    els.feed.classList.toggle("is-search-focused", curSearchTrim);
 
     // Strip stale search highlights ONLY from the small set of previously highlighted cards
     const curHlSig = getHighlightSig();
@@ -6464,7 +6500,14 @@
       const attCount = attached ? attached.length : 0;
       const prev = prevByStep ? prevByStep.get(s) : null;
       const reusePrev = prev && prev.attachedCount === attCount && prev.el;
-      const estH = (reusePrev && prev.measured ? prev.height : estimateCardHeight(s, attached) + CARD_GAP);
+      // Never reuse a measured height from a trimmed search view after search clears or focus-trim changes
+      const canReuseMeasured = Boolean(
+        reusePrev &&
+        prev.measured &&
+        Boolean(prev.searchTrimmed) === curSearchTrim &&
+        (!curSearchTrim || prev.hlSig === curHlSig)
+      );
+      const estH = canReuseMeasured ? prev.height : estimateCardHeight(s, attached) + CARD_GAP;
       const hasErr =
         isCommandErrorStep(s) ||
         (Array.isArray(attached) && attached.some((g) => isCommandErrorStep(g)));
@@ -6479,7 +6522,9 @@
         bytes: estimateStepBytes(s, attached),
         estHeight: estH,
         height: estH,
-        measured: Boolean(reusePrev && prev.measured),
+        measured: canReuseMeasured,
+        searchTrimmed: curSearchTrim,
+        hlSig: curHlSig,
         offsetY: 0,
         el: reusePrev ? prev.el : null,
         cfgKey,
@@ -6548,10 +6593,12 @@
     recomputeTotals();
 
     const wantBottom = els.followToggle.checked && !state.userScrolledUp;
-    if (wantBottom) {
+    if (wantBottom && !opts.skipWindowSync) {
       scrollToBottom();
     } else {
-      syncVirtualWindow({ forceRender: true });
+      if (!opts.skipWindowSync) {
+        syncVirtualWindow({ forceRender: true });
+      }
       if (state.firstUnreadStepIndex !== null && !_vStepToItemMap.has(String(state.firstUnreadStepIndex))) {
         state.firstUnreadStepIndex = null;
       }
@@ -7129,9 +7176,13 @@
           calibrateUserTimezone(state.steps);
           updateStepModels(state.steps, true);
           buildStepMetadataAndTaskIndex(state.steps);
-          renderFullFeed();
+          renderFullFeed({ skipWindowSync: Boolean(wasScrolledUp && anchorStepKey) });
           if (wasScrolledUp && anchorStepKey) {
-            jumpToStep(anchorStepKey, { topOffset: 4 });
+            if (_vStepToItemMap.has(String(anchorStepKey))) {
+              jumpToStep(anchorStepKey, { topOffset: 4 });
+            } else {
+              syncVirtualWindow({ forceRender: true });
+            }
             requestAnimationFrame(updateScrollUiOnFrame);
           }
         } else {
@@ -7241,9 +7292,11 @@
       els.convMeta.textContent = `[${meta.project || "general"}] ${convId} · ${data.path || ""}`;
       linkifyElement(els.convMeta, { treatTranscriptAsFile: true });
 
-      renderFullFeed();
+      renderFullFeed({ skipWindowSync: Boolean(resolvedTargetStep) });
       if (resolvedTargetStep) {
-        jumpToStep(resolvedTargetStep, { topOffset: 4 });
+        if (jumpToStep(resolvedTargetStep, { topOffset: 4 }) === false) {
+          syncVirtualWindow({ forceRender: true });
+        }
       }
       if (els.feedWrap) els.feedWrap.focus({ preventScroll: true });
       if (!els.cmdMapModal.classList.contains("hidden")) {
@@ -7289,6 +7342,144 @@
     if (!fw || !_vItems.length || !state.steps.length) return null;
     const wrapRect = fw.getBoundingClientRect();
 
+    const getScrollBoxState = (el, card) => {
+      let cur = el ? el.parentElement : null;
+      let outerBox = null;
+      const elRect = el.getBoundingClientRect();
+      while (cur && cur !== card) {
+        if (
+          cur.classList.contains("read-scroll-box") ||
+          cur.classList.contains("tool-args") ||
+          cur.classList.contains("generic-pre") ||
+          cur.classList.contains("inline-raw-pre")
+        ) {
+          if (cur.scrollHeight > cur.clientHeight + 2) {
+            const boxRect = cur.getBoundingClientRect();
+            if (elRect.bottom <= boxRect.top + 4 || elRect.top >= boxRect.bottom - 4) {
+              return { visible: false, outerBox: null };
+            }
+            outerBox = cur;
+          }
+        }
+        cur = cur.parentElement;
+      }
+      return { visible: true, outerBox };
+    };
+
+    const indexWithin = (root, sel, node) => {
+      if (!root || !node) return -1;
+      try {
+        return Array.from(root.querySelectorAll(sel)).indexOf(node);
+      } catch (_) {
+        return -1;
+      }
+    };
+
+    const buildAnchorFromEl = (card, rawEl) => {
+      const boxState = getScrollBoxState(rawEl, card);
+      const targetEl = boxState.outerBox || rawEl;
+      const resEl = targetEl.closest(".tool-result[data-step-index]");
+      const tcEl = targetEl.closest(".tool-card[data-tool-idx]");
+      let subAnchor = null;
+      let anchorEl = resEl || tcEl || card;
+
+      if (resEl && card.contains(resEl)) {
+        const resSelectors = [
+          ".tool-result-head",
+          ".read-scroll-box",
+          ".generic-pre",
+          ".inline-raw-pre",
+          ".code-gutter-row",
+          ".md-gutter-row",
+          ".md > *",
+          "pre",
+          "p",
+          "li",
+        ];
+        for (const sel of resSelectors) {
+          const hit = targetEl.closest(sel);
+          if (hit && resEl.contains(hit)) {
+            const idx = indexWithin(resEl, sel, hit);
+            if (idx >= 0) {
+              subAnchor = { scope: "res", sel, idx };
+              anchorEl = hit;
+              break;
+            }
+          }
+        }
+      } else if (tcEl && card.contains(tcEl)) {
+        const tcSelectors = [
+          ":scope > .tool-head",
+          ".arg-row",
+          ".tool-args",
+        ];
+        for (const sel of tcSelectors) {
+          const hit = targetEl.closest(sel);
+          if (hit && tcEl.contains(hit)) {
+            const idx = indexWithin(tcEl, sel, hit);
+            if (idx >= 0) {
+              subAnchor = { scope: "tc", sel, idx };
+              anchorEl = hit;
+              break;
+            }
+          }
+        }
+      } else {
+        const cardSelectors = [
+          ":scope > .step-head",
+          ":scope > .step-body > details.block-thinking > .md > *",
+          ":scope > .step-body > details.block-thinking",
+          ":scope > .step-body > .md > *",
+          ":scope > .step-body > .md",
+          ":scope > .step-body > .system-msg-body",
+          ":scope > .step-body > .generic-content-wrap",
+          ":scope > .step-body > details.block-meta",
+          ":scope > .step-body > details.block-unknown-tag",
+        ];
+        for (const sel of cardSelectors) {
+          const hit = targetEl.closest(sel);
+          if (hit && card.contains(hit)) {
+            const idx = indexWithin(card, sel, hit);
+            if (idx >= 0) {
+              subAnchor = { scope: "card", sel, idx };
+              anchorEl = hit;
+              break;
+            }
+          }
+        }
+      }
+
+      const anchorRect = anchorEl.getBoundingClientRect();
+      return {
+        stepIndex: card.dataset.stepIndex,
+        toolOutStep: resEl ? resEl.dataset.stepIndex : null,
+        toolIdx: !resEl && tcEl ? tcEl.dataset.toolIdx : null,
+        subAnchor,
+        topInWrap: anchorRect.top - wrapRect.top,
+      };
+    };
+
+    const pickVisibleInCard = (card, selectorList) => {
+      for (const sel of selectorList) {
+        const candidates = [];
+        for (const el of card.querySelectorAll(sel)) {
+          const r = el.getBoundingClientRect();
+          if (r.height <= 0 || r.bottom <= wrapRect.top + 6 || r.top >= wrapRect.bottom - 6) continue;
+          const st = getScrollBoxState(el, card);
+          if (!st.visible) continue;
+          const visEl = st.outerBox || el;
+          const vr = st.outerBox ? visEl.getBoundingClientRect() : r;
+          if (vr.height <= 0 || vr.bottom <= wrapRect.top + 6 || vr.top >= wrapRect.bottom - 6) continue;
+          candidates.push({ el: visEl, rect: vr });
+        }
+        if (candidates.length > 0) {
+          const inView = candidates.find(({ rect }) => rect.top >= wrapRect.top - 12);
+          return (inView || candidates[0]).el;
+        }
+      }
+      return null;
+    };
+
     if (_vWindow) {
       const cards = Array.from(_vWindow.children).filter(
         (el) => el.tagName === "ARTICLE" && el.dataset.isSkeleton !== "1" && el.dataset.stepIndex
@@ -7298,26 +7489,24 @@
         .filter(({ rect }) => rect.bottom > wrapRect.top + 8 && rect.top < wrapRect.bottom - 8);
 
       if (visibleCards.length > 0) {
-        // Prefer an actually matched card/hit currently inside the viewport
+        // Prefer the most specific visible matched element inside the viewport
         for (const { card } of visibleCards) {
-          const hitEl =
-            Array.from(card.querySelectorAll(".search-hit-sub, .search-hit-target, mark.hl")).find((el) => {
-              const r = el.getBoundingClientRect();
-              return r.height > 0 && r.bottom > wrapRect.top + 6 && r.top < wrapRect.bottom - 6;
-            }) || null;
-          if (hitEl) {
-            const resEl = hitEl.closest(".tool-result[data-step-index]");
-            const tcEl = hitEl.closest(".tool-card[data-tool-idx]");
-            const targetBox = resEl || tcEl || card;
-            return {
-              stepIndex: card.dataset.stepIndex,
-              toolOutStep: resEl ? resEl.dataset.stepIndex : null,
-              toolIdx: !resEl && tcEl ? tcEl.dataset.toolIdx : null,
-              topInWrap: targetBox.getBoundingClientRect().top - wrapRect.top,
-            };
-          }
+          const hitEl = pickVisibleInCard(card, [
+            "mark.hl",
+            ".search-hit-sub",
+            ".tool-result[data-step-index].search-hit-target, .tool-card.search-hit-target",
+            ".search-hit-target",
+          ]);
+          if (hitEl) return buildAnchorFromEl(card, hitEl);
         }
-        // Fallback to the topmost visible card in the viewport
+        // Fallback: anchor to the topmost visible block (for negation-only search or scrolled long cards)
+        for (const { card } of visibleCards) {
+          const structEl = pickVisibleInCard(card, [
+            ".step-head, .tool-head, .tool-result-head, details.block-thinking > .md > *, .step-body > .md > *",
+            "details.block-thinking, .tool-result[data-step-index], .tool-card[data-tool-idx], .step-body > .md, .step-body > .system-msg-body, .step-body > .generic-content-wrap",
+          ]);
+          if (structEl) return buildAnchorFromEl(card, structEl);
+        }
         const chosen =
           visibleCards.find(({ rect }) => rect.top >= wrapRect.top - 10) ||
           visibleCards[0];
@@ -7325,6 +7514,7 @@
           stepIndex: chosen.card.dataset.stepIndex,
           toolOutStep: null,
           toolIdx: null,
+          subAnchor: null,
           topInWrap: chosen.rect.top - wrapRect.top,
         };
       }
@@ -7333,7 +7523,7 @@
     const viewTop = Math.max(0, fw.scrollTop - getVListBaseTop()) + 18;
     const vIt = _vItems[findVItemAtY(viewTop)];
     if (vIt && vIt.stepKey) {
-      return { stepIndex: vIt.stepKey, toolOutStep: null, toolIdx: null, topInWrap: 4 };
+      return { stepIndex: vIt.stepKey, toolOutStep: null, toolIdx: null, subAnchor: null, topInWrap: 4 };
     }
     return null;
   }
@@ -7343,24 +7533,38 @@
     if (val === state.stepQuery) return;
     const prevQuery = state.stepQuery;
     const isClearing = Boolean(prevQuery && val === "");
-    const anchor = (isClearing || state.userScrolledUp) ? captureSearchContextAnchor() : null;
+    const hadActiveSearch = Boolean(prevQuery);
+    const anchor = (isClearing || hadActiveSearch || state.userScrolledUp) ? captureSearchContextAnchor() : null;
 
     state.stepQuery = val;
     if (anchor) {
       state.userScrolledUp = true;
     }
-    renderFullFeed();
+    renderFullFeed({ skipWindowSync: Boolean(anchor && anchor.stepIndex) });
     if (anchor && anchor.stepIndex) {
-      if (_vStepToItemMap.has(String(anchor.stepIndex))) {
-        jumpToStep(anchor.stepIndex, {
-          topOffset: anchor.topInWrap,
-          toolOutStep: anchor.toolOutStep,
-          toolIdx: anchor.toolIdx,
+      let targetStep = String(anchor.stepIndex);
+      if (!_vStepToItemMap.has(targetStep) && isClearing) {
+        const anchorNum = Number(targetStep);
+        const nearest = _vItems.find((it) => it.kind === "step" && it.stepKey && Number(it.stepKey) >= anchorNum)
+          || [..._vItems].reverse().find((it) => it.kind === "step" && it.stepKey);
+        if (nearest) targetStep = nearest.stepKey;
+      }
+      if (_vStepToItemMap.has(targetStep)) {
+        const useSub = targetStep === String(anchor.stepIndex);
+        jumpToStep(targetStep, {
+          topOffset: useSub ? anchor.topInWrap : 4,
+          toolOutStep: useSub ? anchor.toolOutStep : null,
+          toolIdx: useSub ? anchor.toolIdx : null,
+          subAnchor: useSub ? anchor.subAnchor : null,
           resetFiltersOnMissing: false,
         });
+        requestAnimationFrame(updateScrollUiOnFrame);
       } else if (!isClearing && els.feedWrap && _vItems.length > 0) {
         els.feedWrap.scrollTop = 0;
         _lastScrollFrameTop = 0;
+        syncVirtualWindow({ forceRender: true });
+        updateScrollUiOnFrame();
+      } else if (els.feedWrap && _vItems.length > 0) {
         syncVirtualWindow({ forceRender: true });
         updateScrollUiOnFrame();
       }
@@ -7436,16 +7640,23 @@
     } catch (_) {}
     syncSearchOptionInputs();
     if (state.stepQuery) {
-      const anchor = state.userScrolledUp ? captureSearchContextAnchor() : null;
+      const anchor = captureSearchContextAnchor();
       if (anchor) state.userScrolledUp = true;
-      renderFullFeed();
+      renderFullFeed({ skipWindowSync: Boolean(anchor && anchor.stepIndex) });
       if (anchor && anchor.stepIndex) {
-        jumpToStep(anchor.stepIndex, {
-          topOffset: anchor.topInWrap,
-          toolOutStep: anchor.toolOutStep,
-          toolIdx: anchor.toolIdx,
-          resetFiltersOnMissing: false,
-        });
+        if (_vStepToItemMap.has(String(anchor.stepIndex))) {
+          jumpToStep(anchor.stepIndex, {
+            topOffset: anchor.topInWrap,
+            toolOutStep: anchor.toolOutStep,
+            toolIdx: anchor.toolIdx,
+            subAnchor: anchor.subAnchor,
+            resetFiltersOnMissing: false,
+          });
+          requestAnimationFrame(updateScrollUiOnFrame);
+        } else {
+          syncVirtualWindow({ forceRender: true });
+          updateScrollUiOnFrame();
+        }
       }
     }
   }
@@ -8939,14 +9150,21 @@
     if (state.steps.length > 0) {
       buildStepMetadataAndTaskIndex(state.steps);
       const anchor = state.userScrolledUp ? captureSearchContextAnchor() : null;
-      renderFullFeed();
+      renderFullFeed({ skipWindowSync: Boolean(anchor && anchor.stepIndex) });
       if (anchor && anchor.stepIndex) {
-        jumpToStep(anchor.stepIndex, {
-          topOffset: anchor.topInWrap,
-          toolOutStep: anchor.toolOutStep,
-          toolIdx: anchor.toolIdx,
-          resetFiltersOnMissing: false,
-        });
+        if (_vStepToItemMap.has(String(anchor.stepIndex))) {
+          jumpToStep(anchor.stepIndex, {
+            topOffset: anchor.topInWrap,
+            toolOutStep: anchor.toolOutStep,
+            toolIdx: anchor.toolIdx,
+            subAnchor: anchor.subAnchor,
+            resetFiltersOnMissing: false,
+          });
+          requestAnimationFrame(updateScrollUiOnFrame);
+        } else {
+          syncVirtualWindow({ forceRender: true });
+          updateScrollUiOnFrame();
+        }
       }
       if (!els.cmdMapModal.classList.contains("hidden")) {
         renderCommandMapModal();

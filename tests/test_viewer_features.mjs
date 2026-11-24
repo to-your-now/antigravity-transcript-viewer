@@ -456,5 +456,13 @@ assert.ok(
   appJs.includes('e.key === "."') && appJs.includes('e.code === "Slash"') && appJs.includes("isCtrlDotShortcut"),
   "Global keydown handler must focus #stepSearch on Ctrl+. / physical Slash (Russian keyboard layout)"
 );
+assert.ok(
+  appJs.includes("searchTrimmed: curSearchTrim") && appJs.includes("canReuseMeasured"),
+  "renderFullFeed must invalidate previously measured trimmed card heights when clearing search"
+);
+assert.ok(
+  appJs.includes("subAnchor") && appJs.includes("pickVisibleInCard") && appJs.includes("skipWindowSync"),
+  "captureSearchContextAnchor and jumpToStep must track sub-block anchors and skip stale initial window mounts before jumping"
+);
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");
