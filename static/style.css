@@ -523,9 +523,29 @@ a:hover { color: var(--link-hover); }
 }
 .minimap-notch-cp:hover,
 .minimap-notch-err:hover,
-.minimap-notch-sel:hover {
+.minimap-notch-sel:hover,
+.minimap-notch-search:hover {
   box-shadow: 0 0 6px rgba(255, 255, 255, 0.75);
   z-index: 7;
+}
+.minimap-notch-search {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 12px;
+  line-height: 10px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 900;
+  transform: translateY(-50%);
+  border: 1px solid #000000;
+  border-radius: 3px;
+  background: #ffd43b;
+  color: #111111;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  padding: 0;
+  z-index: 6;
 }
 .minimap-notch-sel {
   position: absolute;
@@ -886,6 +906,148 @@ a:hover { color: var(--link-hover); }
   color: #6b4000;
 }
 
+/* Colored inline tags: [ARTIFACT, [Attachment, @[Quote] */
+.inline-tag {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  border: 1px solid transparent;
+  vertical-align: baseline;
+}
+.inline-tag.tag-artifact {
+  background: rgba(188, 140, 255, 0.20);
+  border-color: rgba(188, 140, 255, 0.62);
+  color: #e2c7ff;
+}
+.inline-tag.tag-attachment {
+  background: rgba(56, 217, 169, 0.16);
+  border-color: rgba(56, 217, 169, 0.56);
+  color: #7df2cc;
+}
+.inline-tag.tag-quote {
+  background: rgba(255, 169, 77, 0.20);
+  border-color: rgba(255, 169, 77, 0.65);
+  color: #ffc078;
+}
+:root[data-theme="day"] .inline-tag.tag-artifact {
+  background: #efe3ff;
+  border-color: #8f4ce6;
+  color: #4f1d91;
+}
+:root[data-theme="day"] .inline-tag.tag-attachment {
+  background: #d7f7ec;
+  border-color: #0b8a64;
+  color: #064d38;
+}
+:root[data-theme="day"] .inline-tag.tag-quote {
+  background: #ffe8cc;
+  border-color: #d96b00;
+  color: #7a3600;
+}
+.inline-tag a.link-auto,
+.inline-tag a.link-authored {
+  font-weight: 700;
+}
+
+/* Background Task Bidirectional Links & Bright Header Pills */
+a.task-step-link {
+  display: inline;
+  font-family: var(--mono);
+  font-weight: 800;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(88, 166, 255, 0.18);
+  border: 1px solid rgba(88, 166, 255, 0.55);
+  color: #8cc8ff !important;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+a.task-step-link.task-link-to-result {
+  background: rgba(63, 185, 80, 0.18);
+  border-color: rgba(63, 185, 80, 0.65);
+  color: #7ee787 !important;
+}
+a.task-step-link.task-link-to-source {
+  background: rgba(255, 180, 50, 0.22);
+  border-color: rgba(255, 180, 50, 0.72);
+  color: #ffd43b !important;
+}
+:root[data-theme="day"] a.task-step-link {
+  background: #dceeff;
+  border-color: #2166c7;
+  color: #0c4499 !important;
+}
+:root[data-theme="day"] a.task-step-link.task-link-to-result {
+  background: #d6f5de;
+  border-color: #167934;
+  color: #0b4f1f !important;
+}
+:root[data-theme="day"] a.task-step-link.task-link-to-source {
+  background: #fff0c2;
+  border-color: #b87000;
+  color: #6b3d00 !important;
+}
+a.task-step-link:hover {
+  filter: brightness(1.15);
+  box-shadow: 0 0 0 1px currentColor;
+}
+
+.task-link-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 800;
+  padding: 2px 9px;
+  border-radius: 999px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.08s, filter 0.12s;
+  white-space: nowrap;
+}
+.task-link-pill:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.1);
+}
+.task-link-pill.task-link-to-result {
+  background: #1a5c2d;
+  color: #a6f7ba !important;
+  border: 1.5px solid #3fb950;
+  box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.25);
+}
+.task-link-pill.task-link-to-source {
+  background: #613d00;
+  color: #ffe066 !important;
+  border: 1.5px solid #ffae00;
+  box-shadow: 0 0 0 1px rgba(255, 174, 0, 0.25);
+}
+.task-link-pill.task-link-pending {
+  background: #2b3242;
+  color: #c9d1d9 !important;
+  border: 1.5px dashed #8b949e;
+  cursor: default;
+}
+:root[data-theme="day"] .task-link-pill.task-link-to-result {
+  background: #157a34;
+  color: #ffffff !important;
+  border-color: #0b4a1e;
+}
+:root[data-theme="day"] .task-link-pill.task-link-to-source {
+  background: #d97706;
+  color: #ffffff !important;
+  border-color: #78350f;
+}
+:root[data-theme="day"] .task-link-pill.task-link-pending {
+  background: #e9e4d3;
+  color: #4b4637 !important;
+  border-color: #8a8368;
+}
+
 .raw-btn {
   font-family: var(--mono);
   font-size: 11px;
@@ -957,7 +1119,18 @@ mark.hl {
   padding: 0 2px;
   border-radius: 3px;
   font-weight: 700;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
+/* Deepest direct search-hit container: thick yellow border with crisp black inner + outer borders */
+.search-hit-target {
+  border: 4px solid #ffd43b !important;
+  outline: 2px solid #000000 !important;
+  outline-offset: 0px !important;
+  box-shadow: inset 0 0 0 2px #000000, 0 0 10px rgba(255, 212, 59, 0.42) !important;
+  border-radius: 6px !important;
+  margin: 2px !important;
+  scroll-margin-top: 20px;
 }
 
 /* Collapsible details (thinking & tool_calls) */
@@ -1569,11 +1742,10 @@ a.link-auto:hover {
   text-decoration-style: solid;
 }
 
-/* Shell command prefix dimming vs actual command highlighting */
+/* Shell command prefix dimming vs actual command highlighting (inline for continuous search/selection) */
 .cmd-prefix {
-  display: inline-block;
-  padding: 0 5px;
-  margin-right: 4px;
+  display: inline;
+  padding: 1px 4px;
   border-radius: 3px;
   background: rgba(128, 128, 128, 0.14);
   color: var(--text-dim);
@@ -1803,8 +1975,6 @@ a.link-auto:hover {
   border-radius: 10px;
   background: var(--bg-elev);
   padding: 12px 16px;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 420px;
 }
 .cache-map-details > summary {
   cursor: pointer;

@@ -347,6 +347,29 @@ def _find_totalcmd_exe() -> Optional[Path]:
     return None
 
 
+def _find_notepadpp_exe() -> Optional[Path]:
+    if not IS_WINDOWS:
+        return None
+    cands = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Notepad++" / "notepad++.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Notepad++" / "notepad++.exe",
+    ]
+    local_app = os.environ.get("LocalAppData", "")
+    if local_app:
+        cands.append(Path(local_app) / "Programs" / "Notepad++" / "notepad++.exe")
+    for cand in cands:
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    for exe_name in ("notepad++.exe", "notepad++"):
+        found = shutil.which(exe_name)
+        if found and Path(found).is_file():
+            return Path(found)
+    return None
+
+
 def _find_posix_opener() -> Optional[str]:
     if IS_MACOS:
         return "open" if shutil.which("open") else None
@@ -364,6 +387,7 @@ def get_platform_capabilities() -> Dict[str, Any]:
         "antigravity_paste": IS_WINDOWS,
         "open_explorer": IS_WINDOWS,
         "open_totalcmd": IS_WINDOWS and (_find_totalcmd_exe() is not None),
+        "open_notepadpp": IS_WINDOWS and (_find_notepadpp_exe() is not None),
         "open_folder_os": IS_WINDOWS or has_posix_opener,
         "open_file_os": IS_WINDOWS or has_posix_opener,
     }
@@ -561,9 +585,30 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             raw_p = str(data.get("path") or "")
             conv_id = str(data.get("conv") or "")
             project_root = str(data.get("root") or "")
+            mode = str(data.get("mode") or "system").strip().lower()
             resolved = _resolve_user_path(raw_p, conv_id, project_root)
             if resolved is None or not resolved.exists():
                 self._send_json({"ok": False, "error": f"Путь не найден: {raw_p}"}, status=404)
+                return
+            if mode == "notepadpp":
+                if not IS_WINDOWS:
+                    self._send_json({"ok": False, "error": "Notepad++ доступен только на Windows"}, status=400)
+                    return
+                if resolved.is_dir():
+                    self._send_json({"ok": False, "error": "Notepad++ открывает файлы, а не папки"}, status=400)
+                    return
+                npp = _find_notepadpp_exe()
+                if not npp:
+                    self._send_json(
+                        {"ok": False, "error": r"Notepad++ не найден (Program Files\Notepad++\notepad++.exe)"},
+                        status=404,
+                    )
+                    return
+                try:
+                    subprocess.Popen([str(npp), str(resolved)])
+                    self._send_json({"ok": True, "path": str(resolved), "mode": "notepadpp"})
+                except OSError as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=500)
                 return
             try:
                 if IS_WINDOWS:
@@ -577,7 +622,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                         )
                         return
                     subprocess.Popen([opener, str(resolved)], start_new_session=True)
-                self._send_json({"ok": True, "path": str(resolved)})
+                self._send_json({"ok": True, "path": str(resolved), "mode": "system"})
             except OSError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -723,6 +768,13 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         full_path = _html.escape(str(file_path))
         raw_url = "/api/file?path=" + urllib.parse.quote(str(file_path)) + "&raw=1"
         safe_json = json.dumps(md_text, ensure_ascii=False).replace("</", "<\\/")
+        safe_path_json = json.dumps(str(file_path), ensure_ascii=False).replace("</", "<\\/")
+        caps = get_platform_capabilities()
+        npp_btn = (
+            '<button class="btn-sm" id="openNppBtn" type="button">📝 Notepad++</button>'
+            if caps.get("open_notepadpp")
+            else ""
+        )
         page = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -764,7 +816,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         <div style="font-weight:700;font-size:15px;">{title}</div>
         <div class="md-path">{full_path}</div>
       </div>
-      <div style="display:flex;gap:8px;">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        {npp_btn}
         <a class="btn-sm" href="{raw_url}" style="text-decoration:none;">Raw</a>
         <a class="btn-sm" href="/" style="text-decoration:none;">← К логам</a>
       </div>
@@ -772,6 +825,25 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     <article class="md-card md" id="mdOut"></article>
   </div>
   <script type="application/json" id="mdRaw">{safe_json}</script>
+  <script>
+    (function() {{
+      const FILE_PATH = {safe_path_json};
+      const nppBtn = document.getElementById("openNppBtn");
+      if (nppBtn) {{
+        nppBtn.addEventListener("click", async () => {{
+          try {{
+            const r = await fetch("/api/open-file", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp" }})
+            }});
+            const d = await r.json();
+            if (!d.ok) alert(d.error || "Ошибка открытия в Notepad++");
+          }} catch (e) {{ alert(e.message); }}
+        }});
+      }}
+    }})();
+  </script>
   <script>
     (function() {{
       const esc = (s) => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
@@ -882,6 +954,13 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         full_path = _html.escape(str(file_path))
         raw_url = "/api/file?path=" + urllib.parse.quote(str(file_path)) + "&raw=1"
         safe_json = json.dumps(display_text, ensure_ascii=False).replace("</", "<\\/")
+        safe_path_json = json.dumps(str(file_path), ensure_ascii=False).replace("</", "<\\/")
+        caps = get_platform_capabilities()
+        npp_btn = (
+            '<button class="btn-sm" id="openNppBtn" type="button">📝 Notepad++</button>'
+            if caps.get("open_notepadpp")
+            else ""
+        )
         page = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -913,6 +992,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button class="btn-sm" id="copyCodeBtn" type="button">📋 Copy</button>
+        {npp_btn}
         <a class="btn-sm" href="{raw_url}" style="text-decoration:none;">Raw</a>
         <a class="btn-sm" href="/" style="text-decoration:none;">← К логам</a>
       </div>
@@ -922,6 +1002,21 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   <script type="application/json" id="codeRaw">{safe_json}</script>
   <script>
     (function() {{
+      const FILE_PATH = {safe_path_json};
+      const nppBtn = document.getElementById("openNppBtn");
+      if (nppBtn) {{
+        nppBtn.addEventListener("click", async () => {{
+          try {{
+            const r = await fetch("/api/open-file", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp" }})
+            }});
+            const d = await r.json();
+            if (!d.ok) alert(d.error || "Ошибка открытия в Notepad++");
+          }} catch (e) {{ alert(e.message); }}
+        }});
+      }}
       const txt = JSON.parse(document.getElementById("codeRaw").textContent);
       const out = document.getElementById("codeOut");
       const lines = String(txt || "").replace(/\\r\\n/g, "\\n").split("\\n");

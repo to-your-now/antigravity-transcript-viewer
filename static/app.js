@@ -32,6 +32,7 @@
       antigravity_paste: true,
       open_explorer: true,
       open_totalcmd: true,
+      open_notepadpp: true,
       open_folder_os: true,
       open_file_os: true,
     },
@@ -102,11 +103,15 @@
     fileOpenCopyPathBtn: document.getElementById("fileOpenCopyPathBtn"),
     fileOpenCloseBtn: document.getElementById("fileOpenCloseBtn"),
     fileOpenRememberCheck: document.getElementById("fileOpenRememberCheck"),
+    fileOpenNotepadChoice: document.getElementById("fileOpenNotepadChoice"),
     fileOpenSystemChoice: document.getElementById("fileOpenSystemChoice"),
   };
 
   const rawStepMap = new WeakMap();
   const stepModelMap = new WeakMap();
+  let stepToolMetaMap = new WeakMap();
+  let taskIndexMap = new Map();
+  let stepTaskMetaMap = new WeakMap();
   const notchItemMap = new WeakMap();
   const mdFenceBlocksMap = new WeakMap();
   const stepErrCache = new WeakMap();
@@ -117,6 +122,8 @@
   let stepSearchBlobCache = new WeakMap();
   let _lastDetectedModel = "";
   let _suppressHashChange = false;
+  let _pendingNavStep = "";
+  let _activeLoadSeq = 0;
   const _vStepToItemMap = new Map();  // String(step_index) -> vItem (including attached GENERICs)
   const userNotchByStep = new Map();      // String(step_index) -> minimap notch
   const _lruMap = new Map();              // LRU of vItems holding offscreen rendered DOM nodes
@@ -1435,7 +1442,27 @@
 
     // Restore any inline code-block placeholders if needed
     const finalHtml = out.join("").replace(/\u0000CB(\d+)\u0000/g, (_, idx) => codeBlocks[Number(idx)]);
-    return formatPairedSystemTagsInHtml(finalHtml);
+    return formatSpecialBracketTagsInHtml(formatPairedSystemTagsInHtml(finalHtml));
+  }
+
+  function formatSpecialBracketTagsInHtml(html) {
+    if (!html) return html;
+    if (!html.includes("ARTIFACT") && !html.includes("Attachment") && !html.includes("Quote")) {
+      return html;
+    }
+    const saved = [];
+    const masked = html.replace(/<(pre|code|a)\b[^>]*>[\s\S]*?<\/\1>|<span class="xml-tag-badge[\s\S]*?<\/span>/gi, (m) => {
+      const idx = saved.length;
+      saved.push(m);
+      return `\u0000BT${idx}\u0000`;
+    });
+    const out = masked
+      .replace(/(@\[Quote(?::[^\]\n]{0,160})?\])/g, '<span class="inline-tag tag-quote">$1</span>')
+      .replace(/(\[ARTIFACT(?:[:\s][^\]\n]{0,200})?\])/g, '<span class="inline-tag tag-artifact">$1</span>')
+      .replace(/(\[Attachment(?:[:\s][^\]\n]{0,260})?\])/g, '<span class="inline-tag tag-attachment">$1</span>')
+      .replace(/(\[ARTIFACT(?=\s|$|<))/g, '<span class="inline-tag tag-artifact">$1</span>')
+      .replace(/(\[Attachment(?=\s|$|<))/g, '<span class="inline-tag tag-attachment">$1</span>');
+    return out.replace(/\u0000BT(\d+)\u0000/g, (_, idx) => saved[Number(idx)]);
   }
 
   function formatPairedSystemTagsInHtml(html) {
@@ -1502,7 +1529,7 @@
 
   function renderSystemMessageBody(rawText) {
     const escaped = escHtml(String(rawText || ""));
-    return formatPairedSystemTagsInHtml(escaped);
+    return formatSpecialBracketTagsInHtml(formatPairedSystemTagsInHtml(escaped));
   }
 
   // ---------- Step Parsing & Card Creation ----------
@@ -1658,7 +1685,7 @@
 
   function renderInlineMdLine(rawLine) {
     const safe = escHtml(String(rawLine || "").replace(/\u0000/g, "\uFFFD"));
-    return formatInlineMdHtml(safe);
+    return formatSpecialBracketTagsInHtml(formatInlineMdHtml(safe));
   }
 
   function renderCodeWithGutter(strippedLines, lineNums, maxRows = Infinity) {
@@ -2065,6 +2092,11 @@
     const isReadTool = toolName === "read_file" || toolName === "view_file" || (!toolName && hasLinesChip);
     const isFileTool =
       isReadTool || ["edit_file", "replace_file_content", "write_file", "write_to_file"].includes(toolName);
+    const isCmdTool =
+      ["run_command", "command_status", "send_command_input", "read_terminal", "schedule", "manage_task"].includes(toolName) ||
+      /^(?:Command exited with code\s+-?\d+|Command output:|Tool is running as a background task|Wait cancelled\b)/im.test(
+        unescapeNewlines(rawContent || "").slice(0, 600)
+      );
     const lineNumInfo =
       isReadTool || (!isFileTool && hasLinesChip)
         ? stripLineNumbers(bodyText)
@@ -2077,7 +2109,7 @@
     let isMd = false;
     if (isReadTool) {
       isMd = isMdFile;
-    } else if (isFileTool || toolName === "run_command") {
+    } else if (isFileTool || isCmdTool) {
       isMd = false;
     } else if (toolName === "search_web") {
       isMd = true;
@@ -2498,6 +2530,345 @@
     return Array.from(urls);
   }
 
+  const BG_TASK_ID_RE = /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/task-\d+)\b/gi;
+
+  function buildStepMetadataAndTaskIndex(steps) {
+    stepToolMetaMap = new WeakMap();
+    taskIndexMap = new Map();
+    stepTaskMetaMap = new WeakMap();
+    if (!Array.isArray(steps) || !steps.length) return;
+
+    const addStepTaskEvent = (step, ev) => {
+      if (!step) return;
+      let list = stepTaskMetaMap.get(step);
+      if (!list) {
+        list = [];
+        stepTaskMetaMap.set(step, list);
+      }
+      if (!list.some((x) => x.role === ev.role && x.taskId === ev.taskId && x.awaitedTaskId === ev.awaitedTaskId)) {
+        list.push(ev);
+      }
+    };
+
+    const getTask = (taskId) => {
+      let t = taskIndexMap.get(taskId);
+      if (!t) {
+        t = {
+          taskId,
+          launchStepIndex: null,
+          callerStepIndex: null,
+          resultStepIndex: null,
+          taskType: "task",
+          waitSteps: new Set(),
+          cancelSteps: new Set(),
+        };
+        taskIndexMap.set(taskId, t);
+      }
+      return t;
+    };
+
+    // 1. Structural caller -> tool output pairing (independent of state.attachToolOutputs)
+    const plannerOutputsMap = new Map();
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      if (!s || s.type !== "PLANNER_RESPONSE" || !Array.isArray(s.tool_calls) || !s.tool_calls.length) continue;
+      const need = s.tool_calls.length;
+      const found = [];
+      for (let j = i + 1; j < steps.length && found.length < need; j++) {
+        const nxt = steps[j];
+        if (!nxt) continue;
+        if (nxt.type === "GENERIC") found.push(nxt);
+        else if (nxt.type === "SYSTEM_MESSAGE" || nxt.type === "ERROR_MESSAGE") continue;
+        else break;
+      }
+      if (found.length) {
+        plannerOutputsMap.set(s, found);
+        for (let k = 0; k < found.length; k++) {
+          const tc = s.tool_calls[k];
+          if (tc) {
+            stepToolMetaMap.set(found[k], {
+              toolName: tc.name || "",
+              toolArgs: tc.args || null,
+              callerStep: s,
+              toolIdx: k,
+            });
+          }
+        }
+      }
+    }
+
+    // 2. Index every background task lifecycle event across steps
+    for (const s of steps) {
+      if (!s) continue;
+      const contentStr = unescapeNewlines(s.content || "");
+      const meta = s.type === "GENERIC" ? stepToolMetaMap.get(s) : null;
+
+      if (s.type === "GENERIC") {
+        const mLaunch = contentStr.match(/Tool is running as a background task with task id:\s*([0-9a-f-]{8,}\/task-\d+)/i);
+        if (mLaunch) {
+          const taskId = mLaunch[1];
+          const t = getTask(taskId);
+          t.launchStepIndex = s.step_index;
+          if (meta && meta.callerStep) {
+            t.callerStepIndex = meta.callerStep.step_index;
+            addStepTaskEvent(meta.callerStep, { role: "caller", taskId, launchStepIndex: s.step_index, toolIdx: meta.toolIdx });
+          }
+          if (/Task Description:\s*Timer:/i.test(contentStr) || (meta && meta.toolName === "schedule")) {
+            t.taskType = "timer";
+          }
+          addStepTaskEvent(s, { role: "launch", taskId });
+        }
+
+        const mCancel = contentStr.match(/Wait cancelled\s*\(\s*task\s+([0-9a-f-]{8,}\/task-\d+)/i);
+        if (mCancel) {
+          const taskId = mCancel[1];
+          const t = getTask(taskId);
+          t.cancelSteps.add(s.step_index);
+          addStepTaskEvent(s, { role: "cancel", taskId });
+          if (meta && meta.callerStep) {
+            addStepTaskEvent(meta.callerStep, { role: "wait", taskId, launchStepIndex: s.step_index, toolIdx: meta.toolIdx });
+          }
+        }
+      }
+
+      if (s.type === "PLANNER_RESPONSE" && Array.isArray(s.tool_calls)) {
+        const outs = plannerOutputsMap.get(s) || [];
+        s.tool_calls.forEach((tc, tcIdx) => {
+          if (!tc || !tc.args || typeof tc.args !== "object") return;
+          for (const v of Object.values(tc.args)) {
+            if (typeof v !== "string") continue;
+            BG_TASK_ID_RE.lastIndex = 0;
+            let tm;
+            while ((tm = BG_TASK_ID_RE.exec(v)) !== null) {
+              const condTaskId = tm[1];
+              const t = getTask(condTaskId);
+              if (tc.name === "schedule" || tc.name === "manage_task") {
+                t.waitSteps.add(s.step_index);
+                addStepTaskEvent(s, { role: "wait", taskId: condTaskId, toolIdx: tcIdx });
+                const pairedOut = outs[tcIdx];
+                if (pairedOut) {
+                  addStepTaskEvent(pairedOut, { role: "awaited", awaitedTaskId: condTaskId });
+                }
+              }
+            }
+          }
+        });
+      }
+
+      if (s.type === "SYSTEM_MESSAGE") {
+        const mRes =
+          contentStr.match(/sender=([0-9a-f-]{8,}\/task-\d+)/i) ||
+          contentStr.match(/Task id\s+"?([0-9a-f-]{8,}\/task-\d+)"?\s+finished/i);
+        if (mRes) {
+          const taskId = mRes[1];
+          const t = getTask(taskId);
+          t.resultStepIndex = s.step_index;
+          addStepTaskEvent(s, { role: "result", taskId });
+        }
+      }
+    }
+  }
+
+  function resolveTaskLinkDestination(taskId, stepObj, preferredRole = "") {
+    const t = taskIndexMap.get(taskId);
+    if (!t) return null;
+    const stepIdxStr = stepObj ? String(stepObj.step_index ?? "") : "";
+    const isResultStep =
+      preferredRole === "result" ||
+      (t.resultStepIndex !== null && stepIdxStr !== "" && String(t.resultStepIndex) === stepIdxStr);
+
+    if (isResultStep) {
+      const destStep = t.callerStepIndex !== null ? t.callerStepIndex : t.launchStepIndex;
+      if (destStep === null) return null;
+      const useToolOut =
+        state.attachToolOutputs &&
+        t.callerStepIndex !== null &&
+        t.launchStepIndex !== null &&
+        String(t.callerStepIndex) !== String(t.launchStepIndex);
+      return {
+        destStepIndex: destStep,
+        toolOutStep: useToolOut ? t.launchStepIndex : null,
+        kind: "to-source",
+        label: t.callerStepIndex !== null ? `↩ Команда #${t.callerStepIndex}` : `↩ Запуск #${t.launchStepIndex}`,
+        desc:
+          t.callerStepIndex !== null
+            ? `Перейти к исходной команде #${t.callerStepIndex}${t.launchStepIndex !== null ? ` (фон #${t.launchStepIndex})` : ""}`
+            : `Перейти к запуску задачи #${t.launchStepIndex}`,
+      };
+    }
+
+    if (t.resultStepIndex !== null) {
+      return {
+        destStepIndex: t.resultStepIndex,
+        toolOutStep: null,
+        kind: "to-result",
+        label: `↗ Результат #${t.resultStepIndex}`,
+        desc: `Перейти к результату фоновой задачи #${t.resultStepIndex}`,
+      };
+    }
+
+    // Fallback: if this step is an awaited timer launch whose own task didn't fire, link caller
+    if (preferredRole === "launch" && !state.attachToolOutputs && t.callerStepIndex !== null) {
+      return {
+        destStepIndex: t.callerStepIndex,
+        toolOutStep: null,
+        kind: "to-source",
+        label: `↩ Команда #${t.callerStepIndex}`,
+        desc: `Перейти к запросившей команде #${t.callerStepIndex}`,
+      };
+    }
+    return null;
+  }
+
+  function getHeaderTaskPillsHtml(stepObj, scope = "step") {
+    if (!stepObj) return "";
+    const evs = stepTaskMetaMap.get(stepObj);
+    if (!evs || !evs.length) return "";
+    const pills = [];
+    const seenKeys = new Set();
+    const pushLink = (dest, tipTitle, extraLabel = "") => {
+      if (!dest) return;
+      const k = `${dest.kind}:${dest.destStepIndex}:${dest.toolOutStep ?? ""}:${extraLabel}`;
+      if (seenKeys.has(k)) return;
+      seenKeys.add(k);
+      const url = buildStepShareUrl(dest.destStepIndex);
+      const text = extraLabel || dest.label;
+      const toolAttr = dest.toolOutStep !== null && dest.toolOutStep !== undefined
+        ? ` data-jump-tool-out="${escHtml(dest.toolOutStep)}"`
+        : "";
+      pills.push(
+        `<a class="task-link-pill task-link-${dest.kind}" href="${escHtml(url)}" data-jump-step="${escHtml(dest.destStepIndex)}"${toolAttr} ${makeTipAttrs(
+          tipTitle,
+          dest.desc,
+          url
+        )}>${escHtml(text)}</a>`
+      );
+    };
+
+    for (const ev of evs) {
+      const t = ev.taskId ? taskIndexMap.get(ev.taskId) : null;
+      if (ev.role === "result" && t) {
+        const dest = resolveTaskLinkDestination(ev.taskId, stepObj, "result");
+        pushLink(dest, "Перейти к запросившей команде");
+        if (!state.attachToolOutputs && t.launchStepIndex !== null && t.callerStepIndex !== null && t.launchStepIndex !== t.callerStepIndex) {
+          pushLink(
+            {
+              destStepIndex: t.launchStepIndex,
+              toolOutStep: null,
+              kind: "to-source",
+              label: `⚙ Фон #${t.launchStepIndex}`,
+              desc: `Перейти к фоновому шагу запуска #${t.launchStepIndex}`,
+            },
+            "Перейти к фоновому запуску"
+          );
+        }
+      } else if (ev.role === "launch" && t) {
+        const dest = resolveTaskLinkDestination(ev.taskId, stepObj, "launch");
+        if (dest && dest.kind === "to-result") {
+          pushLink(dest, "Перейти к результату фоновой задачи");
+        } else {
+          // Check if this launch is an awaited timer whose awaited task has a result
+          const awaitedEv = evs.find((x) => x.role === "awaited" && x.awaitedTaskId);
+          const awaitedDest = awaitedEv ? resolveTaskLinkDestination(awaitedEv.awaitedTaskId, stepObj, "wait") : null;
+          if (awaitedDest) {
+            pushLink(awaitedDest, "Перейти к ожидаемому результату");
+          } else {
+            const pKey = `pending:${ev.taskId}`;
+            if (!seenKeys.has(pKey)) {
+              seenKeys.add(pKey);
+              pills.push(
+                `<span class="task-link-pill task-link-pending" ${makeTipAttrs(
+                  "Фоновая задача без итогового SYSTEM_MESSAGE",
+                  "Результат для этой задачи пока не обнаружен в логе (ещё выполняется или отменён).",
+                  ev.taskId
+                )}>⏳ Фон</span>`
+              );
+            }
+            if (dest) pushLink(dest, "Перейти к команде");
+          }
+        }
+        if (scope === "step" && !state.attachToolOutputs && t.callerStepIndex !== null) {
+          pushLink(
+            {
+              destStepIndex: t.callerStepIndex,
+              toolOutStep: null,
+              kind: "to-source",
+              label: `↩ Команда #${t.callerStepIndex}`,
+              desc: `Перейти к команде #${t.callerStepIndex}`,
+            },
+            "Перейти к запросившей команде"
+          );
+        }
+      } else if ((ev.role === "caller" || ev.role === "wait" || ev.role === "cancel") && t) {
+        const dest = resolveTaskLinkDestination(ev.taskId, stepObj, ev.role);
+        if (dest && dest.kind === "to-result") {
+          pushLink(dest, "Перейти к результату фоновой задачи");
+        }
+      } else if (ev.role === "awaited" && ev.awaitedTaskId) {
+        const dest = resolveTaskLinkDestination(ev.awaitedTaskId, stepObj, "wait");
+        if (dest && dest.kind === "to-result") {
+          pushLink(dest, "Перейти к результату ожидаемой задачи");
+        }
+      }
+    }
+    return pills.join("");
+  }
+
+  function linkifyTaskIdsInElement(rootEl, stepObj = null) {
+    if (!rootEl || taskIndexMap.size === 0) return;
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !node.nodeValue.includes("/task-")) return NodeFilter.FILTER_REJECT;
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (p.closest("a, button, script, style, textarea, input, select, .task-link-pill, .step-num-chip, .inline-raw-pre, .copy-bar")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const nodes = [];
+    let cur;
+    while ((cur = walker.nextNode())) nodes.push(cur);
+    if (!nodes.length) return;
+
+    const evs = stepObj ? (stepTaskMetaMap.get(stepObj) || []) : [];
+    const roleHint = evs.some((e) => e.role === "result") ? "result" : "";
+
+    for (const tn of nodes) {
+      const txt = tn.nodeValue;
+      BG_TASK_ID_RE.lastIndex = 0;
+      let m;
+      let pos = 0;
+      let matched = false;
+      const frag = document.createDocumentFragment();
+      while ((m = BG_TASK_ID_RE.exec(txt)) !== null) {
+        const tid = m[1];
+        const dest = resolveTaskLinkDestination(tid, stepObj, roleHint);
+        if (!dest) continue;
+        matched = true;
+        if (m.index > pos) frag.appendChild(document.createTextNode(txt.slice(pos, m.index)));
+        const a = document.createElement("a");
+        a.className = `task-step-link task-link-${dest.kind}`;
+        a.href = buildStepShareUrl(dest.destStepIndex);
+        a.dataset.jumpStep = String(dest.destStepIndex);
+        if (dest.toolOutStep !== null && dest.toolOutStep !== undefined) {
+          a.dataset.jumpToolOut = String(dest.toolOutStep);
+        }
+        a.dataset.tipTitle = `${dest.label} (${tid})`;
+        a.dataset.tipDesc = dest.desc;
+        a.dataset.tipRaw = a.href;
+        a.textContent = tid;
+        frag.appendChild(a);
+        pos = m.index + tid.length;
+      }
+      if (matched) {
+        if (pos < txt.length) frag.appendChild(document.createTextNode(txt.slice(pos)));
+        tn.parentNode.replaceChild(frag, tn);
+      }
+    }
+  }
+
   function pairToolOutputs(steps) {
     const attachedByPlanner = new Map(); // plannerStep -> array of genericSteps
     const attachedSet = new Set();       // genericSteps consumed into a planner
@@ -2863,6 +3234,197 @@
     return blob;
   }
 
+  let _cachedSearchAstRaw = null;
+  let _cachedSearchAst = null;
+
+  function parseSearchQuery(rawQuery) {
+    const raw = String(rawQuery || "").trim();
+    if (!raw) return null;
+    const tokens = [];
+    let i = 0;
+    const n = raw.length;
+    while (i < n) {
+      if (/\s/.test(raw[i])) {
+        i++;
+        continue;
+      }
+      if (raw[i] === "(") {
+        tokens.push({ type: "LPAREN" });
+        i++;
+        continue;
+      }
+      if (raw[i] === ")") {
+        tokens.push({ type: "RPAREN" });
+        i++;
+        continue;
+      }
+      if (raw[i] === "|") {
+        tokens.push({ type: "OR" });
+        i += raw[i + 1] === "|" ? 2 : 1;
+        continue;
+      }
+      if (raw[i] === "!") {
+        tokens.push({ type: "NOT" });
+        i++;
+        continue;
+      }
+      if (raw[i] === "-" && (raw[i + 1] === '"' || raw[i + 1] === "(")) {
+        tokens.push({ type: "NOT" });
+        i++;
+        continue;
+      }
+      if (raw[i] === '"') {
+        i++;
+        let buf = "";
+        while (i < n && raw[i] !== '"') {
+          if (raw[i] === "\\" && i + 1 < n && (raw[i + 1] === '"' || raw[i + 1] === "\\")) {
+            buf += raw[i + 1];
+            i += 2;
+          } else {
+            buf += raw[i];
+            i++;
+          }
+        }
+        if (i < n && raw[i] === '"') i++;
+        if (buf.length > 0) {
+          tokens.push({ type: "TERM", text: buf, lower: buf.toLowerCase(), quoted: true });
+        }
+        continue;
+      }
+      let start = i;
+      while (i < n && !/[\s()|"]/.test(raw[i])) {
+        i++;
+      }
+      const w = raw.slice(start, i);
+      if (!w) continue;
+      if (w === "OR") {
+        tokens.push({ type: "OR" });
+      } else if (w === "AND") {
+        tokens.push({ type: "AND" });
+      } else if (w === "NOT") {
+        tokens.push({ type: "NOT" });
+      } else if (w.startsWith("-") && w.length > 1) {
+        const inner = w.slice(1);
+        tokens.push({ type: "NOT" });
+        tokens.push({ type: "TERM", text: inner, lower: inner.toLowerCase(), quoted: false });
+      } else {
+        tokens.push({ type: "TERM", text: w, lower: w.toLowerCase(), quoted: false });
+      }
+    }
+    if (!tokens.length) return null;
+
+    let pos = 0;
+    const peek = () => tokens[pos] || null;
+    const consume = () => tokens[pos++];
+
+    const canStartPrimary = (tok) =>
+      tok && (tok.type === "TERM" || tok.type === "LPAREN" || tok.type === "NOT");
+
+    const parseOr = () => {
+      let left = parseAnd();
+      while (peek() && peek().type === "OR") {
+        consume();
+        if (!peek() || peek().type === "RPAREN") break;
+        const right = parseAnd();
+        if (left && right) left = { type: "OR", left, right };
+        else left = left || right;
+      }
+      return left;
+    };
+
+    const parseAnd = () => {
+      let left = parseUnary();
+      while (peek()) {
+        const t = peek();
+        if (t.type === "AND") {
+          consume();
+          if (!peek() || peek().type === "RPAREN" || peek().type === "OR") break;
+          const right = parseUnary();
+          if (left && right) left = { type: "AND", left, right };
+          else left = left || right;
+        } else if (canStartPrimary(t)) {
+          const right = parseUnary();
+          if (left && right) left = { type: "AND", left, right };
+          else left = left || right;
+        } else {
+          break;
+        }
+      }
+      return left;
+    };
+
+    const parseUnary = () => {
+      const t = peek();
+      if (t && t.type === "NOT") {
+        consume();
+        const child = parseUnary();
+        return child ? { type: "NOT", child } : null;
+      }
+      return parsePrimary();
+    };
+
+    const parsePrimary = () => {
+      const t = peek();
+      if (!t) return null;
+      if (t.type === "LPAREN") {
+        consume();
+        const inner = parseOr();
+        if (peek() && peek().type === "RPAREN") consume();
+        return inner;
+      }
+      if (t.type === "TERM") {
+        consume();
+        return t;
+      }
+      // Recover gracefully from stray operators
+      consume();
+      return null;
+    };
+
+    return parseOr();
+  }
+
+  function getCachedSearchAst(rawQuery) {
+    const q = String(rawQuery || "");
+    if (q !== _cachedSearchAstRaw) {
+      _cachedSearchAstRaw = q;
+      _cachedSearchAst = parseSearchQuery(q);
+    }
+    return _cachedSearchAst;
+  }
+
+  function evalSearchAst(node, blobLower) {
+    if (!node) return true;
+    if (node.type === "TERM") return node.lower ? blobLower.includes(node.lower) : true;
+    if (node.type === "NOT") return node.child ? !evalSearchAst(node.child, blobLower) : true;
+    if (node.type === "AND") return evalSearchAst(node.left, blobLower) && evalSearchAst(node.right, blobLower);
+    if (node.type === "OR") return evalSearchAst(node.left, blobLower) || evalSearchAst(node.right, blobLower);
+    return true;
+  }
+
+  function getPositiveSearchTerms(node, negated = false, out = null) {
+    const acc = out || new Set();
+    if (!node) return [];
+    if (node.type === "TERM") {
+      if (!negated && node.lower) acc.add(node.lower);
+    } else if (node.type === "NOT") {
+      if (node.child) getPositiveSearchTerms(node.child, !negated, acc);
+    } else if (node.type === "AND" || node.type === "OR") {
+      getPositiveSearchTerms(node.left, negated, acc);
+      getPositiveSearchTerms(node.right, negated, acc);
+    }
+    if (!out) {
+      return Array.from(acc).sort((a, b) => b.length - a.length);
+    }
+    return null;
+  }
+
+  function getTurnSearchBlob(step, attachedOutputs = null) {
+    const base = getStepSearchBlob(step);
+    if (!Array.isArray(attachedOutputs) || !attachedOutputs.length) return base;
+    return `${base} ${attachedOutputs.map(getStepSearchBlob).join(" ")}`;
+  }
+
   function getStepMatchingCmdKeys(step, attachedOutputs = null) {
     const matched = [];
     if (!step) return matched;
@@ -2920,14 +3482,9 @@
     }
 
     if (state.stepQuery) {
-      const q = state.stepQuery.toLowerCase();
-      if (getStepSearchBlob(step).includes(q)) return true;
-      if (Array.isArray(attachedOutputs)) {
-        for (const g of attachedOutputs) {
-          if (getStepSearchBlob(g).includes(q)) return true;
-        }
-      }
-      return false;
+      const ast = getCachedSearchAst(state.stepQuery);
+      if (!ast) return true;
+      return evalSearchAst(ast, getTurnSearchBlob(step, attachedOutputs));
     }
     return true;
   }
@@ -2971,6 +3528,7 @@
 
     const activeModel = step.type === "PLANNER_RESPONSE" ? (stepModelMap.get(step) || "") : "";
     const shareStepUrl = buildStepShareUrl(step.step_index);
+    const taskHeaderPillsHtml = getHeaderTaskPillsHtml(step, "step");
 
     let headHtml = `
       <span class="badge badge-${escHtml(step.type)}${isFinalPlanner ? " is-final" : ""}" ${makeTipAttrs(
@@ -2986,6 +3544,8 @@
         "Порядковый индекс шага в логе сессии. Клик копирует активную ссылку для браузера и ИИ.",
         shareStepUrl
       )}>#${escHtml(step.step_index)}</span>
+
+      ${taskHeaderPillsHtml}
 
       ${activeModel ? `<span class="meta-chip meta-chip-model" ${makeTipAttrs(
         `Модель ИИ: ${activeModel}`,
@@ -3189,6 +3749,20 @@
           const tcHead = document.createElement("div");
           tcHead.className = "tool-head";
           const initArgsMode = state.expandAllOutputs || state.readDisplayMode === "full" ? "full" : "scroll";
+          let tcTaskPillHtml = "";
+          const stepTaskEvs = stepTaskMetaMap.get(step) || [];
+          const tcEv = stepTaskEvs.find((ev) => ev.toolIdx === tcIdx && ev.taskId);
+          if (tcEv) {
+            const tcDest = resolveTaskLinkDestination(tcEv.taskId, step, tcEv.role);
+            if (tcDest && tcDest.kind === "to-result") {
+              const tcUrl = buildStepShareUrl(tcDest.destStepIndex);
+              tcTaskPillHtml = `<a class="task-link-pill task-link-to-result" href="${escHtml(tcUrl)}" data-jump-step="${escHtml(tcDest.destStepIndex)}" ${makeTipAttrs(
+                "Перейти к результату фоновой задачи",
+                tcDest.desc,
+                tcUrl
+              )}>${escHtml(tcDest.label)}</a>`;
+            }
+          }
 
           tcHead.innerHTML = `
             <span class="tool-name" ${makeTipAttrs(
@@ -3198,6 +3772,7 @@
             )}>${escHtml(tc.name || "tool")}</span>
             ${outIsOk ? '<span class="tool-ok-badge" title="Выполнено успешно">✓</span>' : ""}
             ${outHasErr ? '<span class="tool-err-badge" title="Инструмент завершился с ошибкой">⚠</span>' : ""}
+            ${tcTaskPillHtml}
             <span class="tool-summary"></span>
             <button type="button" class="raw-btn" ${makeTipAttrs(
               "Исходник вызова инструмента",
@@ -3338,6 +3913,7 @@
                   )}</span>`
               )
               .join("");
+            const resTaskPillsHtml = getHeaderTaskPillsHtml(outStep, "result-box");
 
             resHead.innerHTML = `
               <span class="badge badge-GENERIC" ${makeTipAttrs(
@@ -3350,6 +3926,7 @@
                 "Порядковый номер шага ответа инструмента в JSONL. Клик копирует активную ссылку для браузера и ИИ.",
                 buildStepShareUrl(outStep.step_index)
               )}>#${escHtml(outStep.step_index)}</span>
+              ${resTaskPillsHtml}
               <span class="meta-chip" ${makeTipAttrs(
                 `source: ${outStep.source}`,
                 SOURCE_DOCS[outStep.source] || "Источник события.",
@@ -3502,7 +4079,15 @@
             appendUnknownTagDrawers(extraTags);
           }
         } else if (step.type === "GENERIC") {
-          const genRes = renderGenericContent(stepBody, step.content, "", null, null, card);
+          const stepToolMeta = stepToolMetaMap.get(step);
+          const genRes = renderGenericContent(
+            stepBody,
+            step.content,
+            stepToolMeta ? stepToolMeta.toolName : "",
+            stepToolMeta ? stepToolMeta.toolArgs : null,
+            null,
+            card
+          );
           const { chips, contentWrap } = genRes;
           const tokBar = head.querySelector(".tok-bar");
           const cardRawBtn = head.querySelector(".raw-btn");
@@ -3665,6 +4250,11 @@
 
   function clearCardHighlight(card) {
     if (!card) return;
+    const hitEls = card.querySelectorAll(".search-hit-target");
+    for (const hEl of hitEls) {
+      hEl.classList.remove("search-hit-target");
+    }
+    card.classList.remove("search-hit-target");
     const marks = card.querySelectorAll("mark.hl");
     for (const mark of marks) {
       const p = mark.parentNode;
@@ -3687,6 +4277,7 @@
     if (!card) return;
     if (card.dataset.enhanced !== "1") {
       card.dataset.enhanced = "1";
+      linkifyTaskIdsInElement(card, rawStepMap.get(card) || null);
       linkifyElement(card);
     }
     if (state.stepQuery) {
@@ -3896,8 +4487,12 @@
               fw.scrollTop = fw.scrollHeight;
               _lastScrollFrameTop = fw.scrollTop;
             } else if (jumpLockValid) {
-              _suppressScrollTsUntil = performance.now() + 100;
-              fw.scrollTop = Math.max(0, getVListBaseTop() + _activeJumpLock.item.offsetY - _activeJumpLock.desiredTop);
+              _suppressScrollTsUntil = performance.now() + 120;
+              if (typeof _activeJumpLock.alignFn === "function") {
+                _activeJumpLock.alignFn();
+              } else {
+                fw.scrollTop = Math.max(0, getVListBaseTop() + _activeJumpLock.item.offsetY - _activeJumpLock.desiredTop);
+              }
               _lastScrollFrameTop = fw.scrollTop;
             } else if (anchorLockValid) {
               _suppressScrollTsUntil = performance.now() + 100;
@@ -4271,24 +4866,23 @@
     }
     if (!item || !els.feedWrap) return;
 
-    const desiredTop = opts.topOffset !== undefined ? opts.topOffset : 18;
+    const desiredTop = opts.topOffset !== undefined ? opts.topOffset : 4;
+    const subStepKey = opts.toolOutStep !== undefined && opts.toolOutStep !== null ? String(opts.toolOutStep) : "";
     const topCard = ensureRealVElement(item);
     // Warm immediate +/- 2 neighbors cleanly before scroll
     for (let k = Math.max(0, item.idx - 2); k <= Math.min(_vItems.length - 1, item.idx + 2); k++) {
       ensureRealVElement(_vItems[k]);
     }
 
-    _pinBottomLockUntil = 0;
-    _activeAnchorLock = null;
-    _activeJumpLock = { item, desiredTop, expiresAt: performance.now() + 500 };
-    _suppressScrollTsUntil = performance.now() + 200;
-    _suppressRoScrollCompUntil = performance.now() + 250;
-    const baseTop = getVListBaseTop();
-    els.feedWrap.scrollTop = Math.max(0, baseTop + item.offsetY - desiredTop);
-    _lastScrollFrameTop = els.feedWrap.scrollTop;
-    syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+    const resolveTarget = () => {
+      if (subStepKey) {
+        const sub = topCard.querySelector(`[data-step-index="${CSS.escape(subStepKey)}"]`);
+        if (sub) return sub;
+      }
+      return topCard.querySelector(`[data-step-index="${CSS.escape(key)}"]`) || topCard;
+    };
 
-    let target = topCard.querySelector(`[data-step-index="${stepIndex}"]`) || topCard;
+    let target = resolveTarget();
     let p = target.parentElement;
     while (p && p !== els.feed) {
       if (p.tagName === "DETAILS" && !p.open) p.open = true;
@@ -4298,20 +4892,44 @@
     const alignToTarget = () => {
       if (!target.isConnected) {
         syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
-        target = topCard.querySelector(`[data-step-index="${stepIndex}"]`) || topCard;
+        target = resolveTarget();
       }
       if (!target.isConnected) return;
       const wrapRect = els.feedWrap.getBoundingClientRect();
       const tgtRect = target.getBoundingClientRect();
       const delta = tgtRect.top - wrapRect.top - desiredTop;
-      if (Math.abs(delta) > 2) {
+      if (Math.abs(delta) > 1.5) {
         _suppressScrollTsUntil = performance.now() + 140;
         els.feedWrap.scrollTop = Math.max(0, els.feedWrap.scrollTop + delta);
         _lastScrollFrameTop = els.feedWrap.scrollTop;
       }
     };
+
+    _pinBottomLockUntil = 0;
+    _activeAnchorLock = null;
+    const jumpLock = { item, desiredTop, expiresAt: performance.now() + 1200, alignFn: alignToTarget };
+    _activeJumpLock = jumpLock;
+    _suppressScrollTsUntil = performance.now() + 240;
+    _suppressRoScrollCompUntil = performance.now() + 280;
+    const baseTop = getVListBaseTop();
+    els.feedWrap.scrollTop = Math.max(0, baseTop + item.offsetY - desiredTop);
+    _lastScrollFrameTop = els.feedWrap.scrollTop;
+    syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+
+    target = resolveTarget();
+    p = target.parentElement;
+    while (p && p !== els.feed) {
+      if (p.tagName === "DETAILS" && !p.open) p.open = true;
+      p = p.parentElement;
+    }
+
     alignToTarget();
-    requestAnimationFrame(alignToTarget);
+    requestAnimationFrame(() => {
+      if (_activeJumpLock === jumpLock) alignToTarget();
+    });
+    setTimeout(() => {
+      if (_activeJumpLock === jumpLock && performance.now() < jumpLock.expiresAt) alignToTarget();
+    }, 90);
 
     target.classList.remove("step-flash");
     void target.offsetWidth;
@@ -4320,7 +4938,8 @@
   }
 
   function extractMatchSnippet(step, query, attachedOutputs = null) {
-    const qLower = query.toLowerCase();
+    const ast = getCachedSearchAst(query);
+    const terms = getPositiveSearchTerms(ast);
     const attachedChips = Array.isArray(attachedOutputs)
       ? attachedOutputs.flatMap((g) => (g.content ? parseGenericOutput(g.content).chips.map((c) => c.label) : [])).join(" ")
       : "";
@@ -4340,23 +4959,47 @@
       ["output", attachedText],
       ["meta", metaLabel],
     ];
-    for (const [label, raw] of sources) {
-      if (!raw) continue;
-      const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
-      const idx = clean.toLowerCase().indexOf(qLower);
-      if (idx !== -1) {
-        const start = Math.max(0, idx - 36);
-        const end = Math.min(clean.length, idx + query.length + 54);
-        const prefix = start > 0 ? "…" : "";
-        const suffix = end < clean.length ? "…" : "";
-        const before = escHtml(clean.slice(start, idx));
-        const match = escHtml(clean.slice(idx, idx + query.length));
-        const after = escHtml(clean.slice(idx + query.length, end));
-        const tag = label === "content" ? "" : `[${label}] `;
-        return `${escHtml(tag)}${prefix}${before}<mark class="hl">${match}</mark>${after}${suffix}`;
+    if (terms.length > 0) {
+      for (const [label, raw] of sources) {
+        if (!raw) continue;
+        const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
+        const lower = clean.toLowerCase();
+        let bestIdx = -1;
+        let bestTerm = "";
+        for (const t of terms) {
+          const idx = lower.indexOf(t);
+          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx || (idx === bestIdx && t.length > bestTerm.length))) {
+            bestIdx = idx;
+            bestTerm = t;
+          }
+        }
+        if (bestIdx !== -1) {
+          const start = Math.max(0, bestIdx - 36);
+          const end = Math.min(clean.length, bestIdx + bestTerm.length + 54);
+          const prefix = start > 0 ? "…" : "";
+          const suffix = end < clean.length ? "…" : "";
+          const before = escHtml(clean.slice(start, bestIdx));
+          const match = escHtml(clean.slice(bestIdx, bestIdx + bestTerm.length));
+          const after = escHtml(clean.slice(bestIdx + bestTerm.length, end));
+          const tag = label === "content" ? "" : `[${label}] `;
+          return `${escHtml(tag)}${prefix}${before}<mark class="hl">${match}</mark>${after}${suffix}`;
+        }
       }
     }
-    return escHtml(`[${step.type}] #${step.step_index}`);
+    const fallbackSrc = unescapeNewlines(step.content || step.thinking || step.error || "").replace(/\s+/g, " ").trim();
+    return escHtml(fallbackSrc ? `[${step.type}] #${step.step_index}: ${fallbackSrc.slice(0, 80)}` : `[${step.type}] #${step.step_index}`);
+  }
+
+  function extractPlainMatchSnippet(step, query, attachedOutputs = null) {
+    const html = extractMatchSnippet(step, query, attachedOutputs) || "";
+    const txt = html
+      .replace(/<\/?mark\b[^>]*>/gi, "")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+    return txt;
   }
 
   function renderCacheMapAndToc(preAttachedByPlanner = null) {
@@ -4398,9 +5041,7 @@
       for (const s of state.steps) {
         if (isFiltered) {
           const attached = attachedByPlanner.get(s) || null;
-          const matchesSelf = stepMatchesFilter(s, attached);
-          const matchesAttached = attached ? attached.some((g) => stepMatchesFilter(g, null)) : false;
-          if (!matchesSelf && !matchesAttached) continue;
+          if (!stepMatchesFilter(s, attached)) continue;
         }
 
         const hasTok =
@@ -4623,7 +5264,10 @@
               <option value="ask" ${state.fileOpenMode === "ask" ? "selected" : ""}>❓ Спрашивать каждый раз</option>
               <option value="browser_fmt" ${state.fileOpenMode === "browser_fmt" ? "selected" : ""}>🌐 В браузере с форматированием</option>
               <option value="browser_raw" ${state.fileOpenMode === "browser_raw" ? "selected" : ""}>📄 В браузере как текст (Raw)</option>
-              <option value="system" ${state.fileOpenMode === "system" ? "selected" : ""}>🖥️ В системной программе</option>
+              ${state.capabilities?.open_notepadpp
+                ? `<option value="notepadpp" ${state.fileOpenMode === "notepadpp" ? "selected" : ""}>📝 Редактировать в Notepad++</option>`
+                : ""}
+              <option value="system" ${state.fileOpenMode === "system" ? "selected" : ""}>🖥️ Запустить / открыть в системе</option>
             </select>
             <button type="button" id="optFileOpenReset" class="file-mode-reset-btn${state.fileOpenMode === "ask" ? " hidden" : ""}" title="Сбросить запомненный выбор и снова спрашивать при каждом клике">Сбросить</button>
           </label>
@@ -4737,6 +5381,7 @@
       const row = ev.target.closest(".toc-row[data-jump]");
       if (row) {
         selectTocStep(row.dataset.jump, false);
+        clearHashStepIfScrolledAway();
         jumpToStep(row.dataset.jump);
       }
     });
@@ -4759,9 +5404,11 @@
         const rowTarget = ev.target.closest(".toc-row[data-jump]");
         if (rowTarget) {
           ev.preventDefault();
+          clearHashStepIfScrolledAway();
           jumpToStep(rowTarget.dataset.jump);
         } else if (selectedTocStep) {
           ev.preventDefault();
+          clearHashStepIfScrolledAway();
           jumpToStep(selectedTocStep);
         }
       }
@@ -4772,45 +5419,207 @@
   }
 
   function highlightMatches(rootEl, query) {
-    if (!query) return;
-    const qLower = query.toLowerCase();
+    if (!rootEl || !query) return;
+    const ast = getCachedSearchAst(query);
+    const terms = getPositiveSearchTerms(ast);
+    if (!terms.length) return;
+
+    const BLOCK_TAGS = new Set([
+      "ARTICLE", "SECTION", "DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6",
+      "LI", "UL", "OL", "BLOCKQUOTE", "PRE", "TABLE", "THEAD", "TBODY", "TR", "TH", "TD",
+      "SUMMARY", "DETAILS",
+    ]);
+    const INLINE_RUN_ISOLATE_SEL =
+      ".tool-name, .badge, .step-num-chip, .meta-chip, .status-pill, .task-link-pill, .step-ts";
+
+    const getRunScope = (textNode) => {
+      let cur = textNode.parentElement;
+      if (!cur) return rootEl;
+      const isolated = cur.closest(INLINE_RUN_ISOLATE_SEL);
+      if (isolated && rootEl.contains(isolated)) return isolated;
+      while (cur && cur !== rootEl) {
+        if (
+          BLOCK_TAGS.has(cur.tagName) ||
+          cur.classList.contains("tool-summary") ||
+          cur.classList.contains("arg-val-inline") ||
+          cur.classList.contains("arg-key")
+        ) {
+          return cur;
+        }
+        cur = cur.parentElement;
+      }
+      return rootEl;
+    };
+
     const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        if (!node.nodeValue || !node.nodeValue.toLowerCase().includes(qLower)) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        const parentTag = node.parentElement ? node.parentElement.tagName : "";
-        if (parentTag === "BUTTON" || parentTag === "SCRIPT" || parentTag === "STYLE") {
+        if (!node.nodeValue || node.nodeValue.length === 0) return NodeFilter.FILTER_REJECT;
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (
+          p.tagName === "BUTTON" ||
+          p.tagName === "SCRIPT" ||
+          p.tagName === "STYLE" ||
+          p.closest("button, script, style, .copy-bar, .code-gutter-num, .md-gutter-num, .compaction-num")
+        ) {
           return NodeFilter.FILTER_REJECT;
         }
         return NodeFilter.FILTER_ACCEPT;
       },
     });
 
-    const nodes = [];
-    let cur;
-    while ((cur = walker.nextNode())) nodes.push(cur);
+    const runs = [];
+    let curScope = null;
+    let curNodes = [];
+    let curNode;
+    while ((curNode = walker.nextNode())) {
+      const scope = getRunScope(curNode);
+      if (scope !== curScope) {
+        if (curNodes.length) runs.push(curNodes);
+        curScope = scope;
+        curNodes = [curNode];
+      } else {
+        curNodes.push(curNode);
+      }
+    }
+    if (curNodes.length) runs.push(curNodes);
 
-    for (const textNode of nodes) {
-      const text = textNode.nodeValue;
-      const lower = text.toLowerCase();
-      const frag = document.createDocumentFragment();
-      let pos = 0;
-      let idx;
-      while ((idx = lower.indexOf(qLower, pos)) !== -1) {
-        if (idx > pos) {
-          frag.appendChild(document.createTextNode(text.slice(pos, idx)));
+    const findMatchRanges = (fullLower) => {
+      const candidates = [];
+      for (const term of terms) {
+        let pos = 0;
+        let idx;
+        while ((idx = fullLower.indexOf(term, pos)) !== -1) {
+          candidates.push([idx, idx + term.length]);
+          pos = idx + Math.max(1, term.length);
         }
-        const mark = document.createElement("mark");
-        mark.className = "hl";
-        mark.textContent = text.slice(idx, idx + query.length);
-        frag.appendChild(mark);
-        pos = idx + query.length;
       }
-      if (pos < text.length) {
-        frag.appendChild(document.createTextNode(text.slice(pos)));
+      if (!candidates.length) return [];
+      candidates.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+      const nonOverlapping = [];
+      let lastEnd = 0;
+      for (const [s, e] of candidates) {
+        if (s >= lastEnd) {
+          nonOverlapping.push([s, e]);
+          lastEnd = e;
+        }
       }
-      textNode.parentNode.replaceChild(frag, textNode);
+      return nonOverlapping;
+    };
+
+    const createdMarks = [];
+    for (const runNodes of runs) {
+      let totalLen = 0;
+      const segs = runNodes.map((n) => {
+        const txt = n.nodeValue;
+        const s = totalLen;
+        totalLen += txt.length;
+        return { node: n, text: txt, start: s, end: totalLen };
+      });
+      const fullText = segs.map((sg) => sg.text).join("");
+      const fullLower = fullText.toLowerCase();
+      let hasAny = false;
+      for (const term of terms) {
+        if (fullLower.includes(term)) {
+          hasAny = true;
+          break;
+        }
+      }
+      if (!hasAny) continue;
+
+      const ranges = findMatchRanges(fullLower);
+      if (!ranges.length) continue;
+
+      let rIdx = 0;
+      for (const sg of segs) {
+        while (rIdx < ranges.length && ranges[rIdx][1] <= sg.start) rIdx++;
+        if (rIdx >= ranges.length) break;
+        const firstR = rIdx;
+        if (ranges[firstR][0] >= sg.end) continue;
+
+        const frag = document.createDocumentFragment();
+        let localPos = 0;
+        let curR = firstR;
+        while (curR < ranges.length && ranges[curR][0] < sg.end) {
+          const overlapStart = Math.max(0, ranges[curR][0] - sg.start);
+          const overlapEnd = Math.min(sg.text.length, ranges[curR][1] - sg.start);
+          if (overlapStart > localPos) {
+            frag.appendChild(document.createTextNode(sg.text.slice(localPos, overlapStart)));
+          }
+          if (overlapEnd > overlapStart) {
+            const mark = document.createElement("mark");
+            mark.className = "hl";
+            mark.textContent = sg.text.slice(overlapStart, overlapEnd);
+            frag.appendChild(mark);
+            createdMarks.push(mark);
+          }
+          localPos = Math.max(localPos, overlapEnd);
+          if (ranges[curR][1] <= sg.end) curR++;
+          else break;
+        }
+        rIdx = curR;
+        if (localPos < sg.text.length) {
+          frag.appendChild(document.createTextNode(sg.text.slice(localPos)));
+        }
+        if (sg.node.parentNode) {
+          sg.node.parentNode.replaceChild(frag, sg.node);
+        }
+      }
+    }
+
+    if (!createdMarks.length) return;
+
+    const HIT_BLOCK_SEL = [
+      ".arg-row",
+      ".tool-head",
+      ".tool-result",
+      ".tool-card",
+      ".code-gutter-row",
+      ".md-gutter-row",
+      ".md > pre",
+      ".md > blockquote",
+      ".md > table",
+      ".md li",
+      ".md p",
+      ".md h1",
+      ".md h2",
+      ".md h3",
+      ".md h4",
+      ".md h5",
+      ".md h6",
+      ".system-msg-body",
+      ".generic-content-wrap",
+      ".step-head",
+      ".block-body",
+      "article.step",
+    ].join(", ");
+
+    const rawTargets = new Set();
+    for (const mark of createdMarks) {
+      let p = mark.parentElement;
+      while (p && p !== rootEl) {
+        if (p.tagName === "DETAILS" && !p.open) p.open = true;
+        p = p.parentElement;
+      }
+      const blk = mark.closest(HIT_BLOCK_SEL);
+      if (blk && (rootEl === blk || rootEl.contains(blk))) {
+        rawTargets.add(blk);
+      }
+    }
+
+    // Keep only deepest/lowest container per branch so ancestor wrappers never get duplicate frames
+    const rawList = Array.from(rawTargets);
+    for (const t of rawList) {
+      let hasDescendant = false;
+      for (const other of rawList) {
+        if (other !== t && t.contains(other)) {
+          hasDescendant = true;
+          break;
+        }
+      }
+      if (!hasDescendant) {
+        t.classList.add("search-hit-target");
+      }
     }
   }
 
@@ -4979,10 +5788,7 @@
     for (const s of state.steps) {
       if (attachedSet.has(s)) continue;
       const attached = attachedByPlanner.get(s) || null;
-      const matchesSelf = stepMatchesFilter(s, attached);
-      const matchesAttached = attached ? attached.some((g) => stepMatchesFilter(g, null)) : false;
-
-      if (matchesSelf || ((state.stepQuery || state.filter === "errors" || state.onlyCmdErrors || state.cmdMapFilterOnly) && matchesAttached)) {
+      if (stepMatchesFilter(s, attached)) {
         if (state.filter === "dialog" && hiddenBetween.length > 0 && shown > 0) {
           pushExpandItem(hiddenBetween);
           hiddenBetween = [];
@@ -5102,6 +5908,20 @@
       state.steps.push(s);
     }
     updateStepModels(newSteps, false);
+    const prevTaskResMap = new Map();
+    for (const [tid, t] of taskIndexMap.entries()) {
+      prevTaskResMap.set(tid, t.resultStepIndex);
+    }
+    buildStepMetadataAndTaskIndex(state.steps);
+    const touchedEarlierSteps = new Set();
+    for (const [tid, t] of taskIndexMap.entries()) {
+      if (t.resultStepIndex !== prevTaskResMap.get(tid)) {
+        if (t.callerStepIndex !== null) touchedEarlierSteps.add(String(t.callerStepIndex));
+        if (t.launchStepIndex !== null) touchedEarlierSteps.add(String(t.launchStepIndex));
+        for (const ws of t.waitSteps) touchedEarlierSteps.add(String(ws));
+        for (const cs of t.cancelSteps) touchedEarlierSteps.add(String(cs));
+      }
+    }
     _tocBaseCache = null;
     if (state.userTzSource !== "transcript" && newSteps.some((s) => s.type === "USER_INPUT")) {
       if (calibrateUserTimezone(state.steps)) {
@@ -5225,13 +6045,7 @@
       for (const s of tailSlice) {
         if (attachedSet.has(s)) continue;
         const attached = attachedByPlanner.get(s) || null;
-        const matchesSelf = stepMatchesFilter(s, attached);
-        const matchesAttached = attached ? attached.some((g) => stepMatchesFilter(g, null)) : false;
-        if (
-          matchesSelf ||
-          ((state.stepQuery || state.filter === "errors" || state.onlyCmdErrors || state.cmdMapFilterOnly) &&
-            matchesAttached)
-        ) {
+        if (stepMatchesFilter(s, attached)) {
           pushTailItem(s, attached);
         }
       }
@@ -5240,6 +6054,23 @@
         if (stepMatchesFilter(s)) {
           pushTailItem(s, null);
         }
+      }
+    }
+
+    let invalidatedEarlier = false;
+    if (touchedEarlierSteps.size > 0) {
+      for (const sk of touchedEarlierSteps) {
+        const oldIt = _vStepToItemMap.get(sk);
+        if (!oldIt || oldIt.idx >= dirtyFromIdx) continue;
+        _lruMap.delete(oldIt);
+        if (oldIt.el) {
+          if (vResizeObserver) vResizeObserver.unobserve(oldIt.el);
+          _highlightedCards.delete(oldIt.el);
+          if (oldIt.el.isConnected) oldIt.el.remove();
+          oldIt.el = null;
+        }
+        oldIt.measured = false;
+        invalidatedEarlier = true;
       }
     }
 
@@ -5268,6 +6099,7 @@
     if (affectsToc) scheduleTocRefresh();
 
     const affectsMinimapNotches =
+      Boolean(state.stepQuery) ||
       (state.cmdMapKeys && state.cmdMapKeys.size > 0) ||
       newSteps.some(
         (s) =>
@@ -5287,7 +6119,7 @@
     if (wasFollowing) {
       scrollToBottom();
     } else {
-      const forceWin = _winEnd < _winStart || dirtyFromIdx <= _winEnd;
+      const forceWin = _winEnd < _winStart || dirtyFromIdx <= _winEnd || invalidatedEarlier;
       if (fw && savedScrollTop > 0) {
         const maxTop = Math.max(0, fw.scrollHeight - fw.clientHeight);
         const targetTop = Math.min(maxTop, savedScrollTop);
@@ -5318,11 +6150,25 @@
     }
   }
 
+  function clearHashStepIfScrolledAway() {
+    if (!state.activeId) return;
+    const h = window.location.hash || "";
+    if (!/(?:^|[#&])step=/.test(h)) return;
+    _suppressHashChange = true;
+    try {
+      history.replaceState(null, "", `#conv=${encodeURIComponent(state.activeId)}`);
+    } catch (_) {}
+    setTimeout(() => {
+      _suppressHashChange = false;
+    }, 0);
+  }
+
   function scrollToTop(openToc = false) {
     if (!els.feedWrap) return;
     _activeAnchorLock = null;
     _activeJumpLock = null;
     _pinBottomLockUntil = 0;
+    clearHashStepIfScrolledAway();
     _suppressScrollTsUntil = performance.now() + 180;
     _suppressRoScrollCompUntil = performance.now() + 250;
     if (openToc) {
@@ -5351,6 +6197,7 @@
     _activeAnchorLock = null;
     _activeJumpLock = null;
     _pinBottomLockUntil = performance.now() + 650;
+    clearHashStepIfScrolledAway();
     _suppressScrollTsUntil = performance.now() + 180;
     _suppressRoScrollCompUntil = performance.now() + 200;
     state.userScrolledUp = false;
@@ -5517,9 +6364,10 @@
           state.offset = payload.offset || 0;
           calibrateUserTimezone(state.steps);
           updateStepModels(state.steps, true);
+          buildStepMetadataAndTaskIndex(state.steps);
           renderFullFeed();
           if (wasScrolledUp && anchorStepKey) {
-            jumpToStep(anchorStepKey, { topOffset: 18 });
+            jumpToStep(anchorStepKey, { topOffset: 4 });
             requestAnimationFrame(updateScrollUiOnFrame);
           }
         } else {
@@ -5547,7 +6395,9 @@
 
   async function selectTranscript(convId, opts = {}) {
     if (!convId) return;
+    const loadSeq = ++_activeLoadSeq;
     const targetStep = opts && opts.targetStep !== undefined && opts.targetStep !== null ? String(opts.targetStep) : "";
+    _pendingNavStep = targetStep;
     closeStream();
     cancelVirtualTimers();
     clearVWindowDom();
@@ -5560,9 +6410,15 @@
     state.userScrolledUp = Boolean(targetStep);
     state.firstUnreadStepIndex = null;
     _suppressHashChange = true;
-    window.location.hash = targetStep
-      ? `conv=${encodeURIComponent(convId)}&step=${encodeURIComponent(targetStep)}`
-      : `conv=${encodeURIComponent(convId)}`;
+    try {
+      history.replaceState(
+        null,
+        "",
+        targetStep
+          ? `#conv=${encodeURIComponent(convId)}&step=${encodeURIComponent(targetStep)}`
+          : `#conv=${encodeURIComponent(convId)}`
+      );
+    } catch (_) {}
     setTimeout(() => { _suppressHashChange = false; }, 0);
     renderTranscriptList();
 
@@ -5573,6 +6429,10 @@
       const res = await fetch(`/api/transcript/${encodeURIComponent(convId)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      if (loadSeq !== _activeLoadSeq) return;
+      const resolvedTargetStep = _pendingNavStep || targetStep;
+      _pendingNavStep = "";
+      state.userScrolledUp = Boolean(resolvedTargetStep);
       const meta = data.meta || {};
       state.activeMeta = meta;
       state.activeLogPath = data.path || "";
@@ -5588,12 +6448,15 @@
       state.offset = data.offset || 0;
       calibrateUserTimezone(state.steps);
       updateStepModels(state.steps, true);
+      buildStepMetadataAndTaskIndex(state.steps);
 
-      if (targetStep && state.activeId === convId) {
-        const canonicalHash = buildStepShareUrl(targetStep).split("#")[1];
+      if (resolvedTargetStep && state.activeId === convId) {
+        const canonicalHash = buildStepShareUrl(resolvedTargetStep).split("#")[1];
         if (canonicalHash) {
           _suppressHashChange = true;
-          history.replaceState(null, "", `#${canonicalHash}`);
+          try {
+            history.replaceState(null, "", `#${canonicalHash}`);
+          } catch (_) {}
           setTimeout(() => { _suppressHashChange = false; }, 0);
         }
       }
@@ -5603,8 +6466,8 @@
       linkifyElement(els.convMeta, { treatTranscriptAsFile: true });
 
       renderFullFeed();
-      if (targetStep) {
-        jumpToStep(targetStep, { topOffset: 18 });
+      if (resolvedTargetStep) {
+        jumpToStep(resolvedTargetStep, { topOffset: 4 });
       }
       if (els.feedWrap) els.feedWrap.focus({ preventScroll: true });
       if (!els.cmdMapModal.classList.contains("hidden")) {
@@ -5979,6 +6842,19 @@
           frag.appendChild(selNotch);
         }
       }
+
+      if (state.stepQuery) {
+        const qNotch = document.createElement("button");
+        qNotch.type = "button";
+        qNotch.className = "minimap-notch-search";
+        qNotch.textContent = "🔎";
+        qNotch.style.top = `${pct.toFixed(2)}%`;
+        qNotch.dataset.jump = stepIdx;
+        qNotch.dataset.meta = `🔎 Совпадение · Шаг #${stepIdx}${st.created_at ? " · " + fmtStepTime(st.created_at) : ""}`;
+        qNotch.dataset.preview = extractPlainMatchSnippet(st, state.stepQuery, it.attached) || `${st.type} #${stepIdx}`;
+        notchItemMap.set(qNotch, it);
+        frag.appendChild(qNotch);
+      }
     }
 
     _userNotchCoords = nextUserCoords;
@@ -5988,15 +6864,20 @@
   }
 
   els.promptMinimap.addEventListener("click", (e) => {
-    const notch = e.target.closest(".minimap-notch, .minimap-notch-cp, .minimap-notch-err, .minimap-notch-sel");
+    const notch = e.target.closest(
+      ".minimap-notch, .minimap-notch-cp, .minimap-notch-err, .minimap-notch-sel, .minimap-notch-search"
+    );
     if (!notch) return;
+    clearHashStepIfScrolledAway();
     jumpToStep(notch.dataset.jump);
   });
 
   const _minimapTrackHint = els.promptMinimap.getAttribute("title") || "";
 
   els.promptMinimap.addEventListener("mouseover", (e) => {
-    const notch = e.target.closest(".minimap-notch, .minimap-notch-cp, .minimap-notch-err, .minimap-notch-sel");
+    const notch = e.target.closest(
+      ".minimap-notch, .minimap-notch-cp, .minimap-notch-err, .minimap-notch-sel, .minimap-notch-search"
+    );
     if (!notch) {
       els.minimapPreview.classList.add("hidden");
       if (_minimapTrackHint) els.promptMinimap.setAttribute("title", _minimapTrackHint);
@@ -6096,6 +6977,9 @@
     () => {
       if (performance.now() >= _suppressScrollTsUntil) {
         _lastUserScrollMs = Date.now();
+        if (!_activeJumpLock && !_activeAnchorLock) {
+          clearHashStepIfScrolledAway();
+        }
         _activeJumpLock = null;
         _activeAnchorLock = null;
         _pinBottomLockUntil = 0;
@@ -6116,7 +7000,8 @@
       state.firstUnreadStepIndex = null;
       els.jumpBottomBtn.classList.remove("flash-yellow");
       els.jumpBottomBtn.textContent = "↓ Вниз";
-      jumpToStep(targetIdx, { topOffset: 12 });
+      clearHashStepIfScrolledAway();
+      jumpToStep(targetIdx, { topOffset: 4 });
       requestAnimationFrame(updateScrollUiOnFrame);
     } else {
       scrollToBottom();
@@ -6142,19 +7027,20 @@
       window.open(makeApiFileUrl(localPath, "&raw=1"), "_blank", "noopener,noreferrer");
       return;
     }
-    if (mode === "system") {
+    if (mode === "system" || mode === "notepadpp") {
       try {
         const res = await fetch("/api/open-file", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             path: localPath,
+            mode,
             conv: state.activeId || "",
             root: state.projectRoot || "",
           }),
         });
         const data = await res.json();
-        if (!data.ok) alert(data.error || "Не удалось открыть файл в системе");
+        if (!data.ok) alert(data.error || "Не удалось открыть файл");
       } catch (err) {
         alert(err.message);
       }
@@ -6255,6 +7141,17 @@
 
   // Event delegation for local file/folder/transcript links across feed + topbar meta, plus Copy buttons
   document.addEventListener("click", (e) => {
+    const taskJump = e.target.closest("[data-jump-step]");
+    if (taskJump && els.feed.contains(taskJump) && e.button === 0 && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      const jumpStep = taskJump.dataset.jumpStep;
+      const toolOutStep = taskJump.dataset.jumpToolOut || null;
+      clearHashStepIfScrolledAway();
+      jumpToStep(jumpStep, { topOffset: 4, toolOutStep });
+      return;
+    }
+
     const stepChip = e.target.closest(".step-num-chip[data-copy-step]");
     if (stepChip && els.feed.contains(stepChip)) {
       e.preventDefault();
@@ -6522,10 +7419,12 @@
         const title = el.dataset.tipTitle || "";
         const desc = el.dataset.tipDesc || "";
         const raw = el.dataset.tipRaw || "";
+        const rawLabel = el.dataset.tipRawLabel !== undefined ? el.dataset.tipRawLabel : "В файле:";
+        const rawPrefix = rawLabel ? `${escHtml(rawLabel)} ` : "";
         els.tooltip.innerHTML =
           `<div class="tooltip-title">${escHtml(title)}</div>` +
           (desc ? `<div class="tooltip-desc">${escHtml(desc).replace(/\n/g, "<br>")}</div>` : "") +
-          (raw ? `<div class="tooltip-raw">В файле: ${escHtml(raw)}</div>` : "");
+          (raw ? `<div class="tooltip-raw">${rawPrefix}${escHtml(raw)}</div>` : "");
         isTooltipVisible = true;
         els.tooltip.classList.remove("hidden");
         positionTooltip(lastMouseX, lastMouseY);
@@ -6775,6 +7674,17 @@
     if (els.fileOpenSystemChoice) {
       els.fileOpenSystemChoice.classList.toggle("hidden", caps.open_file_os === false);
     }
+    if (els.fileOpenNotepadChoice) {
+      els.fileOpenNotepadChoice.classList.toggle("hidden", caps.open_notepadpp === false);
+    }
+    if (caps.open_notepadpp === false && state.fileOpenMode === "notepadpp") {
+      state.fileOpenMode = "ask";
+      try {
+        localStorage.setItem("tv_file_mode", "ask");
+      } catch (_) {}
+      const sel = document.getElementById("optFileOpenMode");
+      if (sel) sel.value = "ask";
+    }
 
     if (!canPaste) {
       if (_agWindowPollTimer) {
@@ -7009,9 +7919,11 @@
       if (!nav.convId) return;
       if (nav.convId !== state.activeId) {
         selectTranscript(nav.convId, { targetStep: nav.targetStep });
+      } else if (state.steps.length === 0 || !document.getElementById("cacheMapCard")) {
+        _pendingNavStep = nav.targetStep || "";
       } else if (nav.targetStep) {
         state.userScrolledUp = true;
-        jumpToStep(nav.targetStep, { topOffset: 18 });
+        jumpToStep(nav.targetStep, { topOffset: 4 });
       }
     });
     // Periodically refresh sidebar list (Antigravity window polling timer is managed by applyCapabilitiesUI)
