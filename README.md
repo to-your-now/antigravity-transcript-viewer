@@ -18,7 +18,7 @@ Antigravity saves full conversation logs — prompts, hidden thinking blocks, to
 - **Fast on Huge Sessions:** Smoothly browse sessions with tens of thousands of steps without browser freezes.
 - **Table of Contents & Scrollbar Minimap:** Jump to any step from the top Table of Contents, or use the color-coded notches along the right scrollbar (`💬` prompts, `📦` compactions, `⚠` command errors, `★` Command Map selections) — hover any notch to preview text and click to jump.
 - **Dialog-Only Mode:** Switch to **Диалог** to read just your messages and the AI's final answers, with one-click buttons between turns to peek at hidden thinking and tool calls whenever needed.
-- **Universal Instant Search (`/`):** Search across messages, thinking blocks, tool names, parameters, command outputs (e.g., `EXIT: 1`), step numbers, and timestamps, with matching quotes highlighted both in the feed and in the Table of Contents.
+- **Universal Instant Search (`/` or `Ctrl+.`):** Search across messages, thinking blocks, tool names, parameters, command outputs (e.g., `EXIT: 1`), step numbers, and timestamps, with matching quotes highlighted both in the feed and in the Table of Contents.
 
 ### Tools, Code, Diffs & Files
 - **Paired Tool Calls & Clear Errors:** Every tool result appears right below the command that ran it. Failed commands and errors stand out immediately with a blue-yellow striped border, clear `✓` / `⚠` icons, and `exit: 0` / `EXIT: N` badges.
@@ -69,7 +69,7 @@ python3 server.py     # Linux / macOS
 
 ## Shortcuts
 
-- **`/`** — Focus the in-log search filter.
+- **`/`** or **`Ctrl+.`** (any layout) — Focus the in-log search filter.
 - **`PgDn` / `PgUp` / `Home` / `End`** — Scroll the session feed regardless of where button focus sits.
 - **`{ }` button** or **`Shift + Right-Click`** — View original raw JSON for a step or tool output.
 - **`Hover 1.2s`** on badges or argument names — View a helpful explanation tooltip.

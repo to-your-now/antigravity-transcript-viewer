@@ -2,6 +2,7 @@
   "use strict";
 
   const state = {
+    lang: "en",
     transcripts: [],
     activeId: null,
     steps: [],
@@ -9,6 +10,10 @@
     eventSource: null,
     filter: "all",       // all | dialog | errors
     stepQuery: "",
+    searchFocusedOnly: true,
+    searchAcrossWholeTurn: false,
+    searchWholeWord: false,
+    searchCaseSensitive: false,
     sidebarQuery: "",
     projectFilter: "",
     userScrolledUp: false,
@@ -60,10 +65,14 @@
     projectFilter: document.getElementById("projectFilter"),
     convTitle: document.getElementById("convTitle"),
     convMeta: document.getElementById("convMeta"),
+    langSelect: document.getElementById("langSelect"),
     livePill: document.getElementById("livePill"),
     liveText: document.getElementById("liveText"),
     followToggle: document.getElementById("followToggle"),
+    searchBoxWrap: document.getElementById("searchBoxWrap"),
     stepSearch: document.getElementById("stepSearch"),
+    searchOptsBtn: document.getElementById("searchOptsBtn"),
+    searchPopover: document.getElementById("searchPopover"),
     onlyCmdErrorsToggle: document.getElementById("onlyCmdErrorsToggle"),
     expandAllBtn: document.getElementById("expandAllBtn"),
     collapseAllBtn: document.getElementById("collapseAllBtn"),
@@ -107,6 +116,88 @@
     fileOpenSystemChoice: document.getElementById("fileOpenSystemChoice"),
   };
 
+  const _i18nCache = {};
+  let _localeData = {};
+  let _fallbackLocaleData = {};
+
+  function _getNestedI18n(obj, key) {
+    if (!obj || !key) return undefined;
+    const parts = String(key).split(".");
+    let cur = obj;
+    for (const p of parts) {
+      if (cur && typeof cur === "object" && p in cur) {
+        cur = cur[p];
+      } else {
+        return undefined;
+      }
+    }
+    return typeof cur === "string" ? cur : undefined;
+  }
+
+  function t(key, vars = null) {
+    let val = _getNestedI18n(_localeData, key);
+    if (val === undefined) val = _getNestedI18n(_fallbackLocaleData, key);
+    if (val === undefined) val = key;
+    if (vars && typeof vars === "object") {
+      for (const [k, v] of Object.entries(vars)) {
+        val = val.split(`{${k}}`).join(v === undefined || v === null ? "" : String(v));
+      }
+    }
+    return val;
+  }
+
+  function tDoc(group, itemKey, fallbackKey) {
+    const val =
+      _localeData?.docs?.[group]?.[itemKey] ??
+      _fallbackLocaleData?.docs?.[group]?.[itemKey];
+    return typeof val === "string" ? val : t(fallbackKey);
+  }
+
+  async function loadLocale(lang) {
+    const code = lang === "ru" ? "ru" : "en";
+    const fetchCode = async (c) => {
+      if (_i18nCache[c]) return _i18nCache[c];
+      try {
+        const res = await fetch(`/static/i18n/${c}.json`, { cache: "no-cache" });
+        if (res.ok) {
+          const data = await res.json();
+          _i18nCache[c] = data;
+          return data;
+        }
+      } catch (_) {}
+      return null;
+    };
+    const enData = await fetchCode("en");
+    if (enData) _fallbackLocaleData = enData;
+    const targetData = code === "en" ? enData : await fetchCode(code);
+    _localeData = targetData || enData || {};
+    state.lang = code;
+    document.documentElement.lang = code;
+    if (els.langSelect) els.langSelect.value = code;
+    try {
+      localStorage.setItem("tv_lang", code);
+    } catch (_) {}
+    return code;
+  }
+
+  function applyStaticTranslations() {
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      const k = el.getAttribute("data-i18n");
+      if (k) el.textContent = t(k);
+    });
+    document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+      const k = el.getAttribute("data-i18n-title");
+      if (k) el.setAttribute("title", t(k));
+    });
+    document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+      const k = el.getAttribute("data-i18n-placeholder");
+      if (k) el.setAttribute("placeholder", t(k));
+    });
+    if (els.promptMinimap) {
+      els.promptMinimap.setAttribute("title", t("minimap.trackTitle"));
+    }
+  }
+
   const rawStepMap = new WeakMap();
   const stepModelMap = new WeakMap();
   let stepToolMetaMap = new WeakMap();
@@ -116,10 +207,11 @@
   const mdFenceBlocksMap = new WeakMap();
   const stepErrCache = new WeakMap();
   const toolArgsReplaceRowMap = new WeakMap();
-  const minimapMetaCache = new WeakMap();
+  let minimapMetaCache = new WeakMap();
   const _vElToItemMap = new WeakMap();
   const cardOverflowChecksMap = new WeakMap();
   let stepSearchBlobCache = new WeakMap();
+  let stepSearchUnitsCache = new WeakMap();
   let _lastDetectedModel = "";
   let _suppressHashChange = false;
   let _pendingNavStep = "";
@@ -197,8 +289,8 @@
 
   let _pendingEditScrolls = [];
   let _editScrollRaf = 0;
-  function scheduleEditScroll(wrap, rowEl) {
-    _pendingEditScrolls.push([wrap, rowEl]);
+  function scheduleEditScroll(wrap, rowEl, topMargin = 4) {
+    _pendingEditScrolls.push([wrap, rowEl, topMargin]);
     if (_editScrollRaf) return;
     _editScrollRaf = requestAnimationFrame(() => {
       _editScrollRaf = 0;
@@ -206,12 +298,12 @@
       _pendingEditScrolls = [];
       const targets = [];
       // Batch read phase
-      for (const [w, r] of batch) {
+      for (const [w, r, margin] of batch) {
         if (w.isConnected && r.isConnected) {
           const wr = w.getBoundingClientRect();
           const rr = r.getBoundingClientRect();
           if (wr.height > 0 && w.scrollHeight > w.clientHeight + 4) {
-            targets.push([w, Math.max(0, w.scrollTop + (rr.top - wr.top) - 4)]);
+            targets.push([w, Math.max(0, w.scrollTop + (rr.top - wr.top) - margin)]);
           }
         }
       }
@@ -228,8 +320,9 @@
       const argWraps = rootEl.querySelectorAll(".tool-args");
       for (const aw of argWraps) {
         if (aw.classList.contains("is-full") || aw.classList.contains("hidden")) continue;
+        if (state.stepQuery && aw.querySelector("mark.hl")) continue;
         const rr = toolArgsReplaceRowMap.get(aw);
-        if (rr) scheduleEditScroll(aw, rr);
+        if (rr) scheduleEditScroll(aw, rr, 4);
       }
       return;
     }
@@ -238,9 +331,30 @@
       const argWraps = cardEl.querySelectorAll(".tool-args");
       for (const aw of argWraps) {
         if (aw.classList.contains("is-full") || aw.classList.contains("hidden")) continue;
+        if (state.stepQuery && aw.querySelector("mark.hl")) continue;
         const rr = toolArgsReplaceRowMap.get(aw);
-        if (rr) scheduleEditScroll(aw, rr);
+        if (rr) scheduleEditScroll(aw, rr, 4);
       }
+    }
+  }
+
+  function applyInitialSearchScrolls(rootEl) {
+    if (!rootEl || !state.stepQuery) return;
+    const boxes = rootEl.querySelectorAll
+      ? rootEl.querySelectorAll(".read-scroll-box, .tool-args, .generic-pre.inner-scroll, .inline-raw-pre")
+      : [];
+    for (const box of boxes) {
+      if (!box.isConnected || box.classList.contains("is-full") || box.classList.contains("hidden")) continue;
+      if (box.closest(".search-omitted") && !box.closest("article.step.is-search-untrimmed")) continue;
+      // Respect single-scrollbox rule: never schedule an inner child inside .read-scroll-box or .tool-args
+      const outerBox = box.parentElement ? box.parentElement.closest(".read-scroll-box, .tool-args") : null;
+      if (outerBox && !outerBox.classList.contains("is-full")) continue;
+      const firstMark = box.querySelector("mark.hl");
+      if (!firstMark) continue;
+      const target =
+        firstMark.closest(".code-gutter-row, .md-gutter-row, .arg-row, p, li, h1, h2, h3, h4, h5, h6") ||
+        firstMark;
+      scheduleEditScroll(box, target, 16);
     }
   }
 
@@ -559,51 +673,6 @@
     preEl.appendChild(frag);
   }
 
-  const ARG_DOCS = {
-    CommandLine: "Точная команда, переданная в оболочку (PowerShell / cmd).",
-    WaitMsBeforeAsync: "Сколько миллисекунд ждать завершения команды синхронно (500–10000), прежде чем перевести её в фон (async task).",
-    IsDaemon: "Если true — команда запускается как бесконечный фоновый процесс (сервер/вотчер), не ожидая завершения.",
-    Path: "Абсолютный путь к целевому файлу на диске.",
-    TargetFile: "Путь к файлу, в котором выполняется редактирование.",
-    DirectoryPath: "Путь к директории для поиска или листинга.",
-    StartLine: "Начальная строка чтения файла (включительно, с 1).",
-    EndLine: "Конечная строка чтения файла (включительно).",
-    ByteOffset: "Смещение в байтах для продолжения чтения длинного файла.",
-    Target: "Исходный фрагмент текста, который заменяется (строки: удалённое зачёркнуто, изменённое курсивом).",
-    TargetContent: "Исходный фрагмент текста, который заменяется.",
-    Replacement: "Новый фрагмент текста, который вставляется вместо Target (новое — жирным, изменённое — курсивом).",
-    ReplacementContent: "Новый фрагмент текста, который вставляется вместо TargetContent.",
-    Content: "Полное содержимое, записываемое в файл.",
-    CodeContent: "Полное содержимое кода, записываемое в файл.",
-    Overwrite: "Если true — перезаписать существующий файл целиком.",
-    Append: "Если true — дописать содержимое в конец существующего файла.",
-    query: "Поисковый запрос, отправленный в веб-поиск или grep.",
-    domain: "Приоритетный домен для веб-поиска.",
-    TypeName: "Имя типа субагента для запуска (например, research, self).",
-    Role: "Краткое описание роли субагента (2–5 слов).",
-    Model: "Модель субагента (inherit, flash, flash_lite, pro).",
-    Workspace: "Режим рабочего пространства субагента (inherit, branch, share).",
-    Prompt: "Инструкция/задача, передаваемая субагенту или таймеру.",
-    Recipient: "ID беседы агента-получателя сообщения.",
-    Message: "Текст сообщения другому агенту.",
-    Action: "Действие над задачей или субагентом (list, status, kill, send_input).",
-    TaskId: "Идентификатор фоновой задачи.",
-    Input: "Строка ввода, отправляемая в stdin работающей фоновой задачи.",
-    DurationSeconds: "Задержка одноразового таймера в секундах.",
-    CronExpression: "Cron-выражение из 5 полей для периодического расписания.",
-    TimerCondition: "Условие досрочной отмены таймера (never, any или ID отправителя).",
-    ExactTiming: "Если true — запускать cron точно по часам без джиттера.",
-    MaxIterations: "Максимальное число срабатываний cron-задачи.",
-    Name: "Уникальное имя нового типа субагента.",
-    Description: "Описание назначения субагента.",
-    SystemPrompt: "Системный промпт субагента.",
-    EnableMCPTools: "Разрешить субагенту доступ к MCP-инструментам.",
-    EnableSubagentTools: "Разрешить субагенту запускать своих субагентов.",
-    EnableWriteTools: "Разрешить субагенту создавать/редактировать файлы и запускать команды.",
-    ArtifactMetadata: "Метаданные артефакта (Summary, UserFacing, RequestFeedback).",
-    questions: "Список уточняющих вопросов с вариантами ответа для пользователя.",
-  };
-
   function renderToolArgsStructured(args, skipKeys = new Set()) {
     const wrap = document.createElement("div");
     wrap.className = "tool-args inner-scroll";
@@ -675,8 +744,8 @@
       const keySpan = document.createElement("span");
       keySpan.className = "arg-key";
       keySpan.textContent = k;
-      keySpan.dataset.tipTitle = `Параметр: ${k}`;
-      keySpan.dataset.tipDesc = ARG_DOCS[k] || "Аргумент вызова инструмента.";
+      keySpan.dataset.tipTitle = t("card.paramTitle", { key: k });
+      keySpan.dataset.tipDesc = tDoc("args", k, "card.paramFallback");
       keySpan.dataset.tipRaw = `${k}: ${valStr.slice(0, 120)}`;
 
       if (isMultiline) {
@@ -785,15 +854,15 @@
   }
 
   function fmtNum(n) {
-    return Number(n || 0).toLocaleString("ru-RU");
+    return Number(n || 0).toLocaleString(state.lang === "ru" ? "ru-RU" : "en-US");
   }
 
   function fmtRelTime(mtimeSec) {
     const diff = Math.max(0, Math.floor(Date.now() / 1000 - mtimeSec));
-    if (diff < 60) return `${diff}с назад`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}м назад`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}ч назад`;
-    return `${Math.floor(diff / 86400)}д назад`;
+    if (diff < 60) return t("card.timeAgoSec", { n: diff });
+    if (diff < 3600) return t("card.timeAgoMin", { n: Math.floor(diff / 60) });
+    if (diff < 86400) return t("card.timeAgoHour", { n: Math.floor(diff / 3600) });
+    return t("card.timeAgoDay", { n: Math.floor(diff / 86400) });
   }
 
   function getEffectiveTzOffsetMin() {
@@ -891,61 +960,23 @@
 
   function fmtDeltaSec(sec) {
     if (sec === null || sec === undefined || sec < 0) return "—";
-    if (sec < 60) return `+${Math.round(sec)}с`;
+    if (sec < 60) return t("card.deltaSec", { n: Math.round(sec) });
     const m = Math.floor(sec / 60);
     const s = Math.round(sec % 60);
-    if (m < 60) return s > 0 ? `+${m}м ${s}с` : `+${m}м`;
+    if (m < 60) return s > 0 ? t("card.deltaMinSec", { m, s }) : t("card.deltaMin", { m });
     const h = Math.floor(m / 60);
     const rm = m % 60;
-    return `+${h}ч ${rm}м`;
+    return t("card.deltaHourMin", { h, m: rm });
   }
 
   function getCacheLevel(hitPct, totIn) {
-    if (totIn <= 0) return { lvl: 0, cls: "", label: "нет входа" };
-    if (hitPct >= 90) return { lvl: 5, cls: "cache-lvl-5", label: "Отлично (≥90%)" };
-    if (hitPct >= 70) return { lvl: 4, cls: "cache-lvl-4", label: "Хорошо (70–89%)" };
-    if (hitPct >= 40) return { lvl: 3, cls: "cache-lvl-3", label: "Частично (40–69%)" };
-    if (hitPct > 0) return { lvl: 2, cls: "cache-lvl-2", label: "Слабо (1–39%)" };
-    return { lvl: 1, cls: "cache-lvl-1", label: "Промах (0%)" };
+    if (totIn <= 0) return { lvl: 0, cls: "", label: t("card.cacheNone") };
+    if (hitPct >= 90) return { lvl: 5, cls: "cache-lvl-5", label: t("card.cacheLvl5") };
+    if (hitPct >= 70) return { lvl: 4, cls: "cache-lvl-4", label: t("card.cacheLvl4") };
+    if (hitPct >= 40) return { lvl: 3, cls: "cache-lvl-3", label: t("card.cacheLvl3") };
+    if (hitPct > 0) return { lvl: 2, cls: "cache-lvl-2", label: t("card.cacheLvl2") };
+    return { lvl: 1, cls: "cache-lvl-1", label: t("card.cacheLvl1") };
   }
-
-  const TYPE_DOCS = {
-    USER_INPUT: "Запрос пользователя. Может содержать теги <USER_REQUEST>, <ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE> и вложения media.",
-    PLANNER_RESPONSE: "Шаг рассуждений/ответа модели. Содержит метрики токенов, опционально thinking, tool_calls и финальный content.",
-    GENERIC: "Результат выполнения инструмента (run_command, read_file, edit_file, write_file, search_web и др.).",
-    SYSTEM_MESSAGE: "Системное уведомление (например, завершение фоновой задачи). Обёрнуто в <SYSTEM_MESSAGE>.",
-    CHECKPOINT: "Точка сжатия контекста (Compaction) — длинная история сжимается в summary для экономии контекстного окна.",
-    ERROR_MESSAGE: "Системная или сетевая ошибка API (подробности в поле error).",
-  };
-
-  const SOURCE_DOCS = {
-    USER_EXPLICIT: "Инициировано явным сообщением пользователя.",
-    MODEL: "Сгенерировано моделью или результатом её вызова инструмента.",
-    SYSTEM: "Сгенерировано системой/оркестратором (таймеры, ошибки API, чекпоинты).",
-  };
-
-  const STATUS_DOCS = {
-    DONE: "Шаг полностью завершён.",
-    RUNNING: "Задача/команда на момент записи ещё выполнялась (или ушла в фон).",
-    ERROR: "Шаг завершился с ошибкой.",
-  };
-
-  const TOOL_DOCS = {
-    run_command: "Выполняет shell-команду (bash / sh / PowerShell / cmd) в рабочей директории проекта.",
-    read_file: "Читает содержимое файла (текст, изображение, PDF) с указанием диапазона строк.",
-    view_file: "Читает содержимое файла с нумерацией строк.",
-    write_file: "Создаёт новый файл или перезаписывает существующий.",
-    write_to_file: "Создаёт новый файл или перезаписывает существующий.",
-    edit_file: "Точечно заменяет фрагмент текста в существующем файле.",
-    replace_file_content: "Точечно заменяет фрагмент текста в существующем файле.",
-    search_web: "Выполняет веб-поиск и возвращает краткую сводку с URL-источниками.",
-    grep_search: "Ищет совпадения по регулярному выражению/тексту в файлах проекта.",
-    find_by_name: "Ищет файлы и директории по маске имени.",
-    list_dir: "Показывает список файлов и подпапок в указанной директории.",
-    invoke_subagent: "Запускает фонового субагента со своей отдельной задачей и контекстом.",
-    send_message: "Отправляет сообщение другому агенту или субагенту.",
-    ask_question: "Задаёт пользователю уточняющий вопрос с вариантами ответа.",
-  };
 
   function expandLocalTemplatePath(rawPath) {
     let s = String(rawPath || "").trim();
@@ -1059,12 +1090,12 @@
       const showPwshBtn =
         state.capabilities?.is_windows !== false || ["pwsh", "powershell", "ps1"].includes(l);
       extraBtns =
-        `<button class="copy-btn copy-btn-variant" type="button" data-copy-mode="one_line" title="Скопировать одной строкой через && (без перевода строк, выполняется по очереди и не запускается само при вставке)">Copy &&</button>` +
+        `<button class="copy-btn copy-btn-variant" type="button" data-copy-mode="one_line" title="${escHtml(t("card.copyOneLineTitle"))}">${escHtml(t("card.copyOneLine"))}</button>` +
         (showPwshBtn
-          ? `<button class="copy-btn copy-btn-variant" type="button" data-copy-mode="pwsh_block" title="Скопировать как единый блок & { ... } для PowerShell (выполняется как одно целое после Enter)">Copy { ; }</button>`
+          ? `<button class="copy-btn copy-btn-variant" type="button" data-copy-mode="pwsh_block" title="${escHtml(t("card.copyPwshBlockTitle"))}">${escHtml(t("card.copyPwshBlock"))}</button>`
           : "");
     }
-    return `<div class="copy-bar">${extraBtns}<button class="copy-btn" type="button" data-copy-mode="exact" title="Скопировать код без завершающего перевода строки">Copy</button></div>`;
+    return `<div class="copy-bar">${extraBtns}<button class="copy-btn" type="button" data-copy-mode="exact" title="${escHtml(t("card.copyExactTitle"))}">${escHtml(t("card.copyExact"))}</button></div>`;
   }
 
   function formatShellForCopy(rawText, mode) {
@@ -1099,7 +1130,7 @@
     if (res.convId) {
       const cls = isAuto ? "transcript-link link-auto" : "transcript-link link-authored";
       const tip = isAuto
-        ? makeTipAttrs("⚡ Автоссылка на транскрипт", "Определено просмотрщиком автоматически.", url)
+        ? makeTipAttrs(t("card.autoLinkTranscript"), t("card.autoLinkDetected"), url)
         : "";
       return `<a href="${escHtml(res.href)}" class="${cls}" data-conv-id="${escHtml(res.convId)}" ${tip}>${label}</a>`;
     }
@@ -1108,8 +1139,8 @@
       const dirAttr = res.isDir ? 'data-is-dir="1"' : "";
       const lpAttr = res.localPath ? `data-local-path="${escHtml(res.localPath)}"` : "";
       const tip = makeTipAttrs(
-        "⚡ Автоссылка (создана просмотрщиком)",
-        res.isDir ? "Автоматически найденная папка." : "Автоматически найденный файл/URL.",
+        t("card.autoLinkGenericTitle"),
+        res.isDir ? t("card.autoLinkGenericDir") : t("card.autoLinkGenericFile"),
         res.localPath || url
       );
       return `<a href="${escHtml(res.href)}" class="${cls}" ${dirAttr} ${lpAttr} ${tip} target="_blank" rel="noopener noreferrer">${label}</a>`;
@@ -1572,8 +1603,8 @@
         exitChip = {
           label: isErr ? `⚠ EXIT: ${m[1]}` : `✓ exit: 0`,
           cls: isErr ? "exit-nonzero" : "exit-ok",
-          title: "Код возврата команды",
-          desc: !isErr ? "Команда завершилась успешно (код 0)." : `Команда завершилась с ошибкой (код ${m[1]}).`,
+          title: t("card.exitCodeTitle"),
+          desc: !isErr ? t("card.exitCodeOk") : t("card.exitCodeErr", { code: m[1] }),
           raw: ln,
         };
         pos = nextPos;
@@ -1584,8 +1615,8 @@
         chips.push({
           label: `lines: ${m[1]}/${m[2]}`,
           cls: "",
-          title: "Диапазон прочитанных строк",
-          desc: `Показаны строки ${m[1]} из ${m[2]} в файле.`,
+          title: t("card.readLinesTitle"),
+          desc: t("card.readLinesDesc", { range: m[1], total: m[2] }),
           raw: ln,
         });
         pos = nextPos;
@@ -1607,14 +1638,17 @@
         const d1 = Date.parse(createdAt);
         const d2 = Date.parse(completedAt);
         if (!Number.isNaN(d1) && !Number.isNaN(d2)) {
-          durStr = ` · ⏱ ${((d2 - d1) / 1000).toFixed(1)}с`;
+          durStr = ` · ⏱ ${((d2 - d1) / 1000).toFixed(1)}${t("card.durationUnit")}`;
         }
       }
       chips.unshift({
         label: `${tShort}${durStr}`,
         cls: "",
-        title: "Время выполнения инструмента",
-        desc: `Запуск: ${createdAt}${completedAt ? `\nЗавершение: ${completedAt}` : ""}`,
+        title: t("card.durationTitle"),
+        desc: t("card.durationDesc", {
+          start: createdAt,
+          end: completedAt ? t("card.durationEnd", { end: completedAt }) : "",
+        }),
         raw: `Created At: ${createdAt}${completedAt ? `\nCompleted At: ${completedAt}` : ""}`,
       });
     }
@@ -1873,18 +1907,18 @@
       state.folderOpenMode === "totalcmd"
         ? "Total Commander"
         : state.folderOpenMode === "explorer"
-        ? "Проводник"
+        ? t("card.folderModeExplorer")
         : state.folderOpenMode === "system"
-        ? "Файловый менеджер"
-        : "Браузер";
+        ? t("card.folderModeFileManager")
+        : t("card.folderModeBrowser");
 
     if (kind === "web") {
       a.href = rawVal;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       a.className = "link-auto";
-      a.dataset.tipTitle = "⚡ Автоссылка (веб-адрес)";
-      a.dataset.tipDesc = "Создана просмотрщиком автоматически по URL в тексте.";
+      a.dataset.tipTitle = t("card.autoLinkWebTitle");
+      a.dataset.tipDesc = t("card.autoLinkWebDesc");
       a.dataset.tipRaw = rawVal;
       a.textContent = displayText;
       return a;
@@ -1903,8 +1937,10 @@
         if (res.localPath) a.dataset.localPath = res.localPath;
         if (res.isDir) a.dataset.isDir = "1";
       }
-      a.dataset.tipTitle = res.isDir ? `⚡ Автоссылка на папку (${openModeLabel})` : "⚡ Автоссылка на локальный файл";
-      a.dataset.tipDesc = "Создана просмотрщиком автоматически по file:/// URI.";
+      a.dataset.tipTitle = res.isDir
+        ? t("card.autoLinkLocalDirTitle", { mode: openModeLabel })
+        : t("card.autoLinkLocalFileTitle");
+      a.dataset.tipDesc = t("card.autoLinkFileUriDesc");
       a.dataset.tipRaw = res.localPath || rawVal;
       a.textContent = displayText;
       return a;
@@ -1916,8 +1952,8 @@
       a.href = `#conv=${encodeURIComponent(mTrans[1])}`;
       a.className = "transcript-link link-auto";
       a.dataset.convId = mTrans[1];
-      a.dataset.tipTitle = "⚡ Автоссылка на транскрипт";
-      a.dataset.tipDesc = "Открывает указанную сессию прямо в этом просмотрщике.";
+      a.dataset.tipTitle = t("card.autoLinkTranscript");
+      a.dataset.tipDesc = t("card.autoLinkTranscriptDesc");
       a.dataset.tipRaw = rawVal;
       a.textContent = displayText;
       return a;
@@ -1939,21 +1975,21 @@
 
     if (isShort) {
       a.dataset.tipTitle = isDir
-        ? `⚡ Автоссылка: папка проекта (${openModeLabel})`
-        : "⚡ Автоссылка: файл текущего проекта";
-      a.dataset.tipDesc = "Распознано по списку файлов активного проекта (отключается переключателем «Имена проекта»).";
+        ? t("card.autoLinkProjectDirTitle", { mode: openModeLabel })
+        : t("card.autoLinkProjectFileTitle");
+      a.dataset.tipDesc = t("card.autoLinkProjectDesc");
     } else if (kind === "template") {
       a.dataset.tipTitle = isDir
-        ? `⚡ Автоссылка: шаблонная папка (${openModeLabel})`
-        : "⚡ Автоссылка: шаблонный путь";
-      a.dataset.tipDesc = "При открытии подставляются <appDataDir>, <conversation-id> или %USERPROFILE%.";
+        ? t("card.autoLinkTemplateDirTitle", { mode: openModeLabel })
+        : t("card.autoLinkTemplateFileTitle");
+      a.dataset.tipDesc = t("card.autoLinkTemplateDesc");
     } else {
       a.dataset.tipTitle = isDir
-        ? `⚡ Автоссылка на папку (${openModeLabel})`
-        : "⚡ Автоссылка на локальный файл";
+        ? t("card.autoLinkLocalDirTitle", { mode: openModeLabel })
+        : t("card.autoLinkLocalFileTitle");
       a.dataset.tipDesc = isDir
-        ? `Создана просмотрщиком автоматически. Откроется в: ${openModeLabel}.`
-        : "Создана просмотрщиком автоматически (ссылка копируется как чистый file:///).";
+        ? t("card.autoLinkOpenWithDesc", { mode: openModeLabel })
+        : t("card.autoLinkCopyFileUriDesc");
     }
     a.dataset.tipRaw = expandLocalTemplatePath(resolvedDisplayPath);
     a.textContent = displayText;
@@ -2083,6 +2119,25 @@
     }
   }
 
+  function shouldUnfoldSearchTail(headStr, tailStr, fullStr) {
+    if (!state.stepQuery || !tailStr) return false;
+    const ast = getCachedSearchAst(state.stepQuery);
+    if (!ast) return false;
+    const termObjs = getPositiveSearchTermObjs(ast);
+    if (!termObjs.length) return false;
+    const sOpts = getSearchOpts();
+    const headLow = headStr.toLowerCase();
+    const tailLow = tailStr.toLowerCase();
+    if (!evalSearchAst(ast, headStr, sOpts) && evalSearchAst(ast, fullStr, sOpts)) {
+      return true;
+    }
+    return termObjs.some(
+      (term) =>
+        findTermOccurrences(tailStr, tailLow, term.text, term.lower, sOpts, false).length > 0 &&
+        findTermOccurrences(headStr, headLow, term.text, term.lower, sOpts, false).length === 0
+    );
+  }
+
   function renderGenericContent(container, rawContent, toolName = "", toolArgs = null, preParsed = null, cardEl = null) {
     const parsed = preParsed || parseGenericOutput(rawContent);
     const bodyText = parsed.body;
@@ -2122,8 +2177,8 @@
     contentWrap.className = "generic-content-wrap";
 
     const needRawToggle = isMd || lineNumInfo.hadNumbers;
-    const rawLabelText = lineNumInfo.hadNumbers ? "Raw (с № строк)" : "Raw";
-    const backLabelText = isMd ? "Показать Markdown" : "С нумерацией";
+    const rawLabelText = lineNumInfo.hadNumbers ? t("card.rawWithLineNums") : t("card.rawPlain");
+    const backLabelText = isMd ? t("card.showMarkdown") : t("card.showWithLineNums");
     const registeredBtns = [];
     let toggleRawFn = null;
 
@@ -2169,7 +2224,7 @@
     const readModeCallbacks = [];
     let applyReadModeHook = null;
 
-    const getFullBtnLabel = (mode) => (mode === "full" ? "Свернуть в прокрутку" : "Показать полностью");
+    const getFullBtnLabel = (mode) => (mode === "full" ? t("card.collapseToScroll") : t("card.showFull"));
 
     const setReadMode = (nextMode, triggerEl = null) => {
       if (!hasModeCtrl) return;
@@ -2224,18 +2279,28 @@
         const needFold = hasModeCtrl
           ? (curReadMode !== "full" && totalLines > SCROLL_CAP)
           : (!state.expandAllOutputs && totalLines > LIMIT_LINES);
+        let effectiveLimit = needFold ? LIMIT_LINES : Infinity;
+        if (needFold && state.stepQuery) {
+          const headRaw = lineNumInfo.strippedLines.slice(0, effectiveLimit).join("\n");
+          const tailRaw = lineNumInfo.strippedLines.slice(effectiveLimit).join("\n");
+          const fullRaw = lineNumInfo.strippedLines.join("\n");
+          if (shouldUnfoldSearchTail(headRaw, tailRaw, fullRaw)) {
+            effectiveLimit = Infinity;
+          }
+        }
+        const needFoldEffective = effectiveLimit < totalLines;
         mdViewEl = renderMarkdownWithGutter(
           lineNumInfo.strippedLines,
           lineNumInfo.lineNums,
-          needFold ? LIMIT_LINES : Infinity
+          needFoldEffective ? effectiveLimit : Infinity
         );
         viewTarget.appendChild(mdViewEl);
 
-        if (!hasModeCtrl && needFold) {
+        if (!hasModeCtrl && needFoldEffective) {
           foldBtn = document.createElement("button");
           foldBtn.type = "button";
           foldBtn.className = "show-more-btn";
-          const collapsedHtml = `Показать полностью (показано <strong>${LIMIT_LINES} из ${totalLines}</strong> строк)`;
+          const collapsedHtml = t("card.showFullFoldHtml", { shown: LIMIT_LINES, total: totalLines });
           foldBtn.innerHTML = collapsedHtml;
           let expanded = false;
           foldBtn.addEventListener("click", () => {
@@ -2248,10 +2313,10 @@
                 expanded ? Infinity : LIMIT_LINES
               );
               linkifyElement(nextEl);
-              if (state.stepQuery) highlightMatches(nextEl, state.stepQuery);
+              if (state.stepQuery) highlightMatches(nextEl, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
               mdViewEl.replaceWith(nextEl);
               mdViewEl = nextEl;
-              foldBtn.innerHTML = expanded ? `Свернуть до ${LIMIT_LINES} строк` : collapsedHtml;
+              foldBtn.innerHTML = expanded ? escHtml(t("card.collapseToLines", { lines: LIMIT_LINES })) : collapsedHtml;
             }, expanding ? contentWrap : foldBtn);
           });
           contentWrap.appendChild(foldBtn);
@@ -2260,7 +2325,7 @@
             if (mode === "full" && mdViewEl.childElementCount < totalLines) {
               const nextEl = renderMarkdownWithGutter(lineNumInfo.strippedLines, lineNumInfo.lineNums, Infinity);
               linkifyElement(nextEl);
-              if (state.stepQuery) highlightMatches(nextEl, state.stepQuery);
+              if (state.stepQuery) highlightMatches(nextEl, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
               mdViewEl.replaceWith(nextEl);
               mdViewEl = nextEl;
             }
@@ -2293,7 +2358,7 @@
                 }
                 rawPre.textContent = bodyText;
                 linkifyElement(rawPre);
-                if (state.stepQuery) highlightMatches(rawPre, state.stepQuery);
+                if (state.stepQuery) highlightMatches(rawPre, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
                 if (hasModeCtrl) viewTarget.appendChild(rawPre);
                 else contentWrap.insertBefore(rawPre, foldBtn || bottomRawBtn);
               } else {
@@ -2324,13 +2389,11 @@
       const lineLimit = needFold ? (hasModeCtrl ? SCROLL_CAP : LIMIT_LINES) : Infinity;
       let effectiveLimit = lineLimit;
       if (needFold && state.stepQuery) {
-        const searchTerms = getPositiveSearchTerms(getCachedSearchAst(state.stepQuery));
-        if (searchTerms.length) {
-          const headStr = lineNumInfo.strippedLines.slice(0, lineLimit).join("\n").toLowerCase();
-          const tailStr = lineNumInfo.strippedLines.slice(lineLimit).join("\n").toLowerCase();
-          if (searchTerms.some((t) => tailStr.includes(t) && !headStr.includes(t))) {
-            effectiveLimit = Infinity;
-          }
+        const headRaw = lineNumInfo.strippedLines.slice(0, lineLimit).join("\n");
+        const tailRaw = lineNumInfo.strippedLines.slice(lineLimit).join("\n");
+        const fullRaw = lineNumInfo.strippedLines.join("\n");
+        if (shouldUnfoldSearchTail(headRaw, tailRaw, fullRaw)) {
+          effectiveLimit = Infinity;
         }
       }
       const needFoldEffective = effectiveLimit < totalLines;
@@ -2347,7 +2410,7 @@
         foldBtn = document.createElement("button");
         foldBtn.type = "button";
         foldBtn.className = "show-more-btn";
-        const collapsedHtml = `Показать полностью (показано <strong>${LIMIT_LINES} из ${totalLines}</strong> строк)`;
+        const collapsedHtml = t("card.showFullFoldHtml", { shown: LIMIT_LINES, total: totalLines });
         foldBtn.innerHTML = collapsedHtml;
         let expanded = false;
         foldBtn.addEventListener("click", () => {
@@ -2360,10 +2423,10 @@
               expanded ? Infinity : LIMIT_LINES
             );
             linkifyElement(nextEl);
-            if (state.stepQuery) highlightMatches(nextEl, state.stepQuery);
+            if (state.stepQuery) highlightMatches(nextEl, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
             codeViewEl.replaceWith(nextEl);
             codeViewEl = nextEl;
-            foldBtn.innerHTML = expanded ? `Свернуть до ${LIMIT_LINES} строк` : collapsedHtml;
+            foldBtn.innerHTML = expanded ? escHtml(t("card.collapseToLines", { lines: LIMIT_LINES })) : collapsedHtml;
           }, expanding ? contentWrap : foldBtn);
         });
         contentWrap.appendChild(foldBtn);
@@ -2372,7 +2435,7 @@
           if (mode === "full" && codeViewEl.childElementCount < totalLines) {
             const nextEl = renderCodeWithGutter(lineNumInfo.strippedLines, lineNumInfo.lineNums, Infinity);
             linkifyElement(nextEl);
-            if (state.stepQuery) highlightMatches(nextEl, state.stepQuery);
+            if (state.stepQuery) highlightMatches(nextEl, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
             codeViewEl.replaceWith(nextEl);
             codeViewEl = nextEl;
           }
@@ -2398,7 +2461,7 @@
               }
               rawPre.textContent = bodyText;
               linkifyElement(rawPre);
-              if (state.stepQuery) highlightMatches(rawPre, state.stepQuery);
+              if (state.stepQuery) highlightMatches(rawPre, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
               if (hasModeCtrl) viewTarget.appendChild(rawPre);
               else contentWrap.insertBefore(rawPre, foldBtn || bottomRawBtn);
             } else {
@@ -2427,13 +2490,10 @@
         : (!state.expandAllOutputs && totalLines > LIMIT_LINES);
       let effectiveLimit = needFold ? LIMIT_LINES : Infinity;
       if (needFold && state.stepQuery) {
-        const searchTerms = getPositiveSearchTerms(getCachedSearchAst(state.stepQuery));
-        if (searchTerms.length) {
-          const headStr = allLines.slice(0, LIMIT_LINES).join("\n").toLowerCase();
-          const tailStr = allLines.slice(LIMIT_LINES).join("\n").toLowerCase();
-          if (searchTerms.some((t) => tailStr.includes(t) && !headStr.includes(t))) {
-            effectiveLimit = Infinity;
-          }
+        const headRaw = allLines.slice(0, LIMIT_LINES).join("\n");
+        const tailRaw = allLines.slice(LIMIT_LINES).join("\n");
+        if (shouldUnfoldSearchTail(headRaw, tailRaw, bodyText)) {
+          effectiveLimit = Infinity;
         }
       }
       const needFoldEffective = effectiveLimit < totalLines;
@@ -2450,7 +2510,7 @@
         const btn = document.createElement("button");
         btn.className = "show-more-btn";
         btn.type = "button";
-        const collapsedHtml = `Показать полностью (показано <strong>${LIMIT_LINES} из ${totalLines}</strong> строк)`;
+        const collapsedHtml = t("card.showFullFoldHtml", { shown: LIMIT_LINES, total: totalLines });
         btn.innerHTML = collapsedHtml;
         let expanded = false;
         btn.addEventListener("click", () => {
@@ -2459,8 +2519,8 @@
             expanded = !expanded;
             pre.textContent = expanded ? bodyText : allLines.slice(0, LIMIT_LINES).join("\n");
             linkifyElement(pre);
-            if (state.stepQuery) highlightMatches(pre, state.stepQuery);
-            btn.innerHTML = expanded ? `Свернуть до ${LIMIT_LINES} строк` : collapsedHtml;
+            if (state.stepQuery) highlightMatches(pre, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
+            btn.innerHTML = expanded ? escHtml(t("card.collapseToLines", { lines: LIMIT_LINES })) : collapsedHtml;
           }, expanding ? contentWrap : btn);
         });
         contentWrap.appendChild(btn);
@@ -2469,7 +2529,7 @@
           if (mode === "full" && pre.textContent.length < bodyText.length) {
             pre.textContent = bodyText;
             linkifyElement(pre);
-            if (state.stepQuery) highlightMatches(pre, state.stepQuery);
+            if (state.stepQuery) highlightMatches(pre, state.stepQuery, { ...getSearchOpts(), trimNonMatching: false });
           }
           if (origHook) origHook(mode);
         })(applyReadModeHook);
@@ -2479,18 +2539,20 @@
     if (hasModeCtrl) {
       const hiddenNote = document.createElement("div");
       hiddenNote.className = "read-hidden-note";
-      hiddenNote.innerHTML = `<span>${isReadTool ? "Файл скрыт" : "Вывод скрыт"}</span>`;
+      const hiddenLabel = document.createElement("span");
+      hiddenLabel.textContent = isReadTool ? t("card.fileHidden") : t("card.outputHidden");
+      hiddenNote.appendChild(hiddenLabel);
       const showScrollBtn = document.createElement("button");
       showScrollBtn.type = "button";
       showScrollBtn.className = "show-more-btn";
       showScrollBtn.style.marginTop = "0";
-      showScrollBtn.textContent = "Показать в прокрутке";
+      showScrollBtn.textContent = t("card.showInScroll");
       showScrollBtn.addEventListener("click", () => setReadMode("scroll", showScrollBtn));
       const showFullFromHideBtn = document.createElement("button");
       showFullFromHideBtn.type = "button";
       showFullFromHideBtn.className = "show-more-btn";
       showFullFromHideBtn.style.marginTop = "0";
-      showFullFromHideBtn.textContent = "Показать полностью";
+      showFullFromHideBtn.textContent = t("card.showFull");
       showFullFromHideBtn.addEventListener("click", () => setReadMode("full", showFullFromHideBtn));
       hiddenNote.appendChild(showScrollBtn);
       hiddenNote.appendChild(showFullFromHideBtn);
@@ -2696,51 +2758,56 @@
   }
 
   function resolveTaskLinkDestination(taskId, stepObj, preferredRole = "") {
-    const t = taskIndexMap.get(taskId);
-    if (!t) return null;
+    const tInfo = taskIndexMap.get(taskId);
+    if (!tInfo) return null;
     const stepIdxStr = stepObj ? String(stepObj.step_index ?? "") : "";
     const isResultStep =
       preferredRole === "result" ||
-      (t.resultStepIndex !== null && stepIdxStr !== "" && String(t.resultStepIndex) === stepIdxStr);
+      (tInfo.resultStepIndex !== null && stepIdxStr !== "" && String(tInfo.resultStepIndex) === stepIdxStr);
 
     if (isResultStep) {
-      const destStep = t.callerStepIndex !== null ? t.callerStepIndex : t.launchStepIndex;
+      const destStep = tInfo.callerStepIndex !== null ? tInfo.callerStepIndex : tInfo.launchStepIndex;
       if (destStep === null) return null;
       const useToolOut =
         state.attachToolOutputs &&
-        t.callerStepIndex !== null &&
-        t.launchStepIndex !== null &&
-        String(t.callerStepIndex) !== String(t.launchStepIndex);
+        tInfo.callerStepIndex !== null &&
+        tInfo.launchStepIndex !== null &&
+        String(tInfo.callerStepIndex) !== String(tInfo.launchStepIndex);
       return {
         destStepIndex: destStep,
-        toolOutStep: useToolOut ? t.launchStepIndex : null,
+        toolOutStep: useToolOut ? tInfo.launchStepIndex : null,
         kind: "to-source",
-        label: t.callerStepIndex !== null ? `↩ Команда #${t.callerStepIndex}` : `↩ Запуск #${t.launchStepIndex}`,
+        label:
+          tInfo.callerStepIndex !== null
+            ? t("card.taskPillToCmdLabel", { step: tInfo.callerStepIndex })
+            : t("card.taskPillToLaunchLabel", { step: tInfo.launchStepIndex }),
         desc:
-          t.callerStepIndex !== null
-            ? `Перейти к исходной команде #${t.callerStepIndex}${t.launchStepIndex !== null ? ` (фон #${t.launchStepIndex})` : ""}`
-            : `Перейти к запуску задачи #${t.launchStepIndex}`,
+          tInfo.callerStepIndex !== null
+            ? (tInfo.launchStepIndex !== null
+                ? t("card.taskPillToCmdBgDesc", { step: tInfo.callerStepIndex, launch: tInfo.launchStepIndex })
+                : t("card.taskPillToCmdSimpleDesc", { step: tInfo.callerStepIndex }))
+            : t("card.taskPillToLaunchDesc", { step: tInfo.launchStepIndex }),
       };
     }
 
-    if (t.resultStepIndex !== null) {
+    if (tInfo.resultStepIndex !== null) {
       return {
-        destStepIndex: t.resultStepIndex,
+        destStepIndex: tInfo.resultStepIndex,
         toolOutStep: null,
         kind: "to-result",
-        label: `↗ Результат #${t.resultStepIndex}`,
-        desc: `Перейти к результату фоновой задачи #${t.resultStepIndex}`,
+        label: t("card.taskPillToResultLabel", { step: tInfo.resultStepIndex }),
+        desc: t("card.taskPillToResultDesc", { step: tInfo.resultStepIndex }),
       };
     }
 
     // Fallback: if this step is an awaited timer launch whose own task didn't fire, link caller
-    if (preferredRole === "launch" && !state.attachToolOutputs && t.callerStepIndex !== null) {
+    if (preferredRole === "launch" && !state.attachToolOutputs && tInfo.callerStepIndex !== null) {
       return {
-        destStepIndex: t.callerStepIndex,
+        destStepIndex: tInfo.callerStepIndex,
         toolOutStep: null,
         kind: "to-source",
-        label: `↩ Команда #${t.callerStepIndex}`,
-        desc: `Перейти к запросившей команде #${t.callerStepIndex}`,
+        label: t("card.taskPillToCmdLabel", { step: tInfo.callerStepIndex }),
+        desc: t("card.taskPillToCmdSimpleDesc", { step: tInfo.callerStepIndex }),
       };
     }
     return null;
@@ -2772,68 +2839,68 @@
     };
 
     for (const ev of evs) {
-      const t = ev.taskId ? taskIndexMap.get(ev.taskId) : null;
-      if (ev.role === "result" && t) {
+      const tInfo = ev.taskId ? taskIndexMap.get(ev.taskId) : null;
+      if (ev.role === "result" && tInfo) {
         const dest = resolveTaskLinkDestination(ev.taskId, stepObj, "result");
-        pushLink(dest, "Перейти к запросившей команде");
-        if (!state.attachToolOutputs && t.launchStepIndex !== null && t.callerStepIndex !== null && t.launchStepIndex !== t.callerStepIndex) {
+        pushLink(dest, t("card.taskLinkToCaller"));
+        if (!state.attachToolOutputs && tInfo.launchStepIndex !== null && tInfo.callerStepIndex !== null && tInfo.launchStepIndex !== tInfo.callerStepIndex) {
           pushLink(
             {
-              destStepIndex: t.launchStepIndex,
+              destStepIndex: tInfo.launchStepIndex,
               toolOutStep: null,
               kind: "to-source",
-              label: `⚙ Фон #${t.launchStepIndex}`,
-              desc: `Перейти к фоновому шагу запуска #${t.launchStepIndex}`,
+              label: t("card.taskPillBgLaunchLabel", { step: tInfo.launchStepIndex }),
+              desc: t("card.taskPillBgLaunchDesc", { step: tInfo.launchStepIndex }),
             },
-            "Перейти к фоновому запуску"
+            t("card.taskLinkToLaunch")
           );
         }
-      } else if (ev.role === "launch" && t) {
+      } else if (ev.role === "launch" && tInfo) {
         const dest = resolveTaskLinkDestination(ev.taskId, stepObj, "launch");
         if (dest && dest.kind === "to-result") {
-          pushLink(dest, "Перейти к результату фоновой задачи");
+          pushLink(dest, t("card.taskLinkToResult"));
         } else {
           // Check if this launch is an awaited timer whose awaited task has a result
           const awaitedEv = evs.find((x) => x.role === "awaited" && x.awaitedTaskId);
           const awaitedDest = awaitedEv ? resolveTaskLinkDestination(awaitedEv.awaitedTaskId, stepObj, "wait") : null;
           if (awaitedDest) {
-            pushLink(awaitedDest, "Перейти к ожидаемому результату");
+            pushLink(awaitedDest, t("card.taskLinkToAwaitedResult"));
           } else {
             const pKey = `pending:${ev.taskId}`;
             if (!seenKeys.has(pKey)) {
               seenKeys.add(pKey);
               pills.push(
                 `<span class="task-link-pill task-link-pending" ${makeTipAttrs(
-                  "Фоновая задача без итогового SYSTEM_MESSAGE",
-                  "Результат для этой задачи пока не обнаружен в логе (ещё выполняется или отменён).",
+                  t("card.taskPillPendingTitle"),
+                  t("card.taskPillPendingDesc"),
                   ev.taskId
-                )}>⏳ Фон</span>`
+                )}>${escHtml(t("card.taskPillPendingLabel"))}</span>`
               );
             }
-            if (dest) pushLink(dest, "Перейти к команде");
+            if (dest) pushLink(dest, t("card.taskLinkToCmd"));
           }
         }
-        if (scope === "step" && !state.attachToolOutputs && t.callerStepIndex !== null) {
+        if (scope === "step" && !state.attachToolOutputs && tInfo.callerStepIndex !== null) {
           pushLink(
             {
-              destStepIndex: t.callerStepIndex,
+              destStepIndex: tInfo.callerStepIndex,
               toolOutStep: null,
               kind: "to-source",
-              label: `↩ Команда #${t.callerStepIndex}`,
-              desc: `Перейти к команде #${t.callerStepIndex}`,
+              label: t("card.taskPillToCmdLabel", { step: tInfo.callerStepIndex }),
+              desc: t("card.taskPillToCmdSimpleDesc", { step: tInfo.callerStepIndex }),
             },
-            "Перейти к запросившей команде"
+            t("card.taskLinkToCaller")
           );
         }
-      } else if ((ev.role === "caller" || ev.role === "wait" || ev.role === "cancel") && t) {
+      } else if ((ev.role === "caller" || ev.role === "wait" || ev.role === "cancel") && tInfo) {
         const dest = resolveTaskLinkDestination(ev.taskId, stepObj, ev.role);
         if (dest && dest.kind === "to-result") {
-          pushLink(dest, "Перейти к результату фоновой задачи");
+          pushLink(dest, t("card.taskLinkToResult"));
         }
       } else if (ev.role === "awaited" && ev.awaitedTaskId) {
         const dest = resolveTaskLinkDestination(ev.awaitedTaskId, stepObj, "wait");
         if (dest && dest.kind === "to-result") {
-          pushLink(dest, "Перейти к результату ожидаемой задачи");
+          pushLink(dest, t("card.taskLinkToAwaitedResult"));
         }
       }
     }
@@ -3135,7 +3202,8 @@
       if (step.type === "GENERIC" && !isFullMode) {
         lines += isHideMode ? 4 : Math.min(18, Math.max(4, Math.ceil(String(step.content).length / 80)));
       } else {
-        lines += Math.min(isFullMode ? 140 : 50, Math.ceil(String(step.content).length / 75));
+        // Non-GENERIC markdown (e.g. CHECKPOINT / PLANNER_RESPONSE) renders unwrapped without a 50-line scrollbox
+        lines += Math.min(isFullMode ? 320 : 220, Math.ceil(String(step.content).length / 72));
       }
     }
     if (Array.isArray(step.tool_calls)) {
@@ -3162,7 +3230,7 @@
         }
       }
     }
-    const maxCap = isFullMode ? 9000 : 3200;
+    const maxCap = isFullMode ? 10000 : 6200;
     return Math.max(120, Math.min(maxCap, lines * 20));
   }
 
@@ -3237,15 +3305,63 @@
     return err;
   }
 
-  function getStepSearchBlob(step) {
-    if (!step) return "";
-    const cached = stepSearchBlobCache.get(step);
+  const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
+
+  function findTermOccurrences(raw, lower, termText, termLower, opts = {}, findAll = true) {
+    const caseSensitive = Boolean(opts && opts.caseSensitive);
+    const wholeWord = Boolean(opts && opts.wholeWord);
+    const hay = caseSensitive ? String(raw || "") : String(lower || "");
+    const needle = caseSensitive ? String(termText || "") : String(termLower || "");
+    if (!needle || !hay) return [];
+    const checkLeft = wholeWord && WORD_CHAR_RE.test(needle[0]);
+    const checkRight = wholeWord && WORD_CHAR_RE.test(needle[needle.length - 1]);
+    const hits = [];
+    let pos = 0;
+    while (pos <= hay.length - needle.length) {
+      const idx = hay.indexOf(needle, pos);
+      if (idx === -1) break;
+      const end = idx + needle.length;
+      const leftOk = !checkLeft || idx === 0 || !WORD_CHAR_RE.test(hay[idx - 1]);
+      const rightOk = !checkRight || end === hay.length || !WORD_CHAR_RE.test(hay[end]);
+      if (leftOk && rightOk) {
+        hits.push([idx, end]);
+        if (!findAll) return hits;
+        pos = idx + Math.max(1, needle.length);
+      } else {
+        pos = idx + 1;
+      }
+    }
+    return hits;
+  }
+
+  function getSearchOpts() {
+    return {
+      wholeWord: Boolean(state.searchWholeWord),
+      caseSensitive: Boolean(state.searchCaseSensitive),
+      acrossWholeTurn: Boolean(state.searchAcrossWholeTurn),
+    };
+  }
+
+  function getStepSearchUnits(step) {
+    if (!step) return [];
+    const cached = stepSearchUnitsCache.get(step);
     if (cached !== undefined) return cached;
+
+    const units = [];
+    const addUnit = (kind, partsList, toolIdx = null) => {
+      const raw = partsList.filter((x) => x !== undefined && x !== null && x !== "").join(" ");
+      if (!raw) return;
+      const u = { kind, raw, lower: raw.toLowerCase() };
+      if (toolIdx !== null && toolIdx !== undefined) u.toolIdx = toolIdx;
+      units.push(u);
+    };
+
     const fmtN = typeof fmtNum === "function" ? fmtNum : (v) => String(v ?? 0);
     const tsTime = fmtStepTime(step.created_at);
     const tsFull = fmtFullDateTime(step.created_at);
     const activeModel = step.type === "PLANNER_RESPONSE" ? (stepModelMap.get(step) || "") : "";
-    const parts = [
+
+    const headParts = [
       step.step_index,
       `#${step.step_index}`,
       step.type,
@@ -3257,28 +3373,11 @@
       activeModel,
       activeModel ? `🤖 ${activeModel}` : "",
     ];
-
-    if (step.content) {
-      parts.push(`txt:${fmtN(step.content.length)}`, `txt:${step.content.length}`);
-      const cleanContent = unescapeNewlines(step.content);
-      parts.push(cleanContent);
-      if (typeof stripLineNumbers === "function") {
-        const lnInfo = stripLineNumbers(cleanContent);
-        if (lnInfo && lnInfo.hadNumbers && lnInfo.stripped) parts.push(lnInfo.stripped);
-      }
-      if (typeof extractTopLevelXmlTags === "function") {
-        const extra = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
-        for (const t of extra) parts.push(`<${t.tag}>`, `🆕 <${t.tag}>`, unescapeNewlines(t.body || ""));
-      }
+    if (step.content) headParts.push(`txt:${fmtN(step.content.length)}`, `txt:${step.content.length}`);
+    if (step.thinking) headParts.push(`think:${fmtN(step.thinking.length)}`, `think:${step.thinking.length}`);
+    if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+      headParts.push(`tools:${step.tool_calls.length}`, `Tool Calls (${step.tool_calls.length})`);
     }
-    if (step.thinking) {
-      parts.push(`think:${fmtN(step.thinking.length)}`, `think:${step.thinking.length}`, `Thinking (${fmtN(step.thinking.length)} симв.)`);
-      parts.push(unescapeNewlines(step.thinking));
-    }
-    if (step.error) {
-      parts.push(unescapeNewlines(step.error));
-    }
-
     if (
       step.input_tokens !== undefined ||
       step.cache_read_tokens !== undefined ||
@@ -3289,27 +3388,23 @@
       const out = Number(step.output_tokens || 0);
       const tot = inp + cache;
       const pct = tot > 0 ? ((cache / tot) * 100).toFixed(1) : "0.0";
-      parts.push(
+      headParts.push(
         `in: ${inp}`, `in: ${fmtN(inp)}`,
         `cache: ${cache}`, `cache: ${fmtN(cache)}`, `(${pct}%)`, `${pct}%`,
         `out: ${out}`, `out: ${fmtN(out)}`
       );
     }
-
-    // Dynamic task-link pills in card / tool / result headers
     if (typeof stepTaskMetaMap !== "undefined" && stepTaskMetaMap.has(step)) {
       const evs = stepTaskMetaMap.get(step) || [];
       for (const ev of evs) {
-        if (ev.taskId) parts.push(ev.taskId);
-        if (ev.awaitedTaskId) parts.push(ev.awaitedTaskId);
+        if (ev.taskId) headParts.push(ev.taskId);
+        if (ev.awaitedTaskId) headParts.push(ev.awaitedTaskId);
         if (typeof resolveTaskLinkDestination === "function") {
           const d = resolveTaskLinkDestination(ev.taskId || ev.awaitedTaskId, step, ev.role);
-          if (d && d.label) parts.push(d.label);
+          if (d && d.label) headParts.push(d.label);
         }
       }
     }
-
-    // Unknown extra step keys rendered as 🆕 chips in header
     const knownKeys = new Set([
       "step_index", "source", "type", "status", "created_at",
       "content", "thinking", "tool_calls", "media", "error",
@@ -3318,64 +3413,140 @@
     for (const k of Object.keys(step)) {
       if (!knownKeys.has(k)) {
         const preview = typeof formatUnknownValPreview === "function" ? formatUnknownValPreview(step[k]) : String(step[k]);
-        parts.push(`🆕 ${k}: ${preview}`, k);
-        try { parts.push(JSON.stringify(step[k])); } catch (_) {}
+        headParts.push(`🆕 ${k}: ${preview}`, k);
+        try { headParts.push(JSON.stringify(step[k])); } catch (_) {}
       }
     }
-
-    // Media URIs & MIME metadata + CHECKPOINT inline brain images
     if (Array.isArray(step.media) && step.media.length > 0) {
-      parts.push(`media:${step.media.length}`);
+      headParts.push(`media:${step.media.length}`);
       for (const m of step.media) {
         if (!m) continue;
-        if (m.uri) parts.push(m.uri);
-        if (m.mime_type) parts.push(m.mime_type);
+        if (m.uri) headParts.push(m.uri);
+        if (m.mime_type) headParts.push(m.mime_type);
       }
     }
     if (step.type === "CHECKPOINT" && step.content && typeof extractInlineBrainImages === "function") {
-      for (const imgP of extractInlineBrainImages(step.content)) parts.push(imgP);
+      for (const imgP of extractInlineBrainImages(step.content)) headParts.push(imgP);
     }
 
-    // GENERIC metadata chips + standalone caller tool metadata
-    if (step.type === "GENERIC" && step.content) {
-      const parsed = parseGenericOutput(step.content);
-      parts.push("OUTPUT", parsed.chips.map((c) => c.label).join(" "));
-      if (parsed.body && typeof stripLineNumbers === "function") {
-        const bln = stripLineNumbers(parsed.body);
-        if (bln && bln.hadNumbers && bln.stripped) parts.push(bln.stripped);
+    if (step.type === "GENERIC") {
+      // A single GENERIC step is one tool output unit (badges, chips, line-stripped content, task pills)
+      const gParts = [...headParts, "OUTPUT"];
+      if (step.content) {
+        const parsed = parseGenericOutput(step.content);
+        if (parsed.chips.length) gParts.push(parsed.chips.map((c) => c.label).join(" "));
+        const cleanContent = unescapeNewlines(step.content);
+        gParts.push(cleanContent);
+        if (typeof stripLineNumbers === "function") {
+          const lnInfo = stripLineNumbers(cleanContent);
+          if (lnInfo && lnInfo.hadNumbers && lnInfo.stripped) gParts.push(lnInfo.stripped);
+          if (parsed.body) {
+            const bln = stripLineNumbers(parsed.body);
+            if (bln && bln.hadNumbers && bln.stripped) gParts.push(bln.stripped);
+          }
+        }
+        if (typeof extractTopLevelXmlTags === "function") {
+          const extra = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
+          for (const tObj of extra) gParts.push(`<${tObj.tag}>`, `🆕 <${tObj.tag}>`, unescapeNewlines(tObj.body || ""));
+        }
       }
       if (typeof stepToolMetaMap !== "undefined") {
         const tm = stepToolMetaMap.get(step);
         if (tm) {
-          if (tm.toolName) parts.push(tm.toolName);
+          if (tm.toolName) gParts.push(tm.toolName);
           if (tm.toolArgs && typeof summarizeToolArgs === "function") {
             const sumInfo = summarizeToolArgs(tm.toolName, tm.toolArgs);
-            if (sumInfo.text) parts.push(sumInfo.text);
+            if (sumInfo.text) gParts.push(sumInfo.text);
+          }
+        }
+      }
+      if (step.error) gParts.push(unescapeNewlines(step.error));
+      addUnit("generic", gParts);
+      stepSearchUnitsCache.set(step, units);
+      return units;
+    }
+
+    addUnit("header", headParts);
+
+    if (step.content) {
+      if (step.type === "USER_INPUT" && typeof parseUserInputEnvelope === "function") {
+        const env = parseUserInputEnvelope(step.content);
+        const reqStr = unescapeNewlines(env.req !== null ? env.req : step.content);
+        const reqParts = [reqStr];
+        if (typeof stripLineNumbers === "function") {
+          const lnInfo = stripLineNumbers(reqStr);
+          if (lnInfo && lnInfo.hadNumbers && lnInfo.stripped) reqParts.push(lnInfo.stripped);
+        }
+        addUnit("content", reqParts);
+        const metaClean = (env.meta || "").replace(/The current local time is:[^\n]*/gi, "").trim();
+        const metaCombined = [metaClean, env.settings].filter(Boolean).join("\n\n");
+        if (metaCombined) addUnit("meta", [unescapeNewlines(metaCombined)]);
+        if (Array.isArray(env.extraTags)) {
+          for (const tObj of env.extraTags) {
+            addUnit("tag", [`<${tObj.tag}>`, `🆕 <${tObj.tag}>`, unescapeNewlines(tObj.body || "")]);
+          }
+        }
+      } else {
+        const cleanContent = unescapeNewlines(step.content);
+        const contentParts = [cleanContent];
+        if (typeof stripLineNumbers === "function") {
+          const lnInfo = stripLineNumbers(cleanContent);
+          if (lnInfo && lnInfo.hadNumbers && lnInfo.stripped) contentParts.push(lnInfo.stripped);
+        }
+        addUnit("content", contentParts);
+        if (typeof extractTopLevelXmlTags === "function") {
+          const extra = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
+          for (const tObj of extra) {
+            addUnit("tag", [`<${tObj.tag}>`, `🆕 <${tObj.tag}>`, unescapeNewlines(tObj.body || "")]);
           }
         }
       }
     }
 
-    // Tool calls, count chip, summaries, and all args
+    if (step.thinking) {
+      const thinkLbl = `Thinking (${fmtN(step.thinking.length)})`;
+      addUnit("thinking", [thinkLbl, unescapeNewlines(step.thinking)]);
+    }
+
+    if (step.error) {
+      addUnit("error", [unescapeNewlines(step.error)]);
+    }
+
     if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
-      parts.push(`tools:${step.tool_calls.length}`, `Tool Calls (${step.tool_calls.length})`);
-      for (const tc of step.tool_calls) {
-        parts.push(tc.name || "");
+      const stepTaskEvs = typeof stepTaskMetaMap !== "undefined" ? (stepTaskMetaMap.get(step) || []) : [];
+      step.tool_calls.forEach((tc, tcIdx) => {
+        const tcParts = [tc.name || ""];
+        const tcEv = stepTaskEvs.find((ev) => ev.toolIdx === tcIdx && ev.taskId);
+        if (tcEv && typeof resolveTaskLinkDestination === "function") {
+          const tcDest = resolveTaskLinkDestination(tcEv.taskId, step, tcEv.role);
+          if (tcDest && tcDest.label) tcParts.push(tcDest.label);
+        }
         if (tc.args && typeof tc.args === "object") {
           if (typeof summarizeToolArgs === "function") {
             const sumInfo = summarizeToolArgs(tc.name, tc.args);
-            if (sumInfo.text) parts.push(sumInfo.text);
+            if (sumInfo.text) tcParts.push(sumInfo.text);
           }
           for (const [ak, av] of Object.entries(tc.args)) {
-            parts.push(ak, typeof av === "string" ? unescapeNewlines(av) : JSON.stringify(av));
+            tcParts.push(ak, typeof av === "string" ? unescapeNewlines(av) : JSON.stringify(av));
           }
         }
-      }
+        addUnit("tool", tcParts, tcIdx);
+      });
     }
 
-    const blob = parts.join(" ").toLowerCase();
-    stepSearchBlobCache.set(step, blob);
-    return blob;
+    stepSearchUnitsCache.set(step, units);
+    return units;
+  }
+
+  function getStepSearchBlob(step) {
+    if (!step) return { raw: "", lower: "" };
+    const cached = stepSearchBlobCache.get(step);
+    if (cached !== undefined) return cached;
+    const units = getStepSearchUnits(step);
+    const raw = units.map((u) => u.raw).join(" ");
+    const res = { raw, lower: raw.toLowerCase() };
+    stepSearchBlobCache.set(step, res);
+    return res;
   }
 
   let _cachedSearchAstRaw = null;
@@ -3528,36 +3699,94 @@
     return _cachedSearchAst;
   }
 
-  function evalSearchAst(node, blobLower) {
+  function evalSearchAst(node, target, opts = {}) {
     if (!node) return true;
-    if (node.type === "TERM") return node.lower ? blobLower.includes(node.lower) : true;
-    if (node.type === "NOT") return node.child ? !evalSearchAst(node.child, blobLower) : true;
-    if (node.type === "AND") return evalSearchAst(node.left, blobLower) && evalSearchAst(node.right, blobLower);
-    if (node.type === "OR") return evalSearchAst(node.left, blobLower) || evalSearchAst(node.right, blobLower);
+    const rawText = typeof target === "string" ? target : String(target?.raw || "");
+    const lowerText = typeof target === "string" ? target.toLowerCase() : String(target?.lower || rawText.toLowerCase());
+    if (node.type === "TERM") {
+      if (!node.lower && !node.text) return true;
+      if (!opts.caseSensitive && !opts.wholeWord) {
+        return lowerText.includes(node.lower);
+      }
+      return findTermOccurrences(rawText, lowerText, node.text, node.lower, opts, false).length > 0;
+    }
+    if (node.type === "NOT") return node.child ? !evalSearchAst(node.child, target, opts) : true;
+    if (node.type === "AND") return evalSearchAst(node.left, target, opts) && evalSearchAst(node.right, target, opts);
+    if (node.type === "OR") return evalSearchAst(node.left, target, opts) || evalSearchAst(node.right, target, opts);
     return true;
   }
 
-  function getPositiveSearchTerms(node, negated = false, out = null) {
-    const acc = out || new Set();
+  function getPositiveSearchTermObjs(node, negated = false, out = null) {
+    const acc = out || new Map();
     if (!node) return [];
     if (node.type === "TERM") {
-      if (!negated && node.lower) acc.add(node.lower);
+      if (!negated && node.text) {
+        const key = `${node.text}\x00${node.lower}`;
+        if (!acc.has(key)) acc.set(key, { text: node.text, lower: node.lower });
+      }
     } else if (node.type === "NOT") {
-      if (node.child) getPositiveSearchTerms(node.child, !negated, acc);
+      if (node.child) getPositiveSearchTermObjs(node.child, !negated, acc);
     } else if (node.type === "AND" || node.type === "OR") {
-      getPositiveSearchTerms(node.left, negated, acc);
-      getPositiveSearchTerms(node.right, negated, acc);
+      getPositiveSearchTermObjs(node.left, negated, acc);
+      getPositiveSearchTermObjs(node.right, negated, acc);
     }
     if (!out) {
-      return Array.from(acc).sort((a, b) => b.length - a.length);
+      return Array.from(acc.values()).sort((a, b) => b.text.length - a.text.length);
     }
     return null;
+  }
+
+  function getPositiveSearchTerms(node, negated = false, out = null) {
+    return getPositiveSearchTermObjs(node, negated, out).map((o) => o.lower);
   }
 
   function getTurnSearchBlob(step, attachedOutputs = null) {
     const base = getStepSearchBlob(step);
     if (!Array.isArray(attachedOutputs) || !attachedOutputs.length) return base;
-    return `${base} ${attachedOutputs.map(getStepSearchBlob).join(" ")}`;
+    const att = attachedOutputs.map(getStepSearchBlob);
+    const raw = `${base.raw} ${att.map((a) => a.raw).join(" ")}`;
+    const lower = `${base.lower} ${att.map((a) => a.lower).join(" ")}`;
+    return { raw, lower };
+  }
+
+  function getTurnSearchUnits(step, attachedOutputs = null) {
+    const baseUnits = getStepSearchUnits(step);
+    if (!Array.isArray(attachedOutputs) || attachedOutputs.length === 0) {
+      return baseUnits;
+    }
+    if (step && step.type === "PLANNER_RESPONSE") {
+      const out = [];
+      const pairedOutIdxs = new Set();
+      for (const u of baseUnits) {
+        if (u.kind === "tool" && u.toolIdx !== undefined && attachedOutputs[u.toolIdx]) {
+          pairedOutIdxs.add(u.toolIdx);
+          const gUnits = getStepSearchUnits(attachedOutputs[u.toolIdx]);
+          if (gUnits.length > 0) {
+            const extraRaw = gUnits.map((g) => g.raw).join("\n");
+            const combinedRaw = `${u.raw}\n${extraRaw}`;
+            out.push({
+              kind: "tool",
+              toolIdx: u.toolIdx,
+              raw: combinedRaw,
+              lower: combinedRaw.toLowerCase(),
+            });
+            continue;
+          }
+        }
+        out.push(u);
+      }
+      for (let i = 0; i < attachedOutputs.length; i++) {
+        if (!pairedOutIdxs.has(i) && attachedOutputs[i]) {
+          out.push(...getStepSearchUnits(attachedOutputs[i]));
+        }
+      }
+      return out;
+    }
+    const units = [...baseUnits];
+    for (const g of attachedOutputs) {
+      units.push(...getStepSearchUnits(g));
+    }
+    return units;
   }
 
   function getStepMatchingCmdKeys(step, attachedOutputs = null) {
@@ -3619,7 +3848,16 @@
     if (state.stepQuery) {
       const ast = getCachedSearchAst(state.stepQuery);
       if (!ast) return true;
-      return evalSearchAst(ast, getTurnSearchBlob(step, attachedOutputs));
+      const sOpts = getSearchOpts();
+      if (sOpts.acrossWholeTurn) {
+        return evalSearchAst(ast, getTurnSearchBlob(step, attachedOutputs), sOpts);
+      }
+      const units = getTurnSearchUnits(step, attachedOutputs);
+      const hasPositives = getPositiveSearchTermObjs(ast).length > 0;
+      if (hasPositives) {
+        return units.some((u) => evalSearchAst(ast, u, sOpts));
+      }
+      return units.every((u) => evalSearchAst(ast, u, sOpts));
     }
     return true;
   }
@@ -3642,9 +3880,9 @@
     const head = document.createElement("div");
     head.className = "step-head";
 
-    const typeDesc = TYPE_DOCS[step.type] || "Неизвестный/новый тип шага (возможно, добавлен в новой версии Antigravity).";
-    const srcDesc = SOURCE_DOCS[step.source] || "Источник события.";
-    const stDesc = STATUS_DOCS[step.status] || "Статус выполнения шага.";
+    const typeDesc = tDoc("types", step.type, "card.unknownTypeDesc");
+    const srcDesc = tDoc("sources", step.source, "card.unknownSourceDesc");
+    const stDesc = tDoc("statuses", step.status, "card.unknownStatusDesc");
     const isFinalPlanner =
       step.type === "PLANNER_RESPONSE" &&
       Boolean(step.content) &&
@@ -3655,11 +3893,13 @@
     const tzLabel = formatTzOffsetLabel(getEffectiveTzOffsetMin());
     const tzSourceNote =
       state.userTzSource === "transcript"
-        ? `Часовой пояс: ${tzLabel} (автокалибровка по транскрипту: ${state.userTzCalibSample})`
-        : `Часовой пояс: ${tzLabel} (по настройкам браузера)`;
+        ? t("card.tzTranscript", { tz: tzLabel, sample: state.userTzCalibSample })
+        : t("card.tzBrowser", { tz: tzLabel });
     const tsDesc =
-      `Отображается локальное время (${tzSourceNote}).\nВ JSONL хранится в формате ISO 8601 UTC.` +
-      (tsUserLocalRaw ? `\nВ метаданных шага: The current local time is: ${tsUserLocalRaw}` : "");
+      t("card.tsTooltipDesc", {
+        source: tzSourceNote,
+        localRaw: tsUserLocalRaw ? t("card.tsTooltipLocalRaw", { val: tsUserLocalRaw }) : "",
+      });
 
     const activeModel = step.type === "PLANNER_RESPONSE" ? (stepModelMap.get(step) || "") : "";
     const shareStepUrl = buildStepShareUrl(step.step_index);
@@ -3667,24 +3907,24 @@
 
     let headHtml = `
       <span class="badge badge-${escHtml(step.type)}${isFinalPlanner ? " is-final" : ""}" ${makeTipAttrs(
-        `type: ${step.type}${isFinalPlanner ? " (финальный ответ)" : ""}`,
+        `type: ${step.type}${isFinalPlanner ? t("card.typeFinalSuffix") : ""}`,
         isFinalPlanner
-          ? "Финальный ответ ИИ пользователю (содержит content, без новых tool_calls)."
+          ? t("card.typeFinalDesc")
           : typeDesc,
         `"type": ${JSON.stringify(step.type)}`
       )}>${escHtml(step.type)}</span>
 
       <span class="step-num-chip" data-copy-step="${escHtml(step.step_index)}" ${makeTipAttrs(
-        `step_index #${step.step_index} (клик — скопировать ссылку)`,
-        "Порядковый индекс шага в логе сессии. Клик копирует активную ссылку для браузера и ИИ.",
+        t("card.stepIndexTitle", { step: step.step_index }),
+        t("card.stepIndexDesc"),
         shareStepUrl
       )}>#${escHtml(step.step_index)}</span>
 
       ${taskHeaderPillsHtml}
 
       ${activeModel ? `<span class="meta-chip meta-chip-model" ${makeTipAttrs(
-        `Модель ИИ: ${activeModel}`,
-        "Текущая активная модель, отслеженная по метаданным Model Selection из USER_INPUT.",
+        t("card.modelTitle", { model: activeModel }),
+        t("card.modelDesc"),
         `Model Selection: ${activeModel}`
       )}>🤖 ${escHtml(activeModel)}</span>` : ""}
 
@@ -3701,7 +3941,7 @@
       )}>${escHtml(step.status || "—")}</span>
 
       <span class="step-ts" ${makeTipAttrs(
-        "created_at (время создания)",
+        t("card.createdAtTitle"),
         tsDesc,
         `"created_at": ${JSON.stringify(tsIsoRaw)}`
       )}>${escHtml(step.type === "USER_INPUT" ? fmtFullDateTime(tsIsoRaw) : fmtStepTime(tsIsoRaw))}</span>
@@ -3715,29 +3955,29 @@
     ]);
     if (step.content) {
       headHtml += `<span class="meta-chip" ${makeTipAttrs(
-        "content (текст шага)",
-        "Основной текст сообщения, вывода инструмента или summary.",
+        t("card.contentTitle"),
+        t("card.contentDesc"),
         `"content": "<string, ${step.content.length} chars>"`
       )}>txt:${fmtNum(step.content.length)}</span>`;
     }
     if (step.thinking) {
       headHtml += `<span class="meta-chip" ${makeTipAttrs(
-        "thinking (рассуждения)",
-        "Скрытая цепочка рассуждений модели (Chain-of-Thought).",
+        t("card.thinkingMetaTitle"),
+        t("card.thinkingMetaDesc"),
         `"thinking": "<string, ${step.thinking.length} chars>"`
       )}>think:${fmtNum(step.thinking.length)}</span>`;
     }
     if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
       headHtml += `<span class="meta-chip" ${makeTipAttrs(
-        "tool_calls (вызовы инструментов)",
-        "Массив инструментов, которые модель вызвала на этом шаге.",
+        t("card.toolCallsMetaTitle"),
+        t("card.toolCallsMetaDesc"),
         `"tool_calls": [${step.tool_calls.map((t) => `{"name":"${t.name}",...}`).join(", ")}]`
       )}>tools:${step.tool_calls.length}</span>`;
     }
     if (Array.isArray(step.media) && step.media.length > 0) {
       headHtml += `<span class="meta-chip" ${makeTipAttrs(
-        "media (вложения)",
-        "Изображения или файлы, приложенные к запросу пользователя.",
+        t("card.mediaMetaTitle"),
+        t("card.mediaMetaDesc"),
         `"media": ${JSON.stringify(step.media)}`
       )}>media:${step.media.length}</span>`;
     }
@@ -3751,8 +3991,8 @@
           valFull = String(step[k]);
         }
         headHtml += `<span class="meta-chip meta-chip-unknown" ${makeTipAttrs(
-          `🆕 Новое / неизвестное поле: ${k}`,
-          "Нестандартное поле из JSONL-строки (возможно, новая фича Antigravity).",
+          t("card.unknownKeyTitle", { key: k }),
+          t("card.unknownKeyDesc"),
           `"${k}": ${valFull.slice(0, 500)}`
         )}>🆕 ${escHtml(k)}: ${escHtml(valPreview)}</span>`;
       }
@@ -3775,26 +4015,26 @@
 
       tokHtml += `
         <span class="meta-chip" ${makeTipAttrs(
-          "input_tokens (свежий ввод)",
-          "Токены запроса, которые НЕ попали в кэш и тарифицируются по полной цене.",
+          t("card.inTokTitle"),
+          t("card.inTokDesc"),
           `"input_tokens": ${inp}`
         )}>in: ${fmtNum(inp)}</span>
         <span class="cache-pill ${lvl.cls}" ${makeTipAttrs(
-          `Попадание в кэш: ${hitStr}% — ${lvl.label}`,
-          `Формула: cache_read_tokens / (input_tokens + cache_read_tokens) × 100%\nРасчёт: ${fmtNum(cache)} / (${fmtNum(inp)} + ${fmtNum(cache)}) × 100% = ${hitStr}%`,
+          t("card.cacheTitle", { pct: hitStr, label: lvl.label }),
+          t("card.cacheDesc", { cache: fmtNum(cache), inp: fmtNum(inp), pct: hitStr }),
           `"cache_read_tokens": ${cache},\n"input_tokens": ${inp}`
         )}>cache: ${fmtNum(cache)} (${hitStr}%)</span>
         <span class="meta-chip" ${makeTipAttrs(
-          "output_tokens (генерация)",
-          "Токены, сгенерированные моделью в этом шаге.",
+          t("card.outTokTitle"),
+          t("card.outTokDesc"),
           `"output_tokens": ${out}`
         )}>out: ${fmtNum(out)}</span>
       `;
     }
 
     tokHtml += `<button type="button" class="raw-btn" ${makeTipAttrs(
-      "Оригинал шага (Raw JSON)",
-      "Показать/скрыть исходную JSON-строку прямо здесь (также Shift+ПКМ).",
+      t("card.rawStepTitle"),
+      t("card.rawStepDesc"),
       `{"step_index": ${step.step_index}, ...}`
     )}>{ }</button>`;
 
@@ -3817,10 +4057,10 @@
         det.open = state.detailsDefaultOpen !== false;
         det.innerHTML = `
           <summary ${makeTipAttrs(
-            "Поле thinking",
-            "Внутренний монолог/рассуждения модели перед действием или ответом.",
+            t("card.thinkingTipTitle"),
+            t("card.thinkingTipDesc"),
             `"thinking": "**Thinking**\\n..."`
-          )}>Thinking (${fmtNum(step.thinking.length)} симв.)</summary>
+          )}>${escHtml(t("card.thinkingHeader", { n: fmtNum(step.thinking.length) }))}</summary>
           <div class="block-body md">${renderMarkdown(unescapeNewlines(step.thinking))}</div>
         `;
         stepBody.appendChild(det);
@@ -3839,9 +4079,9 @@
         det.className = "block block-tools";
         det.open = state.detailsDefaultOpen !== false;
         const summary = document.createElement("summary");
-        summary.textContent = `Tool Calls (${step.tool_calls.length})`;
-        summary.dataset.tipTitle = "Поле tool_calls";
-        summary.dataset.tipDesc = "Список вызовов инструментов с именем, аргументами и вложенными результатами.";
+        summary.textContent = t("card.toolsHeader", { n: step.tool_calls.length });
+        summary.dataset.tipTitle = t("card.toolsTipTitle");
+        summary.dataset.tipDesc = t("card.toolsTipDesc");
         summary.dataset.tipRaw = `"tool_calls": [{"name": "${step.tool_calls[0]?.name || ""}", "args": {...}}]`;
         det.appendChild(summary);
 
@@ -3863,8 +4103,9 @@
         step.tool_calls.forEach((tc, tcIdx) => {
           const tcCard = document.createElement("div");
           tcCard.className = "tool-card";
+          tcCard.dataset.toolIdx = String(tcIdx);
           const sumInfo = summarizeToolArgs(tc.name, tc.args);
-          const toolDoc = TOOL_DOCS[tc.name] || "Вызов инструмента агента.";
+          const toolDoc = tDoc("tools", tc.name, "card.toolFallbackDoc");
           const outStep = attachedOutputs && attachedOutputs[tcIdx];
           const outHasErr = outStep ? isCommandErrorStep(outStep) : false;
           const outIsOk = outStep && !outHasErr && outStep.status === "DONE";
@@ -3892,7 +4133,7 @@
             if (tcDest && tcDest.kind === "to-result") {
               const tcUrl = buildStepShareUrl(tcDest.destStepIndex);
               tcTaskPillHtml = `<a class="task-link-pill task-link-to-result" href="${escHtml(tcUrl)}" data-jump-step="${escHtml(tcDest.destStepIndex)}" ${makeTipAttrs(
-                "Перейти к результату фоновой задачи",
+                t("card.taskLinkToResult"),
                 tcDest.desc,
                 tcUrl
               )}>${escHtml(tcDest.label)}</a>`;
@@ -3901,17 +4142,17 @@
 
           tcHead.innerHTML = `
             <span class="tool-name" ${makeTipAttrs(
-              `Инструмент: ${tc.name}`,
+              t("card.toolBadgeTitle", { name: tc.name }),
               toolDoc,
               `{"name": "${tc.name}", "args": ...}`
             )}>${escHtml(tc.name || "tool")}</span>
-            ${outIsOk ? '<span class="tool-ok-badge" title="Выполнено успешно">✓</span>' : ""}
-            ${outHasErr ? '<span class="tool-err-badge" title="Инструмент завершился с ошибкой">⚠</span>' : ""}
+            ${outIsOk ? `<span class="tool-ok-badge" title="${escHtml(t("card.toolOkTitle"))}">✓</span>` : ""}
+            ${outHasErr ? `<span class="tool-err-badge" title="${escHtml(t("card.toolErrTitle"))}">⚠</span>` : ""}
             ${tcTaskPillHtml}
             <span class="tool-summary"></span>
             <button type="button" class="raw-btn" ${makeTipAttrs(
-              "Исходник вызова инструмента",
-              "Переключить аргументы этого вызова в сырой JSON.",
+              t("card.toolRawTitle"),
+              t("card.toolRawDesc"),
               `{"name": "${tc.name}", ...}`
             )}>{ }</button>
           `;
@@ -3935,17 +4176,17 @@
             const argsFullBtns = [];
             const argsHiddenNote = document.createElement("div");
             argsHiddenNote.className = "read-hidden-note";
-            argsHiddenNote.innerHTML = `<span>Параметры скрыты</span>`;
+            argsHiddenNote.innerHTML = `<span>${escHtml(t("card.paramsHidden"))}</span>`;
             const aShowScroll = document.createElement("button");
             aShowScroll.type = "button";
             aShowScroll.className = "show-more-btn";
             aShowScroll.style.marginTop = "0";
-            aShowScroll.textContent = "Показать в прокрутке";
+            aShowScroll.textContent = t("card.showInScroll");
             const aShowFull = document.createElement("button");
             aShowFull.type = "button";
             aShowFull.className = "show-more-btn";
             aShowFull.style.marginTop = "0";
-            aShowFull.textContent = "Показать полностью";
+            aShowFull.textContent = t("card.showFull");
             argsHiddenNote.appendChild(aShowScroll);
             argsHiddenNote.appendChild(aShowFull);
             tcCard.appendChild(argsHiddenNote);
@@ -3955,7 +4196,7 @@
               const argsTopFullBtn = document.createElement("button");
               argsTopFullBtn.type = "button";
               argsTopFullBtn.className = "head-raw-btn";
-              argsTopFullBtn.title = "Переключить параметры: 18 строк в прокрутке / полностью без прокрутки";
+              argsTopFullBtn.title = t("card.toggleArgsTitle");
               tcHead.insertBefore(argsTopFullBtn, tcRawBtn);
               argsFullBtns.push(argsTopFullBtn);
 
@@ -3973,7 +4214,7 @@
               argsContainer.classList.toggle("is-scroll", mode === "scroll");
               argsContainer.classList.toggle("hidden", tcRawOpen || mode === "hide");
               argsHiddenNote.classList.toggle("hidden", tcRawOpen || mode !== "hide");
-              const lbl = mode === "full" ? "Свернуть в прокрутку" : "Показать полностью";
+              const lbl = mode === "full" ? t("card.collapseToScroll") : t("card.showFull");
               for (const b of argsFullBtns) {
                 b.textContent = lbl;
                 b.classList.toggle("hidden", tcRawOpen || mode === "hide");
@@ -4052,30 +4293,30 @@
 
             resHead.innerHTML = `
               <span class="badge badge-GENERIC" ${makeTipAttrs(
-                "Ответ инструмента (GENERIC)",
-                TYPE_DOCS.GENERIC,
+                t("card.outputBadgeTitle"),
+                tDoc("types", "GENERIC", "card.unknownTypeDesc"),
                 `"type": "GENERIC"`
               )}>OUTPUT</span>
               <span class="step-num-chip" data-copy-step="${escHtml(outStep.step_index)}" ${makeTipAttrs(
-                `step_index ответа #${outStep.step_index} (клик — скопировать ссылку)`,
-                "Порядковый номер шага ответа инструмента в JSONL. Клик копирует активную ссылку для браузера и ИИ.",
+                t("card.outputStepIndexTitle", { step: outStep.step_index }),
+                t("card.outputStepIndexDesc"),
                 buildStepShareUrl(outStep.step_index)
               )}>#${escHtml(outStep.step_index)}</span>
               ${resTaskPillsHtml}
               <span class="meta-chip" ${makeTipAttrs(
                 `source: ${outStep.source}`,
-                SOURCE_DOCS[outStep.source] || "Источник события.",
+                tDoc("sources", outStep.source, "card.unknownSourceDesc"),
                 `"source": ${JSON.stringify(outStep.source)}`
               )}>${escHtml(outStep.source || "MODEL")}</span>
               <span class="status-pill ${escHtml(outStep.status)}" ${makeTipAttrs(
                 `status: ${outStep.status}`,
-                STATUS_DOCS[outStep.status] || "Статус.",
+                tDoc("statuses", outStep.status, "card.unknownStatusDesc"),
                 `"status": ${JSON.stringify(outStep.status)}`
               )}>${escHtml(outStep.status || "DONE")}</span>
               ${extraChipsHtml}
               <button type="button" class="raw-btn" ${makeTipAttrs(
-                "Исходник ответа инструмента",
-                "Переключить только этот вывод в сырую JSON-строку.",
+                t("card.outputRawTitle"),
+                t("card.outputRawDesc"),
                 `{"step_index": ${outStep.step_index}, ...}`
               )}>{ }</button>
             `;
@@ -4089,7 +4330,7 @@
               const headFullBtn = document.createElement("button");
               headFullBtn.type = "button";
               headFullBtn.className = "head-raw-btn";
-              headFullBtn.title = "Переключить этот вывод: 18 строк в прокрутке / полностью без прокрутки";
+              headFullBtn.title = t("card.toggleOutputTitle");
               resHead.insertBefore(headFullBtn, resRawBtn);
               genRes.registerFullBtn(headFullBtn);
             }
@@ -4098,7 +4339,7 @@
               headRawBtn.type = "button";
               headRawBtn.className = "head-raw-btn";
               headRawBtn.textContent = genRes.rawLabel;
-              headRawBtn.title = "Переключить между форматированным видом и исходным текстом с номерами строк";
+              headRawBtn.title = t("card.toggleFormattedRawLinesTitle");
               resHead.insertBefore(headRawBtn, resRawBtn);
               genRes.registerRawBtn(headRawBtn);
             }
@@ -4155,25 +4396,25 @@
         const span = document.createElement("span");
         span.innerHTML = tags
           .map(
-            (t) =>
+            (tg) =>
               `<span class="meta-chip meta-chip-newtag" ${makeTipAttrs(
-                `🆕 Новый XML-тег: <${t.tag}>`,
-                "Нестандартный тег из поля content (возможно, добавлен в новой версии Antigravity).",
-                `<${t.tag}>\n${t.body.slice(0, 260)}`
-              )}>🆕 &lt;${escHtml(t.tag)}&gt;</span>`
+                t("card.unknownTagTitle", { tag: tg.tag }),
+                t("card.unknownTagDesc"),
+                `<${tg.tag}>\n${tg.body.slice(0, 260)}`
+              )}>🆕 &lt;${escHtml(tg.tag)}&gt;</span>`
           )
           .join("");
         if (tokBar) head.insertBefore(span, tokBar);
         else head.appendChild(span);
       };
 
-          const appendUnknownTagDrawers = (tags) => {
-        for (const t of tags) {
+      const appendUnknownTagDrawers = (tags) => {
+        for (const tg of tags) {
           const det = document.createElement("details");
           det.className = "block block-unknown-tag";
           det.innerHTML = `
-            <summary>🆕 Новый тег &lt;${escHtml(t.tag)}&gt; (${fmtNum(t.body.length)} симв.)</summary>
-            <div class="block-body"><pre class="generic-pre inner-scroll">${escHtml(unescapeNewlines(t.body))}</pre></div>
+            <summary>${escHtml(t("card.unknownTagDrawer", { tag: tg.tag, n: fmtNum(tg.body.length) }))}</summary>
+            <div class="block-body"><pre class="generic-pre inner-scroll">${escHtml(unescapeNewlines(tg.body))}</pre></div>
           `;
           det.querySelectorAll(".inner-scroll").forEach(attachInnerScrollGuard);
           stepBody.appendChild(det);
@@ -4202,7 +4443,7 @@
               det.className = "block block-meta";
               const parts = [metaClean, settings].filter(Boolean).join("\n\n");
               det.innerHTML = `
-                <summary>Метаданные запроса</summary>
+                <summary>${escHtml(t("card.requestMetaSummary"))}</summary>
                 <div class="block-body"><pre class="generic-pre inner-scroll">${escHtml(unescapeNewlines(parts))}</pre></div>
               `;
               det.querySelectorAll(".inner-scroll").forEach(attachInnerScrollGuard);
@@ -4231,7 +4472,7 @@
               const headFullBtn = document.createElement("button");
               headFullBtn.type = "button";
               headFullBtn.className = "head-raw-btn";
-              headFullBtn.title = "Переключить этот вывод: 18 строк в прокрутке / полностью без прокрутки";
+              headFullBtn.title = t("card.toggleOutputTitle");
               tokBar.insertBefore(headFullBtn, cardRawBtn);
               genRes.registerFullBtn(headFullBtn);
             }
@@ -4242,7 +4483,7 @@
               headRawBtn.type = "button";
               headRawBtn.className = "head-raw-btn";
               headRawBtn.textContent = genRes.rawLabel;
-              headRawBtn.title = "Переключить между форматированным видом и исходным текстом";
+              headRawBtn.title = t("card.toggleFormattedRawTitle");
               tokBar.insertBefore(headRawBtn, cardRawBtn);
               genRes.registerRawBtn(headRawBtn);
             }
@@ -4268,7 +4509,7 @@
           const localRawBtn = document.createElement("button");
           localRawBtn.type = "button";
           localRawBtn.className = "show-more-btn";
-          localRawBtn.textContent = "{ } Исходник вывода";
+          localRawBtn.textContent = t("card.localRawShow");
           let localRawPre = null;
           localRawBtn.addEventListener("click", () => {
             preserveScrollAnchor(() => {
@@ -4276,7 +4517,7 @@
                 localRawPre.remove();
                 localRawPre = null;
                 contentWrap.classList.remove("hidden");
-                localRawBtn.textContent = "{ } Исходник вывода";
+                localRawBtn.textContent = t("card.localRawShow");
               } else {
                 contentWrap.classList.add("hidden");
                 localRawPre = document.createElement("pre");
@@ -4284,7 +4525,7 @@
                 attachInnerScrollGuard(localRawPre);
                 localRawPre.textContent = step.content;
                 stepBody.insertBefore(localRawPre, localRawBtn);
-                localRawBtn.textContent = "Скрыть исходник";
+                localRawBtn.textContent = t("card.localRawHide");
               }
             }, localRawBtn);
           });
@@ -4373,6 +4614,7 @@
 
   function getRenderConfigKey() {
     return [
+      state.lang || "en",
       state.attachToolOutputs ? 1 : 0,
       state.expandAllOutputs ? 1 : 0,
       state.monoOutputs ? 1 : 0,
@@ -4385,11 +4627,20 @@
 
   function clearCardHighlight(card) {
     if (!card) return;
-    const hitEls = card.querySelectorAll(".search-hit-target");
+    const hitEls = card.querySelectorAll(".search-hit-target, .search-hit-sub");
     for (const hEl of hitEls) {
-      hEl.classList.remove("search-hit-target");
+      hEl.classList.remove("search-hit-target", "search-hit-sub");
     }
-    card.classList.remove("search-hit-target");
+    card.classList.remove("search-hit-target", "search-hit-sub");
+    card.classList.remove("has-search-omitted", "is-search-untrimmed");
+    const omittedEls = card.querySelectorAll(".search-omitted");
+    for (const oEl of omittedEls) {
+      oEl.classList.remove("search-omitted");
+    }
+    const revealBars = card.querySelectorAll(".search-reveal-bar");
+    for (const rb of revealBars) {
+      rb.remove();
+    }
     const marks = card.querySelectorAll("mark.hl");
     for (const mark of marks) {
       const p = mark.parentNode;
@@ -4408,6 +4659,11 @@
     _tocBaseCache = null;
   }
 
+  function getHighlightSig() {
+    if (!state.stepQuery) return "";
+    return `${state.stepQuery}\x01${state.searchWholeWord ? 1 : 0}\x01${state.searchCaseSensitive ? 1 : 0}\x01${state.searchAcrossWholeTurn ? 1 : 0}\x01${state.searchFocusedOnly ? 1 : 0}\x01${state.lang || "en"}`;
+  }
+
   function enhanceCardNow(card) {
     if (!card) return;
     if (card.dataset.enhanced !== "1") {
@@ -4415,15 +4671,22 @@
       linkifyTaskIdsInElement(card, rawStepMap.get(card) || null);
       linkifyElement(card);
     }
+    const hlSig = getHighlightSig();
     if (state.stepQuery) {
-      if (card.dataset.hlQuery !== state.stepQuery) {
+      if (card.dataset.hlQuery !== hlSig) {
         if (card.dataset.hlQuery) clearCardHighlight(card);
-        highlightMatches(card, state.stepQuery);
-        card.dataset.hlQuery = state.stepQuery;
+        highlightMatches(card, state.stepQuery, {
+          ...getSearchOpts(),
+          trimNonMatching: state.searchFocusedOnly && card.tagName === "ARTICLE",
+          cardEl: card,
+        });
+        card.dataset.hlQuery = hlSig;
         _highlightedCards.add(card);
+        if (card.isConnected) applyInitialSearchScrolls(card);
       }
     } else if (card.dataset.hlQuery) {
       clearCardHighlight(card);
+      if (card.isConnected && card.dataset.hasEditDiff === "1") applyInitialEditScrolls(card);
     }
   }
 
@@ -4482,6 +4745,30 @@
       : 0;
     _vSpacerTop.style.height = `${topH}px`;
     _vSpacerBottom.style.height = `${botH}px`;
+  }
+
+  function measureMountedVWindowNow() {
+    if (!_vItems.length || !_vWindow) return false;
+    let minChangedIdx = _vItems.length;
+    for (const el of _vWindow.children) {
+      if (!el.isConnected || el.dataset.isSkeleton === "1") continue;
+      const item = _vElToItemMap.get(el);
+      if (!item) continue;
+      const boxH = Math.ceil(el.getBoundingClientRect().height);
+      if (boxH <= 0) continue;
+      const newH = boxH + CARD_GAP;
+      if (Math.abs(newH - item.height) >= 1) {
+        item.height = newH;
+        item.measured = true;
+        if (item.idx < minChangedIdx) minChangedIdx = item.idx;
+      }
+    }
+    if (minChangedIdx < _vItems.length) {
+      recomputeVItemOffsets(minChangedIdx);
+      updateVSpacers();
+      return true;
+    }
+    return false;
   }
 
   function touchLruItem(item, el, cfgKey) {
@@ -4549,7 +4836,7 @@
         `<span class="status-pill ${escHtml(s.status)}">${escHtml(s.status || "—")}</span>` +
         `<span class="step-ts">${escHtml(fmtStepTime(s.created_at))}</span>` +
       `</div>` +
-      `<div class="step-body step-shell-placeholder">${escHtml(hint || "Прокрутка…")}</div>`;
+      `<div class="step-body step-shell-placeholder">${escHtml(hint || t("app.scrollingPlaceholder"))}</div>`;
     _vElToItemMap.set(sk, item);
     return sk;
   }
@@ -4838,6 +5125,7 @@
       _vWindow.innerHTML = "";
       _vWindow.appendChild(frag);
       for (const en of editNodes) applyInitialEditScrolls(en);
+      if (state.stepQuery) for (const cn of checkNodes) applyInitialSearchScrolls(cn);
       for (const cn of checkNodes) scheduleCardOverflowCheck(cn);
     } else {
       // Remove top elements outside new window
@@ -4876,6 +5164,7 @@
         }
         _vWindow.prepend(topFrag);
         for (const en of topEditNodes) applyInitialEditScrolls(en);
+        if (state.stepQuery) for (const cn of topCheckNodes) applyInitialSearchScrolls(cn);
         for (const cn of topCheckNodes) scheduleCardOverflowCheck(cn);
       }
       // Append missing bottom elements
@@ -4892,6 +5181,7 @@
         }
         _vWindow.appendChild(botFrag);
         for (const en of botEditNodes) applyInitialEditScrolls(en);
+        if (state.stepQuery) for (const cn of botCheckNodes) applyInitialSearchScrolls(cn);
         for (const cn of botCheckNodes) scheduleCardOverflowCheck(cn);
       }
       // Upgrade skeletons: visible viewport skeletons FIRST, then overscan within budget
@@ -4911,6 +5201,7 @@
           const realNode = ensureRealVElement(item);
           sk.replaceWith(realNode);
           if (realNode.dataset.hasEditDiff === "1") applyInitialEditScrolls(realNode);
+          if (state.stepQuery) applyInitialSearchScrolls(realNode);
           scheduleCardOverflowCheck(realNode);
           if (vResizeObserver) vResizeObserver.observe(realNode);
         }
@@ -4922,6 +5213,7 @@
           const realNode = ensureRealVElement(item);
           sk.replaceWith(realNode);
           if (realNode.dataset.hasEditDiff === "1") applyInitialEditScrolls(realNode);
+          if (state.stepQuery) applyInitialSearchScrolls(realNode);
           scheduleCardOverflowCheck(realNode);
           if (vResizeObserver) vResizeObserver.observe(realNode);
         }
@@ -4957,8 +5249,13 @@
     const { inTok, cacheTok, outTok } = state.totals;
     const totIn = inTok + cacheTok;
     const hitPct = totIn > 0 ? ((cacheTok / totIn) * 100).toFixed(1) : "0.0";
-    els.sessionStats.textContent =
-      `Шагов: ${state.steps.length} · in: ${fmtNum(inTok)} · cache: ${fmtNum(cacheTok)} (${hitPct}%) · out: ${fmtNum(outTok)}`;
+    els.sessionStats.textContent = t("app.stepsStatsBar", {
+      steps: state.steps.length,
+      inTok: fmtNum(inTok),
+      cacheTok: fmtNum(cacheTok),
+      hitPct,
+      outTok: fmtNum(outTok),
+    });
   }
 
   function recomputeTotals() {
@@ -4985,6 +5282,7 @@
     const key = String(stepIndex);
     let item = _vStepToItemMap.get(key);
     if (!item) {
+      if (opts.resetFiltersOnMissing === false) return false;
       // Reset filters so the target step becomes visible
       state.filter = "all";
       state.stepQuery = "";
@@ -5003,6 +5301,7 @@
 
     const desiredTop = opts.topOffset !== undefined ? opts.topOffset : 4;
     const subStepKey = opts.toolOutStep !== undefined && opts.toolOutStep !== null ? String(opts.toolOutStep) : "";
+    const toolIdxKey = opts.toolIdx !== undefined && opts.toolIdx !== null ? String(opts.toolIdx) : "";
     const topCard = ensureRealVElement(item);
     // Warm immediate +/- 2 neighbors cleanly before scroll
     for (let k = Math.max(0, item.idx - 2); k <= Math.min(_vItems.length - 1, item.idx + 2); k++) {
@@ -5013,6 +5312,10 @@
       if (subStepKey) {
         const sub = topCard.querySelector(`[data-step-index="${CSS.escape(subStepKey)}"]`);
         if (sub) return sub;
+      }
+      if (toolIdxKey) {
+        const tc = topCard.querySelector(`.tool-card[data-tool-idx="${CSS.escape(toolIdxKey)}"]`);
+        if (tc) return tc;
       }
       return topCard.querySelector(`[data-step-index="${CSS.escape(key)}"]`) || topCard;
     };
@@ -5026,39 +5329,49 @@
 
     const alignToTarget = () => {
       if (!target.isConnected) {
+        const baseNow = getVListBaseTop();
+        _suppressScrollTsUntil = Math.max(_suppressScrollTsUntil, performance.now() + 260);
+        els.feedWrap.scrollTop = Math.max(0, baseNow + item.offsetY - desiredTop);
+        _lastScrollFrameTop = els.feedWrap.scrollTop;
         syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+        measureMountedVWindowNow();
         target = resolveTarget();
       }
-      if (!target.isConnected) return;
+      if (!target.isConnected) return 0;
       const wrapRect = els.feedWrap.getBoundingClientRect();
       const tgtRect = target.getBoundingClientRect();
       const delta = tgtRect.top - wrapRect.top - desiredTop;
       if (Math.abs(delta) > 1.5) {
-        _suppressScrollTsUntil = performance.now() + 140;
+        _suppressScrollTsUntil = Math.max(_suppressScrollTsUntil, performance.now() + 240);
         els.feedWrap.scrollTop = Math.max(0, els.feedWrap.scrollTop + delta);
         _lastScrollFrameTop = els.feedWrap.scrollTop;
       }
+      return delta;
     };
 
     _pinBottomLockUntil = 0;
     _activeAnchorLock = null;
     const jumpLock = { item, desiredTop, expiresAt: performance.now() + 1200, alignFn: alignToTarget };
     _activeJumpLock = jumpLock;
-    _suppressScrollTsUntil = performance.now() + 240;
-    _suppressRoScrollCompUntil = performance.now() + 280;
+    _suppressScrollTsUntil = performance.now() + 320;
+    _suppressRoScrollCompUntil = performance.now() + 360;
     const baseTop = getVListBaseTop();
     els.feedWrap.scrollTop = Math.max(0, baseTop + item.offsetY - desiredTop);
     _lastScrollFrameTop = els.feedWrap.scrollTop;
-    syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
 
-    target = resolveTarget();
-    p = target.parentElement;
-    while (p && p !== els.feed) {
-      if (p.tagName === "DETAILS" && !p.open) p.open = true;
-      p = p.parentElement;
+    for (let pass = 0; pass < 3; pass++) {
+      syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
+      measureMountedVWindowNow();
+      target = resolveTarget();
+      p = target.parentElement;
+      while (p && p !== els.feed) {
+        if (p.tagName === "DETAILS" && !p.open) p.open = true;
+        p = p.parentElement;
+      }
+      const delta = alignToTarget();
+      if (Math.abs(delta) <= 4) break;
     }
 
-    alignToTarget();
     requestAnimationFrame(() => {
       if (_activeJumpLock === jumpLock) alignToTarget();
     });
@@ -5074,7 +5387,8 @@
 
   function extractMatchSnippet(step, query, attachedOutputs = null) {
     const ast = getCachedSearchAst(query);
-    const terms = getPositiveSearchTerms(ast);
+    const termObjs = getPositiveSearchTermObjs(ast);
+    const sOpts = getSearchOpts();
     const attachedChips = Array.isArray(attachedOutputs)
       ? attachedOutputs.flatMap((g) => (g.content ? parseGenericOutput(g.content).chips.map((c) => c.label) : [])).join(" ")
       : "";
@@ -5096,15 +5410,22 @@
       .join(" ");
     const modelLbl = stepModelMap.get(step) ? `🤖 ${stepModelMap.get(step)}` : "";
     const metaLabel = `#${step.step_index} ${step.type || ""} ${step.status || ""} ${step.source || ""} ${fmtStepTime(step.created_at)} ${modelLbl} ${taskLabels} ${selfChips} ${attachedChips}`;
-    const sources = [
-      ["content", step.content || ""],
-      ["thinking", step.thinking || ""],
-      ["error", step.error || ""],
-      ["tools", step.tool_calls ? JSON.stringify(step.tool_calls) : ""],
-      ["output", attachedText],
-      ["meta", metaLabel],
-    ];
-    if (terms.length > 0) {
+    const sources = [];
+    if (step.content) sources.push(["content", step.content]);
+    if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+      step.tool_calls.forEach((tc, tcIdx) => {
+        const out = Array.isArray(attachedOutputs) ? attachedOutputs[tcIdx] : null;
+        const outPart = out ? ` #${out.step_index} ${out.status || ""} ${out.error || ""} ${out.content || ""}` : "";
+        sources.push([tc.name || "tool", `${tc.name || ""} ${JSON.stringify(tc.args || {})}${outPart}`]);
+      });
+    } else if (attachedText) {
+      sources.push(["output", attachedText]);
+    }
+    if (step.thinking) sources.push(["thinking", step.thinking]);
+    if (step.error) sources.push(["error", step.error]);
+    sources.push(["meta", metaLabel]);
+
+    if (termObjs.length > 0) {
       const renderSliceHtml = (label, clean, idx, termLen) => {
         const start = Math.max(0, idx - 34);
         const end = Math.min(clean.length, idx + termLen + 48);
@@ -5114,40 +5435,54 @@
         const match = escHtml(clean.slice(idx, idx + termLen));
         const after = escHtml(clean.slice(idx + termLen, end));
         const tag = label === "content" ? "" : `[${label}] `;
+        const winRaw = clean.slice(start, end);
         return {
           html: `${escHtml(tag)}${prefix}${before}<mark class="hl">${match}</mark>${after}${suffix}`,
-          windowLower: clean.slice(start, end).toLowerCase(),
+          windowRaw: winRaw,
+          windowLower: winRaw.toLowerCase(),
         };
       };
 
+      const prepared = sources
+        .filter(([, raw]) => Boolean(raw))
+        .map(([label, raw]) => {
+          const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
+          return { label, clean, lower: clean.toLowerCase() };
+        })
+        .filter((s) => s.clean.length > 0);
+      const astMatchedSources =
+        !sOpts.acrossWholeTurn && ast
+          ? prepared.filter((s) => evalSearchAst(ast, { raw: s.clean, lower: s.lower }, sOpts))
+          : [];
+      const activeSources = astMatchedSources.length > 0 ? astMatchedSources : prepared;
+
       let firstSnip = null;
-      for (const [label, raw] of sources) {
-        if (!raw) continue;
-        const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
-        const lower = clean.toLowerCase();
+      for (const s of activeSources) {
         let bestIdx = -1;
-        let bestTerm = "";
-        for (const t of terms) {
-          const idx = lower.indexOf(t);
-          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx || (idx === bestIdx && t.length > bestTerm.length))) {
+        let bestTerm = null;
+        for (const tObj of termObjs) {
+          const hits = findTermOccurrences(s.clean, s.lower, tObj.text, tObj.lower, sOpts, false);
+          const idx = hits.length ? hits[0][0] : -1;
+          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx || (idx === bestIdx && tObj.text.length > bestTerm.text.length))) {
             bestIdx = idx;
-            bestTerm = t;
+            bestTerm = tObj;
           }
         }
-        if (bestIdx !== -1) {
-          firstSnip = renderSliceHtml(label, clean, bestIdx, bestTerm.length);
+        if (bestIdx !== -1 && bestTerm) {
+          firstSnip = renderSliceHtml(s.label, s.clean, bestIdx, bestTerm.text.length);
           break;
         }
       }
       if (firstSnip) {
-        const missingTerm = terms.find((t) => !firstSnip.windowLower.includes(t));
+        const missingTerm = termObjs.find(
+          (tObj) => findTermOccurrences(firstSnip.windowRaw, firstSnip.windowLower, tObj.text, tObj.lower, sOpts, false).length === 0
+        );
         if (missingTerm) {
-          for (const [label, raw] of sources) {
-            if (!raw) continue;
-            const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
-            const idx = clean.toLowerCase().indexOf(missingTerm);
+          for (const s of activeSources) {
+            const mHits = findTermOccurrences(s.clean, s.lower, missingTerm.text, missingTerm.lower, sOpts, false);
+            const idx = mHits.length ? mHits[0][0] : -1;
             if (idx !== -1) {
-              const secondSnip = renderSliceHtml(label, clean, idx, missingTerm.length);
+              const secondSnip = renderSliceHtml(s.label, s.clean, idx, missingTerm.text.length);
               return `${firstSnip.html} <span style="opacity:.6">·</span> ${secondSnip.html}`;
             }
           }
@@ -5192,7 +5527,8 @@
       _tocBaseCache &&
       _tocBaseCache.activeId === state.activeId &&
       _tocBaseCache.stepsLen === state.steps.length &&
-      _tocBaseCache.tzMin === tzMin
+      _tocBaseCache.tzMin === tzMin &&
+      _tocBaseCache.lang === (state.lang || "en")
     ) {
       hasTokBars = _tocBaseCache.hasTokBars;
       barsHtml = _tocBaseCache.barsHtml;
@@ -5264,7 +5600,7 @@
         } else if (s.type === "USER_INPUT") {
           snippetHtml = escHtml("👤 " + rawFirstLineSource.replace(/\s+/g, " ").trim().slice(0, 90));
         } else if (s.type === "CHECKPOINT") {
-          snippetHtml = escHtml("🟣 Сжатие контекста (Compaction)");
+          snippetHtml = escHtml(t("toc.compactionRow"));
         } else if (Array.isArray(s.tool_calls) && s.tool_calls.length > 0) {
           snippetHtml = escHtml("🛠 " + s.tool_calls.map((t) => t.name).join(", "));
         } else if (s.content) {
@@ -5297,8 +5633,13 @@
           const lvl = getCacheLevel(e.hitPct, e.totIn);
           const deltaStr = fmtDeltaSec(e.deltaSec);
           return `<button type="button" class="cache-bar ${lvl.cls}" data-toc-step="${escHtml(e.stepIndex)}" data-tip-delay="80" ${makeTipAttrs(
-            `Шаг #${e.stepIndex} · ${e.time} (Δt ${deltaStr})`,
-            `${e.firstLine}\n\nКэш: ${e.hitPct.toFixed(1)}% (${fmtNum(e.cache)} из ${fmtNum(e.totIn)}) · Клик — выделить в оглавлении`,
+            t("toc.barTipTitle", { step: e.stepIndex, time: e.time, delta: deltaStr }),
+            t("toc.barTipDesc", {
+              firstLine: e.firstLine,
+              hitPct: e.hitPct.toFixed(1),
+              cache: fmtNum(e.cache),
+              totIn: fmtNum(e.totIn),
+            }),
             `in=${e.inp}, cache=${e.cache}, out=${e.out}`
           )}></button>`;
         })
@@ -5336,6 +5677,7 @@
           activeId: state.activeId,
           stepsLen: state.steps.length,
           tzMin,
+          lang: state.lang || "en",
           hasTokBars,
           barsHtml,
           rowsHtml,
@@ -5344,15 +5686,15 @@
       }
     }
 
-    let mapTitle = "📑 Оглавление";
+    let mapTitle = t("toc.title");
     if (isFiltered) {
       const parts = [];
-      if (state.filter === "dialog") parts.push("Диалог");
-      if (state.filter === "errors") parts.push("Ошибки");
-      if (state.onlyCmdErrors) parts.push("Ошибки команд");
-      if (state.cmdMapFilterOnly && state.cmdMapKeys.size > 0) parts.push(`Карта команд (${state.cmdMapKeys.size})`);
+      if (state.filter === "dialog") parts.push(t("toc.filterDialog"));
+      if (state.filter === "errors") parts.push(t("toc.filterErrors"));
+      if (state.onlyCmdErrors) parts.push(t("toc.filterCmdErrors"));
+      if (state.cmdMapFilterOnly && state.cmdMapKeys.size > 0) parts.push(t("toc.filterCmdMap", { count: state.cmdMapKeys.size }));
       if (state.stepQuery) parts.push(`«${state.stepQuery}»`);
-      mapTitle = `📑 Фильтрованное оглавление (${parts.join(" + ")}) — найдено: ${entryCount}`;
+      mapTitle = t("toc.titleFiltered", { filters: parts.join(" + "), count: entryCount });
     }
 
     card.innerHTML = `
@@ -5364,81 +5706,97 @@
             <span class="cache-pill cache-lvl-4">70–89%</span>
             <span class="cache-pill cache-lvl-3">40–69%</span>
             <span class="cache-pill cache-lvl-2">1–39%</span>
-            <span class="cache-pill cache-lvl-1">0% (Miss)</span>
+            <span class="cache-pill cache-lvl-1">${escHtml(t("toc.legend0"))}</span>
           </div>
         </summary>
         <div class="cache-formula">
-          Формула кэша: <code>cache_read_tokens / (input_tokens + cache_read_tokens) × 100%</code>. Клик по квадрату — выделить в оглавлении; Enter или клик по строке — переход к сообщению.
+          ${t("toc.formula")}
         </div>
         ${hasTokBars ? `<div class="cache-strip">${barsHtml}</div>` : ""}
         <div class="toc-wrap">
           <table class="toc-table">
             <thead>
               <tr>
-                <th>Шаг</th>
-                <th>Время</th>
-                <th>Пауза Δt</th>
-                <th>${state.stepQuery ? "Цитата с совпадением" : "Событие / Запрос"}</th>
-                <th>in / cache / out</th>
-                <th>Кэш</th>
+                <th>${escHtml(t("toc.colStep"))}</th>
+                <th>${escHtml(t("toc.colTime"))}</th>
+                <th>${escHtml(t("toc.colDelta"))}</th>
+                <th>${escHtml(state.stepQuery ? t("toc.colSnippetSearch") : t("toc.colSnippetDefault"))}</th>
+                <th>${escHtml(t("toc.colTokens"))}</th>
+                <th>${escHtml(t("toc.colCache"))}</th>
               </tr>
             </thead>
-            <tbody>${rowsHtml || `<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">Нет совпадений</td></tr>`}</tbody>
+            <tbody>${rowsHtml || `<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">${escHtml(t("toc.noMatches"))}</td></tr>`}</tbody>
           </table>
         </div>
         <div class="toc-options">
           <label class="toc-option-check">
             <input type="checkbox" id="optAttachTools" ${state.attachToolOutputs ? "checked" : ""}>
-            <span>Прикладывать ответы инструментов к их вызовам</span>
+            <span>${escHtml(t("toc.optAttachTools"))}</span>
           </label>
           <label class="toc-option-check">
             <input type="checkbox" id="optExpandOutputs" ${state.expandAllOutputs ? "checked" : ""}>
-            <span>Развернуть все выводы инструментов</span>
+            <span>${escHtml(t("toc.optExpandOutputs"))}</span>
           </label>
           <label class="toc-option-check">
             <input type="checkbox" id="optMonoOutputs" ${state.monoOutputs ? "checked" : ""}>
-            <span>Консольный шрифт в выводах</span>
+            <span>${escHtml(t("toc.optMonoOutputs"))}</span>
           </label>
-          <label class="toc-option-check" title="Режим отображения прочитанных файлов и длинных блоков инструментов (read_file, edit_file, write_file, invoke_subagent и др.); «Полностью сразу» разворачивает все такие блоки">
-            <span>Файлы / блоки:</span>
+          <label class="toc-option-check" title="${escHtml(t("toc.optReadModeTitle"))}">
+            <span>${escHtml(t("toc.optReadModeLabel"))}</span>
             <select id="optReadDisplayMode" class="select-sm">
-              <option value="scroll" ${state.readDisplayMode === "scroll" ? "selected" : ""}>📜 В прокрутке (18 строк)</option>
-              <option value="full" ${state.readDisplayMode === "full" ? "selected" : ""}>📖 Полностью сразу</option>
-              <option value="hide" ${state.readDisplayMode === "hide" ? "selected" : ""}>🙈 Не показывать файлы</option>
+              <option value="scroll" ${state.readDisplayMode === "scroll" ? "selected" : ""}>${escHtml(t("toc.optReadScroll"))}</option>
+              <option value="full" ${state.readDisplayMode === "full" ? "selected" : ""}>${escHtml(t("toc.optReadFull"))}</option>
+              <option value="hide" ${state.readDisplayMode === "hide" ? "selected" : ""}>${escHtml(t("toc.optReadHide"))}</option>
             </select>
           </label>
-          <label class="toc-option-check" title="Отключить автоматическую генерацию ссылок из текста/путей/URL (останутся только явные Markdown-ссылки [текст](url))">
+          <label class="toc-option-check" title="${escHtml(t("toc.optDisableAutoLinksTitle"))}">
             <input type="checkbox" id="optDisableAutoLinks" ${state.disableAutoLinks ? "checked" : ""}>
-            <span>Отключить генерацию автоссылок</span>
+            <span>${escHtml(t("toc.optDisableAutoLinks"))}</span>
           </label>
-          <label class="toc-option-check" title="Делать кликабельными короткие имена файлов текущего проекта (server.py, README.md и т.д.)">
+          <label class="toc-option-check" title="${escHtml(t("toc.optLinkifyShortTitle"))}">
             <input type="checkbox" id="optLinkifyShort" ${state.linkifyProjectFiles ? "checked" : ""} ${state.disableAutoLinks ? "disabled" : ""}>
-            <span>📄 Имена проекта</span>
+            <span>${escHtml(t("toc.optLinkifyShort"))}</span>
           </label>
-          <label class="toc-option-check" title="Где открывать ссылки на папки">
-            <span>Папки:</span>
+          <label class="toc-option-check" title="${escHtml(t("toc.optFolderTitle"))}">
+            <span>${escHtml(t("toc.optFolderLabel"))}</span>
             <select id="optFolderOpenMode" class="select-sm">
-              <option value="browser" ${state.folderOpenMode === "browser" ? "selected" : ""}>🌐 Браузер</option>
+              <option value="browser" ${state.folderOpenMode === "browser" ? "selected" : ""}>${escHtml(t("toc.optFolderBrowser"))}</option>
               ${state.capabilities?.is_windows !== false
-                ? `<option value="explorer" ${state.folderOpenMode === "explorer" ? "selected" : ""}>🗂 Проводник</option>
-                   <option value="totalcmd" ${state.folderOpenMode === "totalcmd" ? "selected" : ""}>⚡ TotalCmd</option>`
+                ? `<option value="explorer" ${state.folderOpenMode === "explorer" ? "selected" : ""}>${escHtml(t("toc.optFolderExplorer"))}</option>
+                   <option value="totalcmd" ${state.folderOpenMode === "totalcmd" ? "selected" : ""}>${escHtml(t("toc.optFolderTotalCmd"))}</option>`
                 : (state.capabilities?.open_folder_os
-                  ? `<option value="system" ${state.folderOpenMode === "system" ? "selected" : ""}>📂 Файловый менеджер</option>`
+                  ? `<option value="system" ${state.folderOpenMode === "system" ? "selected" : ""}>${escHtml(t("toc.optFolderSystem"))}</option>`
                   : "")}
             </select>
           </label>
-          <label class="toc-option-check" title="Способ открытия локальных файлов (.html, .md, .txt, код и т.д.) при клике на ссылку">
-            <span>Файлы:</span>
+          <label class="toc-option-check" title="${escHtml(t("toc.optFileTitle"))}">
+            <span>${escHtml(t("toc.optFileLabel"))}</span>
             <select id="optFileOpenMode" class="select-sm">
-              <option value="ask" ${state.fileOpenMode === "ask" ? "selected" : ""}>❓ Спрашивать каждый раз</option>
-              <option value="browser_fmt" ${state.fileOpenMode === "browser_fmt" ? "selected" : ""}>🌐 В браузере с форматированием</option>
-              <option value="browser_raw" ${state.fileOpenMode === "browser_raw" ? "selected" : ""}>📄 В браузере как текст (Raw)</option>
+              <option value="ask" ${state.fileOpenMode === "ask" ? "selected" : ""}>${escHtml(t("toc.optFileAsk"))}</option>
+              <option value="browser_fmt" ${state.fileOpenMode === "browser_fmt" ? "selected" : ""}>${escHtml(t("toc.optFileBrowserFmt"))}</option>
+              <option value="browser_raw" ${state.fileOpenMode === "browser_raw" ? "selected" : ""}>${escHtml(t("toc.optFileBrowserRaw"))}</option>
               ${state.capabilities?.open_notepadpp
-                ? `<option value="notepadpp" ${state.fileOpenMode === "notepadpp" ? "selected" : ""}>📝 Редактировать в Notepad++</option>`
+                ? `<option value="notepadpp" ${state.fileOpenMode === "notepadpp" ? "selected" : ""}>${escHtml(t("toc.optFileNotepad"))}</option>`
                 : ""}
-              <option value="system" ${state.fileOpenMode === "system" ? "selected" : ""}>🖥️ Запустить / открыть в системе</option>
+              <option value="system" ${state.fileOpenMode === "system" ? "selected" : ""}>${escHtml(t("toc.optFileSystem"))}</option>
             </select>
-            <button type="button" id="optFileOpenReset" class="file-mode-reset-btn${state.fileOpenMode === "ask" ? " hidden" : ""}" title="Сбросить запомненный выбор и снова спрашивать при каждом клике">Сбросить</button>
+            <button type="button" id="optFileOpenReset" class="file-mode-reset-btn${state.fileOpenMode === "ask" ? " hidden" : ""}" title="${escHtml(t("toc.optFileResetTitle"))}">${escHtml(t("toc.optFileReset"))}</button>
+          </label>
+          <label class="toc-option-check" title="${escHtml(t("toc.optSearchFocusedTitle"))}">
+            <input type="checkbox" id="optSearchFocused" data-search-opt="searchFocusedOnly" ${state.searchFocusedOnly ? "checked" : ""}>
+            <span>${escHtml(t("toc.optSearchFocused"))}</span>
+          </label>
+          <label class="toc-option-check" title="${escHtml(t("toc.optSearchWholeTurnTitle"))}">
+            <input type="checkbox" id="optSearchWholeTurn" data-search-opt="searchAcrossWholeTurn" ${state.searchAcrossWholeTurn ? "checked" : ""}>
+            <span>${escHtml(t("toc.optSearchWholeTurn"))}</span>
+          </label>
+          <label class="toc-option-check" title="${escHtml(t("toc.optSearchWholeWordTitle"))}">
+            <input type="checkbox" id="optSearchWholeWord" data-search-opt="searchWholeWord" ${state.searchWholeWord ? "checked" : ""}>
+            <span>${escHtml(t("toc.optSearchWholeWord"))}</span>
+          </label>
+          <label class="toc-option-check" title="${escHtml(t("toc.optSearchCaseTitle"))}">
+            <input type="checkbox" id="optSearchCase" data-search-opt="searchCaseSensitive" ${state.searchCaseSensitive ? "checked" : ""}>
+            <span>${escHtml(t("toc.optSearchCase"))}</span>
           </label>
         </div>
       </details>
@@ -5502,6 +5860,11 @@
       try {
         localStorage.setItem("tv_file_mode", "ask");
       } catch (_) {}
+    });
+    card.querySelectorAll("input[data-search-opt]").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        setSearchOption(e.target.dataset.searchOpt, e.target.checked);
+      });
     });
 
     const tocWrap = card.querySelector(".toc-wrap");
@@ -5587,11 +5950,20 @@
     els.feed.prepend(card);
   }
 
-  function highlightMatches(rootEl, query) {
+  function highlightMatches(rootEl, query, opts = {}) {
     if (!rootEl || !query) return;
     const ast = getCachedSearchAst(query);
-    const terms = getPositiveSearchTerms(ast);
-    if (!terms.length) return;
+    const termObjs = getPositiveSearchTermObjs(ast);
+    if (!termObjs.length) return;
+    const sOpts = {
+      caseSensitive: Boolean(opts && opts.caseSensitive),
+      wholeWord: Boolean(opts && opts.wholeWord),
+      acrossWholeTurn: Boolean(opts && opts.acrossWholeTurn),
+    };
+    const isCard = rootEl.tagName === "ARTICLE";
+    const isStandaloneGeneric = isCard && rootEl.classList.contains("type-GENERIC");
+    const stepHeadEl = isCard ? rootEl.querySelector(":scope > .step-head") : null;
+    const stepBodyEl = isCard ? rootEl.querySelector(":scope > .step-body") : null;
 
     const BLOCK_TAGS = new Set([
       "ARTICLE", "SECTION", "DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6",
@@ -5620,6 +5992,27 @@
       return rootEl;
     };
 
+    const getUnitScopeEl = (textNode) => {
+      if (!isCard || isStandaloneGeneric) return rootEl;
+      const p = textNode.parentElement;
+      if (!p) return rootEl;
+      if (stepHeadEl && stepHeadEl.contains(p)) return stepHeadEl;
+      const tc = p.closest(".tool-card");
+      if (tc && rootEl.contains(tc)) return tc;
+      const think = p.closest(".block-thinking");
+      if (think && rootEl.contains(think)) return think;
+      const toolsSum = p.closest("details.block-tools > summary");
+      if (toolsSum && rootEl.contains(toolsSum)) return toolsSum;
+      if (stepBodyEl && stepBodyEl.contains(p)) {
+        let cur = p;
+        while (cur && cur.parentElement !== stepBodyEl) {
+          cur = cur.parentElement;
+        }
+        if (cur) return cur;
+      }
+      return rootEl;
+    };
+
     const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (!node.nodeValue || node.nodeValue.length === 0) return NodeFilter.FILTER_REJECT;
@@ -5639,29 +6032,98 @@
 
     const runs = [];
     let curScope = null;
+    let curUnitScope = null;
     let curNodes = [];
     let curNode;
     while ((curNode = walker.nextNode())) {
       const scope = getRunScope(curNode);
-      if (scope !== curScope) {
-        if (curNodes.length) runs.push(curNodes);
+      const unitScope = getUnitScopeEl(curNode);
+      if (scope !== curScope || unitScope !== curUnitScope) {
+        if (curNodes.length) runs.push({ nodes: curNodes, unitScope: curUnitScope });
         curScope = scope;
+        curUnitScope = unitScope;
         curNodes = [curNode];
       } else {
         curNodes.push(curNode);
       }
     }
-    if (curNodes.length) runs.push(curNodes);
+    if (curNodes.length) runs.push({ nodes: curNodes, unitScope: curUnitScope });
 
-    const findMatchRanges = (fullLower) => {
-      const candidates = [];
-      for (const term of terms) {
-        let pos = 0;
-        let idx;
-        while ((idx = fullLower.indexOf(term, pos)) !== -1) {
-          candidates.push([idx, idx + term.length]);
-          pos = idx + Math.max(1, term.length);
+    const preparedRuns = runs.map((run) => {
+      let totalLen = 0;
+      const segs = run.nodes.map((n) => {
+        const txt = n.nodeValue;
+        const s = totalLen;
+        totalLen += txt.length;
+        return { node: n, text: txt, start: s, end: totalLen };
+      });
+      const fullText = segs.map((sg) => sg.text).join("");
+      return {
+        segs,
+        unitScope: run.unitScope,
+        fullText,
+        fullLower: fullText.toLowerCase(),
+      };
+    });
+
+    // When searchAcrossWholeTurn is false (default), check the full search AST per logical unit
+    // so partial hits (e.g. a lone "-c" inside an unrelated read_file) are never highlighted or shown.
+    let matchedUnitScopes = null;
+    if (!sOpts.acrossWholeTurn) {
+      if (isCard && !isStandaloneGeneric) {
+        matchedUnitScopes = new Set();
+        const unitTexts = new Map();
+        for (const r of preparedRuns) {
+          let arr = unitTexts.get(r.unitScope);
+          if (!arr) {
+            arr = [];
+            unitTexts.set(r.unitScope, arr);
+          }
+          if (r.fullText) arr.push(r.fullText);
         }
+        for (const [uEl, parts] of unitTexts.entries()) {
+          const combinedRaw = parts.join(" ");
+          if (evalSearchAst(ast, { raw: combinedRaw, lower: combinedRaw.toLowerCase() }, sOpts)) {
+            matchedUnitScopes.add(uEl);
+          }
+        }
+      } else if (!isCard) {
+        const ownerUnit = rootEl.closest(
+          ".tool-card, .block-thinking, .md, .system-msg-body, .generic-content-wrap, .block-meta, .block-unknown-tag"
+        );
+        if (ownerUnit) {
+          const walkOwner = document.createTreeWalker(ownerUnit, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+              if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+              const p = node.parentElement;
+              if (!p) return NodeFilter.FILTER_REJECT;
+              if (
+                p.tagName === "BUTTON" ||
+                p.tagName === "SCRIPT" ||
+                p.tagName === "STYLE" ||
+                p.closest("button, script, style, .copy-bar, .code-gutter-num, .md-gutter-num, .compaction-num")
+              ) {
+                return NodeFilter.FILTER_REJECT;
+              }
+              return NodeFilter.FILTER_ACCEPT;
+            },
+          });
+          const ownerParts = [];
+          let on;
+          while ((on = walkOwner.nextNode())) ownerParts.push(on.nodeValue);
+          const ownerRaw = ownerParts.join(" ");
+          if (!evalSearchAst(ast, { raw: ownerRaw, lower: ownerRaw.toLowerCase() }, sOpts)) {
+            return;
+          }
+        }
+      }
+    }
+
+    const findMatchRanges = (fullText, fullLower) => {
+      const candidates = [];
+      for (const tObj of termObjs) {
+        const hits = findTermOccurrences(fullText, fullLower, tObj.text, tObj.lower, sOpts, true);
+        for (const h of hits) candidates.push(h);
       }
       if (!candidates.length) return [];
       candidates.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
@@ -5677,30 +6139,13 @@
     };
 
     const createdMarks = [];
-    for (const runNodes of runs) {
-      let totalLen = 0;
-      const segs = runNodes.map((n) => {
-        const txt = n.nodeValue;
-        const s = totalLen;
-        totalLen += txt.length;
-        return { node: n, text: txt, start: s, end: totalLen };
-      });
-      const fullText = segs.map((sg) => sg.text).join("");
-      const fullLower = fullText.toLowerCase();
-      let hasAny = false;
-      for (const term of terms) {
-        if (fullLower.includes(term)) {
-          hasAny = true;
-          break;
-        }
-      }
-      if (!hasAny) continue;
-
-      const ranges = findMatchRanges(fullLower);
+    for (const run of preparedRuns) {
+      if (matchedUnitScopes && !matchedUnitScopes.has(run.unitScope)) continue;
+      const ranges = findMatchRanges(run.fullText, run.fullLower);
       if (!ranges.length) continue;
 
       let rIdx = 0;
-      for (const sg of segs) {
+      for (const sg of run.segs) {
         while (rIdx < ranges.length && ranges[rIdx][1] <= sg.start) rIdx++;
         if (rIdx >= ranges.length) break;
         const firstR = rIdx;
@@ -5736,60 +6181,154 @@
       }
     }
 
-    if (!createdMarks.length) return;
+    const MACRO_HIT_SEL = [
+      ".tool-card",
+      "details.block-thinking",
+      "details.block-meta",
+      "details.block-unknown-tag",
+      ".step-head",
+      ".step-body > .md",
+      ".step-body > .system-msg-body",
+      ".step-body > .generic-content-wrap",
+      ".step-body > details.block-tools > summary",
+    ].join(", ");
 
-    const HIT_BLOCK_SEL = [
+    const SUB_HIT_SEL = [
+      ".code-gutter-row",
+      ".md-gutter-row",
       ".arg-row",
       ".tool-head",
       ".tool-result-head",
-      "details > summary",
-      ".tool-result",
-      ".tool-card",
-      ".code-gutter-row",
-      ".md-gutter-row",
-      ".md > pre",
-      ".md > blockquote",
-      ".md > table",
+      ".md > p",
       ".md li",
-      ".md p",
       ".md h1",
       ".md h2",
       ".md h3",
       ".md h4",
       ".md h5",
       ".md h6",
-      ".system-msg-body",
-      ".generic-content-wrap",
-      ".step-head",
-      ".block-body",
-      "article.step",
+      ".md > pre",
+      ".md > blockquote",
+      ".md > table",
     ].join(", ");
 
-    const rawTargets = new Set();
-    for (const mark of createdMarks) {
-      let p = mark.parentElement;
-      while (p && p !== rootEl) {
-        if (p.tagName === "DETAILS" && !p.open) p.open = true;
-        p = p.parentElement;
+    if (createdMarks.length > 0) {
+      const macroTargets = new Set();
+      const subTargets = new Set();
+      for (const mark of createdMarks) {
+        let p = mark.parentElement;
+        while (p && p !== rootEl) {
+          if (p.tagName === "DETAILS" && !p.open) p.open = true;
+          p = p.parentElement;
+        }
+        const macro = mark.closest(MACRO_HIT_SEL);
+        if (macro && (rootEl === macro || rootEl.contains(macro) || !isCard)) {
+          macroTargets.add(macro);
+        } else if (isCard) {
+          macroTargets.add(rootEl);
+        }
+        const sub = mark.closest(SUB_HIT_SEL);
+        if (sub && sub !== macro && (rootEl === sub || rootEl.contains(sub))) {
+          subTargets.add(sub);
+        } else {
+          const resBox = mark.closest(".tool-result");
+          if (resBox && resBox !== macro && (rootEl === resBox || rootEl.contains(resBox))) {
+            subTargets.add(resBox);
+          }
+        }
       }
-      const blk = mark.closest(HIT_BLOCK_SEL);
-      if (blk && (rootEl === blk || rootEl.contains(blk))) {
-        rawTargets.add(blk);
+
+      for (const mEl of macroTargets) {
+        mEl.classList.add("search-hit-target");
+      }
+      const subList = Array.from(subTargets);
+      for (const sEl of subList) {
+        if (macroTargets.has(sEl)) continue;
+        let hasDescendant = false;
+        for (const other of subList) {
+          if (other !== sEl && sEl.contains(other)) {
+            hasDescendant = true;
+            break;
+          }
+        }
+        if (!hasDescendant) {
+          sEl.classList.add("search-hit-sub");
+        }
       }
     }
 
-    // Keep only deepest/lowest container per branch so ancestor wrappers never get duplicate frames
-    const rawList = Array.from(rawTargets);
-    for (const t of rawList) {
-      let hasDescendant = false;
-      for (const other of rawList) {
-        if (other !== t && t.contains(other)) {
-          hasDescendant = true;
-          break;
+    // Hide sibling tools and blocks without matches, while ALWAYS keeping matched tool calls + their outputs visible
+    if (opts && opts.trimNonMatching && isCard && !isStandaloneGeneric && stepBodyEl) {
+      if (matchedUnitScopes && matchedUnitScopes.size === 0 && createdMarks.length === 0) {
+        return;
+      }
+      const hasAnyMark = (el) => Boolean(el && (el.matches?.("mark.hl") || el.querySelector("mark.hl")));
+      const isUnitMatched = (el) => (matchedUnitScopes ? matchedUnitScopes.has(el) : hasAnyMark(el));
+
+      let omittedCount = 0;
+      for (const child of Array.from(stepBodyEl.children)) {
+        if (
+          child.classList.contains("search-reveal-bar") ||
+          child.classList.contains("inline-raw-pre") ||
+          child.classList.contains("show-more-btn") ||
+          child.classList.contains("read-hidden-note")
+        ) {
+          continue;
+        }
+        if (child.classList.contains("block-tools")) {
+          const toolCards = Array.from(child.querySelectorAll(":scope > .block-body > .tool-card"));
+          let matchedTools = 0;
+          let omittedTools = 0;
+          for (const tcCard of toolCards) {
+            if (isUnitMatched(tcCard)) {
+              matchedTools++;
+              // Keep the entire matched tool-card (header, args, AND its .tool-result output) visible
+            } else {
+              tcCard.classList.add("search-omitted");
+              omittedTools++;
+            }
+          }
+          if (matchedTools > 0) {
+            child.open = true;
+            omittedCount += omittedTools;
+          } else {
+            for (const tcCard of toolCards) tcCard.classList.remove("search-omitted");
+            child.classList.add("search-omitted");
+            omittedCount += Math.max(1, toolCards.length);
+          }
+        } else if (!isUnitMatched(child)) {
+          child.classList.add("search-omitted");
+          omittedCount++;
+          if (child.classList.contains("generic-content-wrap")) {
+            for (const extra of stepBodyEl.querySelectorAll(":scope > .show-more-btn, :scope > .read-hidden-note")) {
+              extra.classList.add("search-omitted");
+            }
+          }
+        } else if (child.tagName === "DETAILS") {
+          child.open = true;
         }
       }
-      if (!hasDescendant) {
-        t.classList.add("search-hit-target");
+
+      if (omittedCount > 0) {
+        rootEl.classList.add("has-search-omitted");
+        const bar = document.createElement("div");
+        bar.className = "search-reveal-bar";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "search-reveal-btn";
+        btn.textContent = t("card.searchRevealTurn", { count: omittedCount });
+        btn.addEventListener("click", () => {
+          preserveScrollAnchor(() => {
+            const untrimmed = rootEl.classList.toggle("is-search-untrimmed");
+            btn.textContent = untrimmed
+              ? t("card.searchHideTurn", { count: omittedCount })
+              : t("card.searchRevealTurn", { count: omittedCount });
+            scheduleCardOverflowCheck(rootEl);
+          }, btn);
+          requestAnimationFrame(scheduleMinimapSync);
+        });
+        bar.appendChild(btn);
+        stepBodyEl.appendChild(bar);
       }
     }
   }
@@ -5801,7 +6340,7 @@
     const bar = document.createElement("div");
     bar.id = "bottomTocBar";
     bar.className = "bottom-toc-bar";
-    bar.innerHTML = `<button type="button" class="btn-sm">↑ К оглавлению</button>`;
+    bar.innerHTML = `<button type="button" class="btn-sm">${escHtml(t("toc.backToToc"))}</button>`;
     bar.querySelector("button").addEventListener("click", () => {
       scrollToTop(true);
     });
@@ -5814,8 +6353,8 @@
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "dialog-expand-btn";
-    const labelClosed = `🔍 Показать мысли и вызовы инструментов (${hiddenSteps.length})`;
-    const labelOpen = `▲ Скрыть мысли и вызовы инструментов (${hiddenSteps.length})`;
+    const labelClosed = t("toc.showHiddenDialog", { count: hiddenSteps.length });
+    const labelOpen = t("toc.hideHiddenDialog", { count: hiddenSteps.length });
     btn.textContent = labelClosed;
 
     let inlineBox = null;
@@ -5835,6 +6374,7 @@
           }
           wrap.appendChild(inlineBox);
           applyInitialEditScrolls(inlineBox);
+          if (state.stepQuery) applyInitialSearchScrolls(inlineBox);
           for (const ch of inlineBox.children) scheduleCardOverflowCheck(ch);
           btn.textContent = labelOpen;
         }
@@ -5887,10 +6427,12 @@
       _cardRenderConfigKey = cfgKey;
     }
     els.feed.classList.toggle("is-read-full", state.readDisplayMode === "full" || state.expandAllOutputs);
+    els.feed.classList.toggle("is-search-focused", Boolean(state.stepQuery && state.searchFocusedOnly));
 
     // Strip stale search highlights ONLY from the small set of previously highlighted cards
+    const curHlSig = getHighlightSig();
     for (const hCard of Array.from(_highlightedCards)) {
-      if (!state.stepQuery || hCard.dataset.hlQuery !== state.stepQuery) {
+      if (!state.stepQuery || hCard.dataset.hlQuery !== curHlSig) {
         clearCardHighlight(hCard);
       }
     }
@@ -5995,7 +6537,7 @@
     if (shown === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-hint";
-      empty.textContent = "Нет шагов, подходящих под текущий фильтр.";
+      empty.textContent = t("app.emptyFeedFilter");
       _vWindow.appendChild(empty);
     }
 
@@ -6010,15 +6552,29 @@
       scrollToBottom();
     } else {
       syncVirtualWindow({ forceRender: true });
+      if (state.firstUnreadStepIndex !== null && !_vStepToItemMap.has(String(state.firstUnreadStepIndex))) {
+        state.firstUnreadStepIndex = null;
+      }
+      syncJumpBottomButtonState(_lastShowBottom);
     }
     scheduleMinimapRender();
   }
 
+  function syncJumpBottomButtonState(showBottom = Boolean(_lastShowBottom)) {
+    if (!els.jumpBottomBtn) return;
+    const visible = Boolean(showBottom);
+    const hasUnread = visible && state.firstUnreadStepIndex !== null;
+    els.jumpBottomBtn.classList.toggle("hidden", !visible);
+    els.jumpBottomBtn.classList.toggle("flash-yellow", hasUnread);
+    const wantText = hasUnread ? t("minimap.jumpNewMessage") : t("minimap.jumpBottom");
+    if (els.jumpBottomBtn.textContent !== wantText) {
+      els.jumpBottomBtn.textContent = wantText;
+    }
+  }
+
   function notifyNewMessageButton() {
-    els.jumpBottomBtn.textContent = "↓ К новому сообщению";
-    els.jumpBottomBtn.classList.remove("hidden");
-    els.jumpBottomBtn.classList.add("flash-yellow");
     _lastShowBottom = true;
+    syncJumpBottomButtonState(true);
   }
 
   let _tocRefreshTimer = null;
@@ -6097,12 +6653,14 @@
     if (state.userTzSource !== "transcript" && newSteps.some((s) => s.type === "USER_INPUT")) {
       if (calibrateUserTimezone(state.steps)) {
         stepSearchBlobCache = new WeakMap();
+        stepSearchUnitsCache = new WeakMap();
         invalidateCardRenderCache();
       }
     }
     const cfgKey = getRenderConfigKey();
     if (!_cardRenderConfigKey) _cardRenderConfigKey = cfgKey;
     els.feed.classList.toggle("is-read-full", state.readDisplayMode === "full" || state.expandAllOutputs);
+    els.feed.classList.toggle("is-search-focused", Boolean(state.stepQuery && state.searchFocusedOnly));
 
     const newStepSet = new Set(newSteps);
     const renderedNewIndices = new Set();
@@ -6229,15 +6787,23 @@
     }
 
     let invalidatedEarlier = false;
+    let needClearWindow = false;
     if (touchedEarlierSteps.size > 0) {
       for (const sk of touchedEarlierSteps) {
         const oldIt = _vStepToItemMap.get(sk);
         if (!oldIt) continue;
         stepSearchBlobCache.delete(oldIt.step);
+        stepSearchUnitsCache.delete(oldIt.step);
         if (Array.isArray(oldIt.attached)) {
-          for (const g of oldIt.attached) stepSearchBlobCache.delete(g);
+          for (const g of oldIt.attached) {
+            stepSearchBlobCache.delete(g);
+            stepSearchUnitsCache.delete(g);
+          }
         }
         if (oldIt.idx >= dirtyFromIdx) continue;
+        if (oldIt.idx >= _winStart && oldIt.idx <= _winEnd) {
+          needClearWindow = true;
+        }
         _lruMap.delete(oldIt);
         if (oldIt.el) {
           if (vResizeObserver) vResizeObserver.unobserve(oldIt.el);
@@ -6248,6 +6814,9 @@
         oldIt.measured = false;
         invalidatedEarlier = true;
       }
+      if (needClearWindow) {
+        clearVWindowDom();
+      }
     }
 
     recomputeVItemOffsets(dirtyFromIdx);
@@ -6257,10 +6826,13 @@
 
     let firstNewVisibleIdx = null;
     for (const s of newSteps) {
-      if (renderedNewIndices.has(s.step_index)) {
+      if (s.step_index !== undefined && s.step_index !== null && renderedNewIndices.has(s.step_index)) {
         firstNewVisibleIdx = s.step_index;
         break;
       }
+    }
+    if (firstNewVisibleIdx === null && renderedNewIndices.size > 0) {
+      firstNewVisibleIdx = renderedNewIndices.values().next().value;
     }
 
     const isFilteredNow = state.filter !== "all" || Boolean(state.stepQuery) || state.onlyCmdErrors || (state.cmdMapFilterOnly && state.cmdMapKeys.size > 0);
@@ -6321,7 +6893,11 @@
         }
         notifyNewMessageButton();
       } else if (addedVisible > 0) {
-        notifyNewMessageButton();
+        if (state.firstUnreadStepIndex === null) {
+          const fallbackStep = newSteps.find((s) => s && s.step_index !== undefined && s.step_index !== null);
+          if (fallbackStep) state.firstUnreadStepIndex = fallbackStep.step_index;
+        }
+        if (state.firstUnreadStepIndex !== null) notifyNewMessageButton();
       }
     }
   }
@@ -6379,9 +6955,7 @@
     state.userScrolledUp = false;
     state.firstUnreadStepIndex = null;
     _lastShowBottom = false;
-    els.jumpBottomBtn.classList.add("hidden");
-    els.jumpBottomBtn.classList.remove("flash-yellow");
-    els.jumpBottomBtn.textContent = "↓ Вниз";
+    syncJumpBottomButtonState(false);
     els.feedWrap.scrollTop = els.feedWrap.scrollHeight;
     _lastScrollFrameTop = els.feedWrap.scrollTop;
     syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
@@ -6426,9 +7000,9 @@
   }
 
   function updateProjectDropdown() {
-    const projects = Array.from(new Set(state.transcripts.map((t) => t.project))).sort();
+    const projects = Array.from(new Set(state.transcripts.map((tItem) => tItem.project))).sort();
     const cur = els.projectFilter.value;
-    els.projectFilter.innerHTML = `<option value="">Все проекты (${projects.length})</option>`;
+    els.projectFilter.innerHTML = `<option value="">${escHtml(t("sidebar.allProjectsCount", { count: projects.length }))}</option>`;
     for (const p of projects) {
       const opt = document.createElement("option");
       opt.value = p;
@@ -6441,41 +7015,41 @@
   function renderTranscriptList() {
     const q = state.sidebarQuery.toLowerCase();
     const proj = state.projectFilter;
-    const filtered = state.transcripts.filter((t) => {
-      if (proj && t.project !== proj) return false;
+    const filtered = state.transcripts.filter((tr) => {
+      if (proj && tr.project !== proj) return false;
       if (q) {
-        const hay = `${t.title} ${t.project} ${t.id}`.toLowerCase();
+        const hay = `${tr.title} ${tr.project} ${tr.id}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
 
     if (filtered.length === 0) {
-      els.transcriptList.innerHTML = `<div class="empty-hint">Ничего не найдено</div>`;
+      els.transcriptList.innerHTML = `<div class="empty-hint">${escHtml(t("app.emptySearchSidebar"))}</div>`;
       return;
     }
 
     const nowSec = Date.now() / 1000;
     const frag = document.createDocumentFragment();
-    for (const t of filtered) {
+    for (const tr of filtered) {
       const el = document.createElement("div");
-      el.className = `t-item${t.id === state.activeId ? " active" : ""}`;
-      const isFresh = nowSec - t.mtime < 120;
+      el.className = `t-item${tr.id === state.activeId ? " active" : ""}`;
+      const isFresh = nowSec - tr.mtime < 120;
       el.innerHTML = `
         <div class="t-item-top">
-          <span class="t-project" title="${escHtml(t.project)}">${escHtml(t.project)}</span>
-          <span class="t-time" title="${escHtml(t.mtime_iso)}">
-            ${isFresh ? '<span class="fresh-dot" title="Недавно обновлён"></span>' : ""}
-            ${escHtml(fmtRelTime(t.mtime))}
+          <span class="t-project" title="${escHtml(tr.project)}">${escHtml(tr.project)}</span>
+          <span class="t-time" title="${escHtml(tr.mtime_iso)}">
+            ${isFresh ? `<span class="fresh-dot" title="${escHtml(t("sidebar.freshDotTitle"))}"></span>` : ""}
+            ${escHtml(fmtRelTime(tr.mtime))}
           </span>
         </div>
-        <div class="t-title">${escHtml(t.title)}</div>
+        <div class="t-title">${escHtml(tr.title)}</div>
         <div class="t-sub">
-          <span>${escHtml(t.id.slice(0, 8))}</span>
-          <span>${fmtNum(t.lines)} шагов · ${fmtBytes(t.size)}</span>
+          <span>${escHtml(tr.id.slice(0, 8))}</span>
+          <span>${escHtml(t("sidebar.sessionMeta", { lines: fmtNum(tr.lines), size: fmtBytes(tr.size) }))}</span>
         </div>
       `;
-      el.addEventListener("click", () => selectTranscript(t.id));
+      el.addEventListener("click", () => selectTranscript(tr.id));
       frag.appendChild(el);
     }
     els.transcriptList.innerHTML = "";
@@ -6483,6 +7057,11 @@
   }
 
   function closeStream() {
+    if (_sseFlushTimer) {
+      clearTimeout(_sseFlushTimer);
+      _sseFlushTimer = null;
+    }
+    _pendingSseSteps = [];
     if (state.eventSource) {
       state.eventSource.close();
       state.eventSource = null;
@@ -6516,13 +7095,17 @@
   function startStream(convId, offset) {
     closeStream();
     _pendingSseSteps = [];
-    setLiveStatus("", "Подключение…");
+    setLiveStatus("", t("topbar.liveConnecting"));
     const es = new EventSource(`/api/stream/${encodeURIComponent(convId)}?offset=${offset}`);
     state.eventSource = es;
 
-    es.onopen = () => setLiveStatus("connected", "Live");
+    es.onopen = () => {
+      if (state.eventSource !== es || state.activeId !== convId) return;
+      setLiveStatus("connected", "Live");
+    };
 
     es.addEventListener("steps", (ev) => {
+      if (state.eventSource !== es || state.activeId !== convId) return;
       try {
         const payload = JSON.parse(ev.data);
         if (payload.reset) {
@@ -6533,8 +7116,13 @@
             const anchorIt = _vItems[findVItemAtY(viewTop)];
             if (anchorIt && anchorIt.stepKey) anchorStepKey = anchorIt.stepKey;
           }
+          if (_sseFlushTimer) {
+            clearTimeout(_sseFlushTimer);
+            _sseFlushTimer = null;
+          }
           _pendingSseSteps = [];
           stepSearchBlobCache = new WeakMap();
+          stepSearchUnitsCache = new WeakMap();
           invalidateCardRenderCache();
           state.steps = payload.steps || [];
           state.offset = payload.offset || 0;
@@ -6550,13 +7138,21 @@
           state.offset = payload.offset || state.offset;
           const incoming = payload.steps || [];
           if (!incoming.length) return;
-          // Pause DOM updates while the user is actively typing or wheel-scrolling in Chrome
+          // Pause DOM updates while actively typing/scrolling; preserve strict FIFO order if queued batches exist
           const now = Date.now();
           if (now - _lastComposerTypeMs < 400 || now - _lastUserScrollMs < 240) {
             _pendingSseSteps.push(...incoming);
             if (!_sseFlushTimer) {
               _sseFlushTimer = setTimeout(flushPendingSseSteps, now - _lastComposerTypeMs < 400 ? 420 : 280);
             }
+          } else if (_pendingSseSteps.length > 0) {
+            if (_sseFlushTimer) {
+              clearTimeout(_sseFlushTimer);
+              _sseFlushTimer = null;
+            }
+            const combined = _pendingSseSteps.splice(0, _pendingSseSteps.length);
+            combined.push(...incoming);
+            appendNewSteps(combined);
           } else {
             appendNewSteps(incoming);
           }
@@ -6565,7 +7161,8 @@
     });
 
     es.onerror = () => {
-      setLiveStatus("error", "Переподключение…");
+      if (state.eventSource !== es || state.activeId !== convId) return;
+      setLiveStatus("error", t("topbar.liveReconnecting"));
     };
   }
 
@@ -6585,6 +7182,8 @@
     state.activeLogPath = "";
     state.userScrolledUp = Boolean(targetStep);
     state.firstUnreadStepIndex = null;
+    _lastShowBottom = false;
+    syncJumpBottomButtonState(false);
     _suppressHashChange = true;
     try {
       history.replaceState(
@@ -6598,8 +7197,8 @@
     setTimeout(() => { _suppressHashChange = false; }, 0);
     renderTranscriptList();
 
-    els.feed.innerHTML = `<div class="empty-hint">Загрузка транскрипта…</div>`;
-    setLiveStatus("", "Загрузка…");
+    els.feed.innerHTML = `<div class="empty-hint">${escHtml(t("app.loadingTranscript"))}</div>`;
+    setLiveStatus("", t("topbar.liveLoading"));
 
     try {
       const res = await fetch(`/api/transcript/${encodeURIComponent(convId)}`);
@@ -6619,6 +7218,7 @@
       );
       rebuildProjectFilesRegex();
       stepSearchBlobCache = new WeakMap();
+      stepSearchUnitsCache = new WeakMap();
       invalidateCardRenderCache();
       state.steps = data.steps || [];
       state.offset = data.offset || 0;
@@ -6652,8 +7252,8 @@
       startStream(convId, state.offset);
       checkAntigravityWindow();
     } catch (err) {
-      els.feed.innerHTML = `<div class="empty-hint">Ошибка загрузки: ${escHtml(err.message)}</div>`;
-      setLiveStatus("error", "Ошибка");
+      els.feed.innerHTML = `<div class="empty-hint">${escHtml(t("app.loadError", { error: err.message }))}</div>`;
+      setLiveStatus("error", t("topbar.liveError"));
     }
   }
 
@@ -6684,17 +7284,261 @@
 
   window.addEventListener("resize", () => scheduleMinimapSync(), { passive: true });
 
+  function captureSearchContextAnchor() {
+    const fw = els.feedWrap;
+    if (!fw || !_vItems.length || !state.steps.length) return null;
+    const wrapRect = fw.getBoundingClientRect();
+
+    if (_vWindow) {
+      const cards = Array.from(_vWindow.children).filter(
+        (el) => el.tagName === "ARTICLE" && el.dataset.isSkeleton !== "1" && el.dataset.stepIndex
+      );
+      const visibleCards = cards
+        .map((card) => ({ card, rect: card.getBoundingClientRect() }))
+        .filter(({ rect }) => rect.bottom > wrapRect.top + 8 && rect.top < wrapRect.bottom - 8);
+
+      if (visibleCards.length > 0) {
+        // Prefer an actually matched card/hit currently inside the viewport
+        for (const { card } of visibleCards) {
+          const hitEl =
+            Array.from(card.querySelectorAll(".search-hit-sub, .search-hit-target, mark.hl")).find((el) => {
+              const r = el.getBoundingClientRect();
+              return r.height > 0 && r.bottom > wrapRect.top + 6 && r.top < wrapRect.bottom - 6;
+            }) || null;
+          if (hitEl) {
+            const resEl = hitEl.closest(".tool-result[data-step-index]");
+            const tcEl = hitEl.closest(".tool-card[data-tool-idx]");
+            const targetBox = resEl || tcEl || card;
+            return {
+              stepIndex: card.dataset.stepIndex,
+              toolOutStep: resEl ? resEl.dataset.stepIndex : null,
+              toolIdx: !resEl && tcEl ? tcEl.dataset.toolIdx : null,
+              topInWrap: targetBox.getBoundingClientRect().top - wrapRect.top,
+            };
+          }
+        }
+        // Fallback to the topmost visible card in the viewport
+        const chosen =
+          visibleCards.find(({ rect }) => rect.top >= wrapRect.top - 10) ||
+          visibleCards[0];
+        return {
+          stepIndex: chosen.card.dataset.stepIndex,
+          toolOutStep: null,
+          toolIdx: null,
+          topInWrap: chosen.rect.top - wrapRect.top,
+        };
+      }
+    }
+
+    const viewTop = Math.max(0, fw.scrollTop - getVListBaseTop()) + 18;
+    const vIt = _vItems[findVItemAtY(viewTop)];
+    if (vIt && vIt.stepKey) {
+      return { stepIndex: vIt.stepKey, toolOutStep: null, toolIdx: null, topInWrap: 4 };
+    }
+    return null;
+  }
+
+  function applySearchQueryChange(nextVal) {
+    const val = String(nextVal || "").trim();
+    if (val === state.stepQuery) return;
+    const prevQuery = state.stepQuery;
+    const isClearing = Boolean(prevQuery && val === "");
+    const anchor = (isClearing || state.userScrolledUp) ? captureSearchContextAnchor() : null;
+
+    state.stepQuery = val;
+    if (anchor) {
+      state.userScrolledUp = true;
+    }
+    renderFullFeed();
+    if (anchor && anchor.stepIndex) {
+      if (_vStepToItemMap.has(String(anchor.stepIndex))) {
+        jumpToStep(anchor.stepIndex, {
+          topOffset: anchor.topInWrap,
+          toolOutStep: anchor.toolOutStep,
+          toolIdx: anchor.toolIdx,
+          resetFiltersOnMissing: false,
+        });
+      } else if (!isClearing && els.feedWrap && _vItems.length > 0) {
+        els.feedWrap.scrollTop = 0;
+        _lastScrollFrameTop = 0;
+        syncVirtualWindow({ forceRender: true });
+        updateScrollUiOnFrame();
+      }
+    }
+  }
+
   let searchTimer = null;
   els.stepSearch.addEventListener("input", (e) => {
     clearTimeout(searchTimer);
     const val = e.target.value.trim();
-    const delay = val === "" ? 90 : 200;
+    if (val === "") {
+      applySearchQueryChange("");
+      return;
+    }
     searchTimer = setTimeout(() => {
-      if (val === state.stepQuery) return;
-      state.stepQuery = val;
-      renderFullFeed();
-    }, delay);
+      applySearchQueryChange(val);
+    }, 200);
   });
+
+  els.stepSearch.addEventListener("search", (e) => {
+    clearTimeout(searchTimer);
+    applySearchQueryChange(e.target.value.trim());
+  });
+
+  function isSearchPopoverOpen() {
+    return Boolean(els.searchPopover && !els.searchPopover.classList.contains("hidden"));
+  }
+
+  function openSearchPopover() {
+    if (!els.searchPopover) return;
+    if (!els.searchPopover.dataset.rendered) renderSearchPopover();
+    els.searchPopover.classList.remove("hidden");
+    if (els.searchOptsBtn) {
+      els.searchOptsBtn.classList.add("active");
+      els.searchOptsBtn.setAttribute("aria-expanded", "true");
+    }
+  }
+
+  function closeSearchPopover() {
+    if (!els.searchPopover) return;
+    els.searchPopover.classList.add("hidden");
+    if (els.searchOptsBtn) {
+      els.searchOptsBtn.classList.remove("active");
+      els.searchOptsBtn.setAttribute("aria-expanded", "false");
+    }
+  }
+
+  function syncSearchOptionInputs() {
+    const map = {
+      searchFocusedOnly: Boolean(state.searchFocusedOnly),
+      searchAcrossWholeTurn: Boolean(state.searchAcrossWholeTurn),
+      searchWholeWord: Boolean(state.searchWholeWord),
+      searchCaseSensitive: Boolean(state.searchCaseSensitive),
+    };
+    document.querySelectorAll("input[data-search-opt]").forEach((cb) => {
+      const k = cb.dataset.searchOpt;
+      if (k in map) cb.checked = map[k];
+    });
+  }
+
+  function setSearchOption(optKey, checked) {
+    const val = Boolean(checked);
+    const storageKeys = {
+      searchFocusedOnly: "tv_search_focused",
+      searchAcrossWholeTurn: "tv_search_whole_turn",
+      searchWholeWord: "tv_search_whole_word",
+      searchCaseSensitive: "tv_search_case",
+    };
+    if (!(optKey in storageKeys)) return;
+    state[optKey] = val;
+    try {
+      localStorage.setItem(storageKeys[optKey], val ? "1" : "0");
+    } catch (_) {}
+    syncSearchOptionInputs();
+    if (state.stepQuery) {
+      const anchor = state.userScrolledUp ? captureSearchContextAnchor() : null;
+      if (anchor) state.userScrolledUp = true;
+      renderFullFeed();
+      if (anchor && anchor.stepIndex) {
+        jumpToStep(anchor.stepIndex, {
+          topOffset: anchor.topInWrap,
+          toolOutStep: anchor.toolOutStep,
+          toolIdx: anchor.toolIdx,
+          resetFiltersOnMissing: false,
+        });
+      }
+    }
+  }
+
+  function renderSearchPopover() {
+    if (!els.searchPopover) return;
+    const examples = [
+      'pwsh -c git diff',
+      '"git diff"',
+      'error OR warning !cache',
+      '(edit_file OR write_file) NOT failed',
+    ];
+    els.searchPopover.innerHTML = `
+      <div class="search-popover-title">${escHtml(t("searchPopover.header"))}</div>
+      <div class="search-popover-checks">
+        <label class="search-pop-opt">
+          <input type="checkbox" data-search-opt="searchFocusedOnly" ${state.searchFocusedOnly ? "checked" : ""}>
+          <span class="search-pop-opt-text">
+            <span class="search-pop-opt-lbl">${escHtml(t("searchPopover.focusedOnly"))}</span>
+            <span class="search-pop-opt-desc">${escHtml(t("searchPopover.focusedOnlyDesc"))}</span>
+          </span>
+        </label>
+        <label class="search-pop-opt">
+          <input type="checkbox" data-search-opt="searchAcrossWholeTurn" ${state.searchAcrossWholeTurn ? "checked" : ""}>
+          <span class="search-pop-opt-text">
+            <span class="search-pop-opt-lbl">${escHtml(t("searchPopover.wholeTurn"))}</span>
+            <span class="search-pop-opt-desc">${escHtml(t("searchPopover.wholeTurnDesc"))}</span>
+          </span>
+        </label>
+        <label class="search-pop-opt">
+          <input type="checkbox" data-search-opt="searchWholeWord" ${state.searchWholeWord ? "checked" : ""}>
+          <span class="search-pop-opt-text">
+            <span class="search-pop-opt-lbl">${escHtml(t("searchPopover.wholeWord"))}</span>
+            <span class="search-pop-opt-desc">${escHtml(t("searchPopover.wholeWordDesc"))}</span>
+          </span>
+        </label>
+        <label class="search-pop-opt">
+          <input type="checkbox" data-search-opt="searchCaseSensitive" ${state.searchCaseSensitive ? "checked" : ""}>
+          <span class="search-pop-opt-text">
+            <span class="search-pop-opt-lbl">${escHtml(t("searchPopover.caseSensitive"))}</span>
+            <span class="search-pop-opt-desc">${escHtml(t("searchPopover.caseSensitiveDesc"))}</span>
+          </span>
+        </label>
+      </div>
+      <div class="search-popover-title">${escHtml(t("searchPopover.syntaxTitle"))}</div>
+      <div class="search-syntax-list">
+        <code>word1 word2</code><span class="search-syntax-desc">${escHtml(t("searchPopover.synAnd"))}</span>
+        <code>"exact phrase"</code><span class="search-syntax-desc">${escHtml(t("searchPopover.synPhrase"))}</span>
+        <code>foo OR bar | baz</code><span class="search-syntax-desc">${escHtml(t("searchPopover.synOr"))}</span>
+        <code>!word / NOT word</code><span class="search-syntax-desc">${escHtml(t("searchPopover.synNot"))}</span>
+        <code>(a OR b) !error</code><span class="search-syntax-desc">${escHtml(t("searchPopover.synGroup"))}</span>
+      </div>
+      <div class="search-popover-title">${escHtml(t("searchPopover.examplesTitle"))}</div>
+      <div class="search-examples-row">
+        ${examples.map((ex) => `<button type="button" class="search-ex-chip" data-search-ex="${escHtml(ex)}">${escHtml(ex)}</button>`).join("")}
+      </div>
+    `;
+    els.searchPopover.dataset.rendered = "1";
+    els.searchPopover.querySelectorAll("input[data-search-opt]").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        setSearchOption(e.target.dataset.searchOpt, e.target.checked);
+      });
+    });
+    els.searchPopover.querySelectorAll("button[data-search-ex]").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const ex = chip.dataset.searchEx || "";
+        els.stepSearch.value = ex;
+        applySearchQueryChange(ex);
+        els.stepSearch.focus();
+      });
+    });
+  }
+
+  if (els.searchOptsBtn) {
+    els.searchOptsBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isSearchPopoverOpen()) closeSearchPopover();
+      else openSearchPopover();
+    });
+  }
+  document.addEventListener("mousedown", (e) => {
+    if (!isSearchPopoverOpen()) return;
+    if (els.searchBoxWrap && !els.searchBoxWrap.contains(e.target)) {
+      closeSearchPopover();
+    }
+  });
+
+  if (els.langSelect) {
+    els.langSelect.addEventListener("change", (e) => {
+      setLanguage(e.target.value);
+    });
+  }
 
   els.expandAllBtn.addEventListener("click", () => {
     state.detailsDefaultOpen = true;
@@ -6841,6 +7685,7 @@
         if (e.target && e.target.open) {
           const stepCard = e.target.closest("article.step");
           applyInitialEditScrolls(stepCard || e.target);
+          if (state.stepQuery) applyInitialSearchScrolls(stepCard || e.target);
           scheduleCardOverflowCheck(stepCard || e.target);
         }
         requestAnimationFrame(() => {
@@ -6950,8 +7795,11 @@
         notch.className = "minimap-notch";
         notch.style.top = `${pct.toFixed(2)}%`;
         notch.dataset.jump = stepIdx;
-        notch.dataset.preview = previewText || `Запрос #${stepIdx}`;
-        notch.dataset.meta = `💬 Запрос #${stepIdx}${st.created_at ? " · " + fmtStepTime(st.created_at) : ""}`;
+        notch.dataset.preview = previewText || t("minimap.userPromptFallback", { step: stepIdx });
+        notch.dataset.meta = t("minimap.userPromptMeta", {
+          step: stepIdx,
+          time: st.created_at ? " · " + fmtStepTime(st.created_at) : "",
+        });
         notchItemMap.set(notch, it);
         if (stepIdx) userNotchByStep.set(stepIdx, notch);
         nextUserCoords.push({ top, bottom: top + it.height, notch });
@@ -6965,20 +7813,23 @@
         cpNotch.textContent = "📦";
         cpNotch.style.top = `${pct.toFixed(2)}%`;
         cpNotch.dataset.jump = stepIdx;
-        cpNotch.dataset.meta = `📦 Компакция (CHECKPOINT) · Шаг #${stepIdx}${st.created_at ? " · " + fmtStepTime(st.created_at) : ""}`;
-        cpNotch.dataset.preview = "Сжатие истории диалога (Compaction Checkpoint)";
+        cpNotch.dataset.meta = t("minimap.checkpointMeta", {
+          step: stepIdx,
+          time: st.created_at ? " · " + fmtStepTime(st.created_at) : "",
+        });
+        cpNotch.dataset.preview = t("minimap.checkpointPreview");
         notchItemMap.set(cpNotch, it);
         frag.appendChild(cpNotch);
       }
 
       if (showErrors && it.hasErr) {
-        let errPreview = "Ошибка выполнения";
+        let errPreview = t("minimap.errorPreviewDefault");
         if (st.error) {
           errPreview = unescapeNewlines(st.error).trim().slice(0, 140);
         } else if (Array.isArray(it.attached)) {
           const errOut = it.attached.find((g) => isCommandErrorStep(g));
           if (errOut) {
-            errPreview = unescapeNewlines(errOut.error || errOut.content || "Ошибка выполнения").trim().slice(0, 140);
+            errPreview = unescapeNewlines(errOut.error || errOut.content || t("minimap.errorPreviewDefault")).trim().slice(0, 140);
           }
         }
         const errNotch = document.createElement("button");
@@ -6987,7 +7838,7 @@
         errNotch.textContent = "⚠";
         errNotch.style.top = `${pct.toFixed(2)}%`;
         errNotch.dataset.jump = stepIdx;
-        errNotch.dataset.meta = `⚠ Ошибка · Шаг #${stepIdx}`;
+        errNotch.dataset.meta = t("minimap.errorMeta", { step: stepIdx });
         errNotch.dataset.preview = errPreview;
         notchItemMap.set(errNotch, it);
         frag.appendChild(errNotch);
@@ -7004,7 +7855,7 @@
           selNotch.textContent = "★";
           selNotch.style.top = `${pct.toFixed(2)}%`;
           selNotch.dataset.jump = stepIdx;
-          selNotch.dataset.meta = `★ Выбор карты (${allHits.join(", ")}) · Шаг #${stepIdx}`;
+          selNotch.dataset.meta = t("minimap.mapSelMeta", { hits: allHits.join(", "), step: stepIdx });
           let snippet = "";
           if (Array.isArray(st.tool_calls) && st.tool_calls.length) {
             snippet = st.tool_calls
@@ -7023,10 +7874,13 @@
         const qNotch = document.createElement("button");
         qNotch.type = "button";
         qNotch.className = "minimap-notch-search";
-        qNotch.setAttribute("aria-label", `Поиск · Шаг #${stepIdx}`);
+        qNotch.setAttribute("aria-label", t("minimap.searchAria", { step: stepIdx }));
         qNotch.style.top = `${pct.toFixed(2)}%`;
         qNotch.dataset.jump = stepIdx;
-        qNotch.dataset.meta = `🔎 Совпадение · Шаг #${stepIdx}${st.created_at ? " · " + fmtStepTime(st.created_at) : ""}`;
+        qNotch.dataset.meta = t("minimap.searchMeta", {
+          step: stepIdx,
+          time: st.created_at ? " · " + fmtStepTime(st.created_at) : "",
+        });
         qNotch.dataset.preview = extractPlainMatchSnippet(st, state.stepQuery, it.attached) || `${st.type} #${stepIdx}`;
         notchItemMap.set(qNotch, it);
         frag.appendChild(qNotch);
@@ -7048,15 +7902,13 @@
     jumpToStep(notch.dataset.jump);
   });
 
-  const _minimapTrackHint = els.promptMinimap.getAttribute("title") || "";
-
   els.promptMinimap.addEventListener("mouseover", (e) => {
     const notch = e.target.closest(
       ".minimap-notch, .minimap-notch-cp, .minimap-notch-err, .minimap-notch-sel, .minimap-notch-search"
     );
     if (!notch) {
       els.minimapPreview.classList.add("hidden");
-      if (_minimapTrackHint) els.promptMinimap.setAttribute("title", _minimapTrackHint);
+      els.promptMinimap.setAttribute("title", t("minimap.trackTitle"));
       return;
     }
     if (els.promptMinimap.hasAttribute("title")) {
@@ -7073,7 +7925,7 @@
   els.promptMinimap.addEventListener("mouseout", (e) => {
     if (!e.relatedTarget || !els.promptMinimap.contains(e.relatedTarget)) {
       els.minimapPreview.classList.add("hidden");
-      if (_minimapTrackHint) els.promptMinimap.setAttribute("title", _minimapTrackHint);
+      els.promptMinimap.setAttribute("title", t("minimap.trackTitle"));
     }
   });
 
@@ -7095,24 +7947,23 @@
     const showBottom = dist > 80;
     if (showBottom) {
       state.userScrolledUp = true;
-      if (!_lastShowBottom) {
-        _lastShowBottom = true;
-        els.jumpBottomBtn.classList.remove("hidden");
-        if (state.firstUnreadStepIndex === null) {
-          els.jumpBottomBtn.classList.remove("flash-yellow");
-          els.jumpBottomBtn.textContent = "↓ Вниз";
+      if (state.firstUnreadStepIndex !== null) {
+        const unreadIt = _vStepToItemMap.get(String(state.firstUnreadStepIndex));
+        if (!unreadIt) {
+          state.firstUnreadStepIndex = null;
+        } else if (!_activeJumpLock) {
+          const viewBottomInList = Math.max(0, scrollTop - getVListBaseTop()) + clientH;
+          if (viewBottomInList >= unreadIt.offsetY + Math.min(72, Math.max(24, unreadIt.height * 0.35))) {
+            state.firstUnreadStepIndex = null;
+          }
         }
       }
     } else {
       state.userScrolledUp = false;
       state.firstUnreadStepIndex = null;
-      if (_lastShowBottom !== false) {
-        _lastShowBottom = false;
-        els.jumpBottomBtn.classList.add("hidden");
-        els.jumpBottomBtn.classList.remove("flash-yellow");
-        els.jumpBottomBtn.textContent = "↓ Вниз";
-      }
     }
+    _lastShowBottom = showBottom;
+    syncJumpBottomButtonState(showBottom);
 
     syncVirtualWindow();
     updateActiveMinimapNotch(scrollTop, clientH, scrollH);
@@ -7151,7 +8002,10 @@
   els.feedWrap.addEventListener(
     "scroll",
     () => {
-      if (performance.now() >= _suppressScrollTsUntil) {
+      const matchesProgrammaticTop =
+        (_activeJumpLock || _activeAnchorLock) &&
+        Math.abs(els.feedWrap.scrollTop - _lastScrollFrameTop) <= 2;
+      if (performance.now() >= _suppressScrollTsUntil && !matchesProgrammaticTop) {
         _lastUserScrollMs = Date.now();
         if (!_activeJumpLock && !_activeAnchorLock) {
           clearHashStepIfScrolledAway();
@@ -7174,8 +8028,7 @@
     if (state.firstUnreadStepIndex !== null) {
       const targetIdx = state.firstUnreadStepIndex;
       state.firstUnreadStepIndex = null;
-      els.jumpBottomBtn.classList.remove("flash-yellow");
-      els.jumpBottomBtn.textContent = "↓ Вниз";
+      syncJumpBottomButtonState(_lastShowBottom);
       clearHashStepIfScrolledAway();
       jumpToStep(targetIdx, { topOffset: 4 });
       requestAnimationFrame(updateScrollUiOnFrame);
@@ -7190,7 +8043,8 @@
   function makeApiFileUrl(localPath, extraQuery = "") {
     const convPart = state.activeId ? `&conv=${encodeURIComponent(state.activeId)}` : "";
     const rootPart = state.projectRoot ? `&root=${encodeURIComponent(state.projectRoot)}` : "";
-    return `/api/file?path=${encodeURIComponent(localPath)}${convPart}${rootPart}${extraQuery}`;
+    const langPart = `&lang=${encodeURIComponent(state.lang || "en")}`;
+    return `/api/file?path=${encodeURIComponent(localPath)}${convPart}${rootPart}${langPart}${extraQuery}`;
   }
 
   async function executeFileOpen(localPath, mode) {
@@ -7213,10 +8067,11 @@
             mode,
             conv: state.activeId || "",
             root: state.projectRoot || "",
+            lang: state.lang || "en",
           }),
         });
         const data = await res.json();
-        if (!data.ok) alert(data.error || "Не удалось открыть файл");
+        if (!data.ok) alert(data.error || t("fileModal.openFileError"));
       } catch (err) {
         alert(err.message);
       }
@@ -7227,7 +8082,7 @@
     _pendingFilePath = localPath;
     const expanded = expandLocalTemplatePath(localPath);
     const fileName = expanded.split(/[/\\]/).filter(Boolean).pop() || expanded;
-    els.fileOpenTitle.textContent = `Открыть: ${fileName}`;
+    els.fileOpenTitle.textContent = t("fileModal.titlePrefix", { name: fileName });
     els.fileOpenPathPreview.textContent = expanded;
     els.fileOpenRememberCheck.checked = false;
     els.fileOpenModal.classList.remove("hidden");
@@ -7262,7 +8117,7 @@
     if (!txt) return;
     navigator.clipboard.writeText(txt).then(() => {
       const orig = els.fileOpenCopyPathBtn.textContent;
-      els.fileOpenCopyPathBtn.textContent = "✓ Скопировано";
+      els.fileOpenCopyPathBtn.textContent = t("fileModal.copiedPath");
       setTimeout(() => (els.fileOpenCopyPathBtn.textContent = orig), 1200);
     });
   });
@@ -7290,13 +8145,14 @@
             mode: state.folderOpenMode,
             conv: state.activeId || "",
             root: state.projectRoot || "",
+            lang: state.lang || "en",
           }),
         });
         const data = await res.json();
         if (data.is_file && data.file_url) {
           window.open(data.file_url, "_blank", "noopener,noreferrer");
         } else if (!data.ok) {
-          alert(data.error || "Не удалось открыть папку");
+          alert(data.error || t("fileModal.openFolderError"));
         }
       } catch (err) {
         alert(err.message);
@@ -7434,10 +8290,10 @@
   function applyTheme(theme) {
     if (theme === "day") {
       document.documentElement.setAttribute("data-theme", "day");
-      els.themeToggle.textContent = "🌙 Ночь";
+      els.themeToggle.textContent = t("topbar.themeNightLabel");
     } else {
       document.documentElement.removeAttribute("data-theme");
-      els.themeToggle.textContent = "☀️ День";
+      els.themeToggle.textContent = t("topbar.themeDayLabel");
     }
     try {
       localStorage.setItem("tv_theme", theme);
@@ -7503,12 +8359,14 @@
       const modalWasOpen =
         !els.lightbox.classList.contains("hidden") ||
         !els.cmdMapModal.classList.contains("hidden") ||
-        !els.fileOpenModal.classList.contains("hidden");
+        !els.fileOpenModal.classList.contains("hidden") ||
+        isSearchPopoverOpen();
       els.lightbox.classList.add("hidden");
       isTooltipVisible = false;
       els.tooltip.classList.add("hidden");
       els.cmdMapModal.classList.add("hidden");
       els.fileOpenModal.classList.add("hidden");
+      closeSearchPopover();
       if (!modalWasOpen && document.activeElement && document.activeElement.closest(INNER_SCROLL_SEL)) {
         if (els.feedWrap) els.feedWrap.focus({ preventScroll: true });
       }
@@ -7518,8 +8376,23 @@
     const activeEl = document.activeElement;
     const tag = activeEl?.tagName || "";
     const inEditable = ["INPUT", "TEXTAREA", "SELECT"].includes(tag) || activeEl?.isContentEditable;
-    if (e.key === "/" && !inEditable) {
+    const modalOpen =
+      !els.cmdMapModal.classList.contains("hidden") ||
+      !els.fileOpenModal.classList.contains("hidden") ||
+      !els.lightbox.classList.contains("hidden");
+    const isSlashShortcut =
+      e.key === "/" && !e.ctrlKey && !e.altKey && !e.metaKey && !inEditable;
+    const isCtrlDotShortcut =
+      e.ctrlKey &&
+      !e.altKey &&
+      !e.metaKey &&
+      !e.shiftKey &&
+      (e.key === "." || e.key === "/" || e.code === "Slash");
+    if (!modalOpen && (isSlashShortcut || isCtrlDotShortcut)) {
       e.preventDefault();
+      if (els.appRoot.classList.contains("header-collapsed")) {
+        applyHeaderCollapsed(false);
+      }
       els.stepSearch.focus();
       return;
     }
@@ -7532,15 +8405,14 @@
       !e.metaKey &&
       (e.key === "PageDown" || e.key === "PageUp" || e.key === "Home" || e.key === "End")
     ) {
-      const modalOpen =
-        !els.cmdMapModal.classList.contains("hidden") ||
-        !els.fileOpenModal.classList.contains("hidden") ||
-        !els.lightbox.classList.contains("hidden");
       if (modalOpen) return;
       if (activeEl && activeEl.closest(`.sidebar, ${INNER_SCROLL_SEL}`)) {
         return;
       }
       e.preventDefault();
+      _activeJumpLock = null;
+      _activeAnchorLock = null;
+      _pinBottomLockUntil = 0;
       _lastUserScrollMs = Date.now();
       const fw = els.feedWrap;
       const stepPx = Math.max(160, Math.round(fw.clientHeight * 0.88));
@@ -7595,7 +8467,7 @@
         const title = el.dataset.tipTitle || "";
         const desc = el.dataset.tipDesc || "";
         const raw = el.dataset.tipRaw || "";
-        const rawLabel = el.dataset.tipRawLabel !== undefined ? el.dataset.tipRawLabel : "В файле:";
+        const rawLabel = el.dataset.tipRawLabel !== undefined ? el.dataset.tipRawLabel : t("card.rawTipLabel");
         const rawPrefix = rawLabel ? `${escHtml(rawLabel)} ` : "";
         els.tooltip.innerHTML =
           `<div class="tooltip-title">${escHtml(title)}</div>` +
@@ -7638,7 +8510,7 @@
   // ---------- Command Map Modal (Statistics & Minimap/Feed Filter) ----------
   function updateCmdMapButtonLabel() {
     const n = state.cmdMapKeys.size;
-    els.openCmdMapBtn.textContent = n > 0 ? `📊 Карта команд (${n})` : "📊 Карта команд";
+    els.openCmdMapBtn.textContent = n > 0 ? t("toolbar.cmdMapCount", { count: n }) : t("toolbar.cmdMap");
   }
 
   function buildCommandMapStats() {
@@ -7721,19 +8593,19 @@
                 <input type="checkbox" data-cmd-key="tool:${escHtml(name)}" ${chk(`tool:${name}`)}>
                 <span>${escHtml(name)}</span>
               </label>
-              <span class="meta-chip">${info.total} вызов.</span>
+              <span class="meta-chip">${escHtml(t("cmdMap.callsChip", { count: info.total }))}</span>
             </div>
             <div class="cmd-sub-row">
               <label class="cmd-sub-check is-ok">
                 <input type="checkbox" data-cmd-key="tool:${escHtml(name)}:ok" ${chk(`tool:${name}:ok`)}>
-                <span>✓ Успешно: ${info.ok}</span>
+                <span>${escHtml(t("cmdMap.okCount", { count: info.ok }))}</span>
               </label>
               <label class="cmd-sub-check is-err">
                 <input type="checkbox" data-cmd-key="tool:${escHtml(name)}:err" ${chk(`tool:${name}:err`)}>
-                <span>⚠ Ошибки: ${info.err}</span>
+                <span>${escHtml(t("cmdMap.errCount", { count: info.err }))}</span>
               </label>
             </div>
-            ${filesList ? `<div class="cmd-files-note" title="${escHtml(filesList)}">Файлы: ${escHtml(filesList)}</div>` : ""}
+            ${filesList ? `<div class="cmd-files-note" title="${escHtml(filesList)}">${escHtml(t("cmdMap.filesLabel", { files: filesList }))}</div>` : ""}
           </div>
         `;
       })
@@ -7741,10 +8613,10 @@
 
     const typesHtml = Array.from(stats.typeCounts.entries())
       .map(
-        ([t, cnt]) => `
+        ([tName, cnt]) => `
         <label class="cmd-sub-check">
-          <input type="checkbox" data-cmd-key="type:${escHtml(t)}" ${chk(`type:${t}`)}>
-          <span>${escHtml(t)}: ${cnt}</span>
+          <input type="checkbox" data-cmd-key="type:${escHtml(tName)}" ${chk(`type:${tName}`)}>
+          <span>${escHtml(tName)}: ${cnt}</span>
         </label>
       `
       )
@@ -7762,27 +8634,32 @@
       .join("");
 
     const subtypesHtml = `
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:final" ${chk("sub:final")}><span>Финальные ответы ИИ: ${stats.subFinal}</span></label>
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:thinking" ${chk("sub:thinking")}><span>Шаги с thinking: ${stats.subThinking}</span></label>
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:media" ${chk("sub:media")}><span>Шаги с media: ${stats.subMedia}</span></label>
-      <label class="cmd-sub-check is-err"><input type="checkbox" data-cmd-key="sub:errors" ${chk("sub:errors")}><span>Любые ошибки: ${stats.subErrors}</span></label>
+      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:final" ${chk("sub:final")}><span>${escHtml(t("cmdMap.subFinal", { count: stats.subFinal }))}</span></label>
+      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:thinking" ${chk("sub:thinking")}><span>${escHtml(t("cmdMap.subThinking", { count: stats.subThinking }))}</span></label>
+      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:media" ${chk("sub:media")}><span>${escHtml(t("cmdMap.subMedia", { count: stats.subMedia }))}</span></label>
+      <label class="cmd-sub-check is-err"><input type="checkbox" data-cmd-key="sub:errors" ${chk("sub:errors")}><span>${escHtml(t("cmdMap.subErrors", { count: stats.subErrors }))}</span></label>
     `;
 
     els.cmdMapBody.dataset.allKeys = JSON.stringify(allSelectableKeys);
     els.cmdMapBody.innerHTML = `
       <div class="cmd-map-summary">
-        <span>Всего шагов: <strong>${state.steps.length}</strong></span>
-        <span>Вызовов инструментов: <strong>${stats.totalTools}</strong> (${toolsSorted.length} видов)</span>
-        <span>Ошибок: <strong>${stats.subErrors}</strong></span>
-        <span>Токены in/cache/out: <strong>${fmtNum(state.totals.inTok)} / ${fmtNum(state.totals.cacheTok)} (${hitPct}%) / ${fmtNum(state.totals.outTok)}</strong></span>
+        <span>${t("cmdMap.totalSteps", { count: state.steps.length })}</span>
+        <span>${t("cmdMap.totalTools", { total: stats.totalTools, kinds: toolsSorted.length })}</span>
+        <span>${t("cmdMap.totalErrors", { count: stats.subErrors })}</span>
+        <span>${t("cmdMap.totalTokens", {
+          inTok: fmtNum(state.totals.inTok),
+          cacheTok: fmtNum(state.totals.cacheTok),
+          hitPct,
+          outTok: fmtNum(state.totals.outTok),
+        })}</span>
       </div>
       <div>
-        <h4 class="cmd-map-section-title">Типы шагов, статусы и подтипы (отмеченные отображаются ★ справа на полосе прокрутки)</h4>
+        <h4 class="cmd-map-section-title">${escHtml(t("cmdMap.sectionTypes"))}</h4>
         <div class="cmd-sub-row" style="padding-left:0;">${typesHtml}${statusesHtml}${subtypesHtml}</div>
       </div>
       <div>
-        <h4 class="cmd-map-section-title">Выполненные инструменты (разбивка по командам и результатам)</h4>
-        <div class="cmd-map-grid">${toolsHtml || '<div class="empty-hint">Инструменты ещё не вызывались</div>'}</div>
+        <h4 class="cmd-map-section-title">${escHtml(t("cmdMap.sectionTools"))}</h4>
+        <div class="cmd-map-grid">${toolsHtml || `<div class="empty-hint">${escHtml(t("cmdMap.noToolsYet"))}</div>`}</div>
       </div>
     `;
   }
@@ -7869,23 +8746,19 @@
       }
       setComposerStatus("clipboard_only");
       if (els.composerSendBtn) {
-        els.composerSendBtn.textContent = "Копировать в буфер 📋";
-        els.composerSendBtn.title =
-          "Скопировать текст в буфер обмена (Enter — копировать, Shift+Enter — новая строка; автовставка в Antigravity доступна только на Windows)";
+        els.composerSendBtn.textContent = t("composer.sendBtnPosix");
+        els.composerSendBtn.title = t("composer.sendBtnPosixTitle");
       }
       if (els.promptInput) {
-        els.promptInput.placeholder =
-          "Напишите сообщение… (Enter — скопировать в буфер обмена, Shift+Enter — новая строка)";
+        els.promptInput.placeholder = t("composer.placeholderPosix");
       }
     } else {
       if (els.composerSendBtn) {
-        els.composerSendBtn.textContent = "Вставить в Antigravity ↗";
-        els.composerSendBtn.title =
-          "Скопировать текст, активировать окно Antigravity.exe и вставить (Enter не нажимается)";
+        els.composerSendBtn.textContent = t("composer.sendBtnWin");
+        els.composerSendBtn.title = t("composer.sendBtnWinTitle");
       }
       if (els.promptInput) {
-        els.promptInput.placeholder =
-          "Напишите сообщение… (Enter — вставить в Antigravity без отправки, Shift+Enter — новая строка)";
+        els.promptInput.placeholder = t("composer.placeholderWin");
       }
       if (!_agWindowPollTimer) {
         _agWindowPollTimer = setInterval(checkAntigravityWindow, 10000);
@@ -7893,18 +8766,20 @@
     }
   }
 
+  let _lastComposerStatusMode = "";
+  let _lastComposerWindowTitle = "";
   function setComposerStatus(mode, windowTitle = "") {
+    _lastComposerStatusMode = mode;
+    _lastComposerWindowTitle = windowTitle;
     if (mode === "clipboard_only") {
-      els.composerStatus.textContent = "📋 Буфер обмена";
-      els.composerStatus.dataset.tipTitle = "Режим буфера обмена (Linux / macOS)";
-      els.composerStatus.dataset.tipDesc =
-        "Автовставка в окно Antigravity.exe поддерживается только на Windows.\n" +
-        "На текущей платформе поле ввода работает как черновик с быстрым копированием в буфер по Enter.";
+      els.composerStatus.textContent = t("composer.clipboardModeLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.clipboardModeTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.clipboardModeDesc");
       els.composerStatus.dataset.tipRaw = `os: ${state.capabilities?.os || "posix"}, antigravity_paste: false`;
     } else if (mode === "copied") {
-      els.composerStatus.textContent = "📋 ✓ Скопировано";
-      els.composerStatus.dataset.tipTitle = "Скопировано в буфер обмена";
-      els.composerStatus.dataset.tipDesc = "Текст помещён в буфер обмена. Вставьте его в окно Antigravity вручную (Ctrl+V / Cmd+V).";
+      els.composerStatus.textContent = t("composer.copiedLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.copiedTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.copiedDesc");
       els.composerStatus.dataset.tipRaw = "status: copied";
       clearTimeout(_copiedResetTimer);
       _copiedResetTimer = setTimeout(() => {
@@ -7913,35 +8788,29 @@
         }
       }, 2200);
     } else if (mode === "found") {
-      els.composerStatus.textContent = `🟢 [АГ ✓] ${windowTitle}`;
-      els.composerStatus.dataset.tipTitle = "Статус окна Antigravity.exe: ПОДКЛЮЧЕНО";
-      els.composerStatus.dataset.tipDesc =
-        "Текущий цвет индикатора: ЗЕЛЁНЫЙ (🟢 = окно найдено, БЕЛЫЙ ⚪ = не найдено, ЖЁЛТЫЙ 🟡 = идёт вставка).\n" +
-        "Найдено видимое окно Antigravity.exe — при нажатии Enter текст скопируется в буфер и вставится туда через Ctrl+I → Ctrl+V (без автоотправки).";
-      els.composerStatus.dataset.tipRaw = `Окно: "${windowTitle}"`;
+      els.composerStatus.textContent = t("composer.agFoundLabel", { title: windowTitle });
+      els.composerStatus.dataset.tipTitle = t("composer.agFoundTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agFoundDesc");
+      els.composerStatus.dataset.tipRaw = t("composer.agFoundRaw", { title: windowTitle });
     } else if (mode === "not_found") {
-      els.composerStatus.textContent = "⚪ [АГ —] Не найдено";
-      els.composerStatus.dataset.tipTitle = "Статус окна Antigravity.exe: НЕ НАЙДЕНО";
-      els.composerStatus.dataset.tipDesc =
-        "Текущий цвет индикатора: БЕЛЫЙ (⚪ = окно Antigravity.exe не найдено или свёрнуто без заголовка, ЗЕЛЁНЫЙ 🟢 = найдено).\n" +
-        "При нажатии Enter текст всё равно скопируется в буфер обмена.";
+      els.composerStatus.textContent = t("composer.agNotFoundLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.agNotFoundTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agNotFoundDesc");
       els.composerStatus.dataset.tipRaw = "found: false";
     } else if (mode === "sending") {
-      els.composerStatus.textContent = "🟡 [АГ ⏳] Вставка…";
-      els.composerStatus.dataset.tipTitle = "Статус окна Antigravity.exe: ИДЁТ ВСТАВКА";
-      els.composerStatus.dataset.tipDesc =
-        "Текущий цвет индикатора: ЖЁЛТЫЙ (🟡 = передача текста в буфер, активация окна и вставка Ctrl+V).";
+      els.composerStatus.textContent = t("composer.agSendingLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.agSendingTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agSendingDesc");
       els.composerStatus.dataset.tipRaw = "sending...";
     } else if (mode === "pasted") {
-      els.composerStatus.textContent = "🟢 [АГ ✓] Вставлено";
-      els.composerStatus.dataset.tipTitle = "Текст вставлен в Antigravity.exe";
-      els.composerStatus.dataset.tipDesc =
-        "Текущий цвет индикатора: ЗЕЛЁНЫЙ (🟢).\nТекст вставлен в поле ввода Antigravity (без нажатия Enter) — проверьте и отправьте вручную.";
+      els.composerStatus.textContent = t("composer.agPastedLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.agPastedTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agPastedDesc");
       els.composerStatus.dataset.tipRaw = "status: pasted";
     } else {
       els.composerStatus.textContent = `⚠ ${windowTitle}`;
-      els.composerStatus.dataset.tipTitle = "Ошибка вставки";
-      els.composerStatus.dataset.tipDesc = `Текущий цвет значка: КРАСНО-ЖЁЛТЫЙ (⚠).\n${windowTitle}`;
+      els.composerStatus.dataset.tipTitle = t("composer.agErrorTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agErrorDesc", { msg: windowTitle });
       els.composerStatus.dataset.tipRaw = windowTitle;
     }
   }
@@ -7973,7 +8842,7 @@
         els.promptInput.value = "";
         setComposerStatus("copied");
       } catch (err) {
-        setComposerStatus("error", err?.message || "Буфер обмена недоступен");
+        setComposerStatus("error", err?.message || t("composer.clipboardUnavailable"));
       }
       return;
     }
@@ -7986,6 +8855,7 @@
           text,
           project: state.activeMeta?.project || "",
           title: state.activeMeta?.title || "",
+          lang: state.lang || "en",
         }),
       });
       const data = await res.json();
@@ -7994,7 +8864,7 @@
         setComposerStatus("pasted");
       } else {
         try { await navigator.clipboard.writeText(text); } catch (_) {}
-        setComposerStatus("error", `${data.info || data.error || "Ошибка"} (в буфере)`);
+        setComposerStatus("error", t("composer.copiedErrorSuffix", { msg: data.info || data.error || t("topbar.liveError") }));
       }
     } catch (err) {
       setComposerStatus("error", err.message);
@@ -8046,8 +8916,52 @@
     });
   }
 
+  async function setLanguage(lang) {
+    await loadLocale(lang);
+    applyStaticTranslations();
+    syncJumpBottomButtonState(_lastShowBottom);
+    applyTheme(document.documentElement.getAttribute("data-theme") === "day" ? "day" : "night");
+    applyCapabilitiesUI();
+    if (_lastComposerStatusMode) {
+      setComposerStatus(_lastComposerStatusMode, _lastComposerWindowTitle);
+    }
+    renderSearchPopover();
+    updateCmdMapButtonLabel();
+    _tocBaseCache = null;
+    stepSearchBlobCache = new WeakMap();
+    stepSearchUnitsCache = new WeakMap();
+    minimapMetaCache = new WeakMap();
+    invalidateCardRenderCache();
+    if (state.transcripts.length > 0) {
+      updateProjectDropdown();
+      renderTranscriptList();
+    }
+    if (state.steps.length > 0) {
+      buildStepMetadataAndTaskIndex(state.steps);
+      const anchor = state.userScrolledUp ? captureSearchContextAnchor() : null;
+      renderFullFeed();
+      if (anchor && anchor.stepIndex) {
+        jumpToStep(anchor.stepIndex, {
+          topOffset: anchor.topInWrap,
+          toolOutStep: anchor.toolOutStep,
+          toolIdx: anchor.toolIdx,
+          resetFiltersOnMissing: false,
+        });
+      }
+      if (!els.cmdMapModal.classList.contains("hidden")) {
+        renderCommandMapModal();
+      }
+    }
+    if (els.livePill?.classList.contains("connected")) {
+      setLiveStatus("connected", "Live");
+    } else if (els.livePill?.classList.contains("error")) {
+      setLiveStatus("error", t("topbar.liveReconnecting"));
+    }
+  }
+
   // ---------- Init ----------
   (async () => {
+    let savedLang = "en";
     let savedTheme = "night";
     let savedCollapsed = false;
     let savedHeaderCollapsed = false;
@@ -8058,7 +8972,13 @@
     let savedReadMode = "scroll";
     let savedLinkifyShort = true;
     let savedDisableAutoLinks = false;
+    let savedSearchFocused = true;
+    let savedSearchWholeTurn = false;
+    let savedSearchWholeWord = false;
+    let savedSearchCase = false;
     try {
+      const lsLang = localStorage.getItem("tv_lang");
+      if (lsLang === "ru" || lsLang === "en") savedLang = lsLang;
       savedTheme = localStorage.getItem("tv_theme") || "night";
       savedCollapsed = localStorage.getItem("tv_sidebar_collapsed") === "1";
       savedHeaderCollapsed = localStorage.getItem("tv_header_collapsed") === "1";
@@ -8070,12 +8990,25 @@
       const lsShort = localStorage.getItem("tv_linkify_short");
       savedLinkifyShort = lsShort === null ? true : lsShort === "1";
       savedDisableAutoLinks = localStorage.getItem("tv_disable_auto_links") === "1";
+      const lsFocused = localStorage.getItem("tv_search_focused");
+      savedSearchFocused = lsFocused === null ? true : lsFocused === "1";
+      savedSearchWholeTurn = localStorage.getItem("tv_search_whole_turn") === "1";
+      savedSearchWholeWord = localStorage.getItem("tv_search_whole_word") === "1";
+      savedSearchCase = localStorage.getItem("tv_search_case") === "1";
     } catch (_) {}
     state.folderOpenMode = savedFolderMode;
     state.fileOpenMode = savedFileMode;
     state.readDisplayMode = ["scroll", "full", "hide"].includes(savedReadMode) ? savedReadMode : "scroll";
     state.linkifyProjectFiles = savedLinkifyShort;
     state.disableAutoLinks = savedDisableAutoLinks;
+    state.searchFocusedOnly = savedSearchFocused;
+    state.searchAcrossWholeTurn = savedSearchWholeTurn;
+    state.searchWholeWord = savedSearchWholeWord;
+    state.searchCaseSensitive = savedSearchCase;
+    await loadLocale(savedLang);
+    applyStaticTranslations();
+    renderSearchPopover();
+    updateCmdMapButtonLabel();
     applyTheme(savedTheme);
     applySidebarCollapsed(savedCollapsed);
     applyHeaderCollapsed(savedHeaderCollapsed);

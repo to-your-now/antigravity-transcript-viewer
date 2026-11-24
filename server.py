@@ -45,6 +45,42 @@ FAVICON_TAG = (
 # Metadata cache: conv_id -> (mtime_ns, size, meta_dict)
 _META_CACHE: Dict[str, Tuple[int, int, dict]] = {}
 _META_LOCK = threading.Lock()
+_I18N_SERVER_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _norm_lang(raw_lang: Any) -> str:
+    s = str(raw_lang or "").strip().lower()
+    return "ru" if s.startswith("ru") else "en"
+
+
+def _get_server_i18n(lang: str = "en") -> Dict[str, str]:
+    key = _norm_lang(lang)
+    cached = _I18N_SERVER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    merged: Dict[str, str] = {}
+    for code in ("en", key):
+        p = STATIC_DIR / "i18n" / f"{code}.json"
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            srv = data.get("server")
+            if isinstance(srv, dict):
+                merged.update({str(k): str(v) for k, v in srv.items()})
+        except OSError:
+            pass
+        except Exception:
+            pass
+    _I18N_SERVER_CACHE[key] = merged
+    return merged
+
+
+def _srv_t(lang: str, key: str, **kwargs: Any) -> str:
+    table = _get_server_i18n(lang)
+    tmpl = table.get(key, key)
+    if kwargs:
+        for k, v in kwargs.items():
+            tmpl = tmpl.replace(f"{{{k}}}", str(v))
+    return tmpl
 
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 WORKSPACE_RE = re.compile(
@@ -465,33 +501,34 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/send-to-antigravity":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw_body = self.rfile.read(min(length, 1_000_000)) if length > 0 else b""
+            try:
+                data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except Exception:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            lang = _norm_lang(data.get("lang"))
             if not IS_WINDOWS:
                 self._send_json(
                     {
                         "ok": False,
-                        "error": "Автовставка в окно Antigravity поддерживается только на Windows",
+                        "error": _srv_t(lang, "pasteWindowsOnly"),
                         "status": "unsupported",
                     },
                     status=501,
                 )
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
-            raw_body = self.rfile.read(min(length, 1_000_000))
-            try:
-                data = json.loads(raw_body.decode("utf-8"))
-            except Exception:
-                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
-                return
             text = str(data.get("text") or "")
             prefer_project = str(data.get("project") or "")
             prefer_title = str(data.get("title") or "")
             if not text.strip():
-                self._send_json({"ok": False, "error": "Пустой текст"}, status=400)
+                self._send_json({"ok": False, "error": _srv_t(lang, "emptyText")}, status=400)
                 return
-            ok, info, status_code = send_text_to_antigravity_window(text, prefer_project, prefer_title)
+            ok, info, status_code = send_text_to_antigravity_window(text, prefer_project, prefer_title, lang=lang)
             self._send_json({"ok": ok, "info": info, "status": status_code}, status=200 if ok else 404)
             return
 
@@ -506,31 +543,32 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
                 return
+            lang = _norm_lang(data.get("lang"))
             raw_p = str(data.get("path") or "")
             mode = str(data.get("mode") or ("explorer" if IS_WINDOWS else "system")).lower()
             conv_id = str(data.get("conv") or "")
             project_root = str(data.get("root") or "")
             resolved = _resolve_user_path(raw_p, conv_id, project_root)
             if resolved is None or not resolved.exists():
-                self._send_json({"ok": False, "error": f"Путь не найден: {raw_p}"}, status=404)
+                self._send_json({"ok": False, "error": _srv_t(lang, "pathNotFound", path=raw_p)}, status=404)
                 return
             if resolved.is_file():
                 self._send_json(
                     {
                         "ok": False,
                         "is_file": True,
-                        "file_url": f"/api/file?path={urllib.parse.quote(str(resolved))}",
+                        "file_url": f"/api/file?path={urllib.parse.quote(str(resolved))}&lang={lang}",
                     }
                 )
                 return
             if mode == "totalcmd":
                 if not IS_WINDOWS:
-                    self._send_json({"ok": False, "error": "Total Commander доступен только на Windows"}, status=400)
+                    self._send_json({"ok": False, "error": _srv_t(lang, "totalcmdWinOnly")}, status=400)
                     return
                 tc = _find_totalcmd_exe()
                 if not tc:
                     self._send_json(
-                        {"ok": False, "error": r"Total Commander не найден (C:\totalcmd\TOTALCMD64.EXE)"},
+                        {"ok": False, "error": _srv_t(lang, "totalcmdNotFound")},
                         status=404,
                     )
                     return
@@ -542,7 +580,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 return
             if mode == "explorer":
                 if not IS_WINDOWS:
-                    self._send_json({"ok": False, "error": "Проводник (explorer.exe) доступен только на Windows"}, status=400)
+                    self._send_json({"ok": False, "error": _srv_t(lang, "explorerWinOnly")}, status=400)
                     return
                 try:
                     subprocess.Popen(["explorer.exe", str(resolved)])
@@ -560,7 +598,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             opener = _find_posix_opener()
             if not opener:
                 self._send_json(
-                    {"ok": False, "error": "Системный файловый менеджер недоступен (не найден xdg-open/open)"},
+                    {"ok": False, "error": _srv_t(lang, "posixOpenerNotFound")},
                     status=404,
                 )
                 return
@@ -582,25 +620,26 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
                 return
+            lang = _norm_lang(data.get("lang"))
             raw_p = str(data.get("path") or "")
             conv_id = str(data.get("conv") or "")
             project_root = str(data.get("root") or "")
             mode = str(data.get("mode") or "system").strip().lower()
             resolved = _resolve_user_path(raw_p, conv_id, project_root)
             if resolved is None or not resolved.exists():
-                self._send_json({"ok": False, "error": f"Путь не найден: {raw_p}"}, status=404)
+                self._send_json({"ok": False, "error": _srv_t(lang, "pathNotFound", path=raw_p)}, status=404)
                 return
             if mode == "notepadpp":
                 if not IS_WINDOWS:
-                    self._send_json({"ok": False, "error": "Notepad++ доступен только на Windows"}, status=400)
+                    self._send_json({"ok": False, "error": _srv_t(lang, "notepadWinOnly")}, status=400)
                     return
                 if resolved.is_dir():
-                    self._send_json({"ok": False, "error": "Notepad++ открывает файлы, а не папки"}, status=400)
+                    self._send_json({"ok": False, "error": _srv_t(lang, "notepadNoDirs")}, status=400)
                     return
                 npp = _find_notepadpp_exe()
                 if not npp:
                     self._send_json(
-                        {"ok": False, "error": r"Notepad++ не найден (Program Files\Notepad++\notepad++.exe)"},
+                        {"ok": False, "error": _srv_t(lang, "notepadNotFound")},
                         status=404,
                     )
                     return
@@ -617,7 +656,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                     opener = _find_posix_opener()
                     if not opener:
                         self._send_json(
-                            {"ok": False, "error": "Открытие в системной программе недоступно (не найден xdg-open/open)"},
+                            {"ok": False, "error": _srv_t(lang, "systemOpenerNotFound")},
                             status=404,
                         )
                         return
@@ -638,7 +677,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_dir_html(self, dir_path: Path, conv_id: str = "", project_root: str = "") -> None:
+    def _send_dir_html(self, dir_path: Path, conv_id: str = "", project_root: str = "", lang: str = "en") -> None:
+        lang = _norm_lang(lang)
         try:
             entries = list(dir_path.iterdir())
         except OSError as exc:
@@ -647,10 +687,13 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         entries.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
         title = _html.escape(dir_path.name or str(dir_path))
         full_path = _html.escape(str(dir_path))
+        dir_kind = _html.escape(_srv_t(lang, "dirKind"))
+        lang_q = f"&lang={lang}"
         parent_link = ""
         if dir_path.parent != dir_path:
             pq = urllib.parse.quote(str(dir_path.parent))
-            parent_link = f'<a class="dir-row is-dir" href="/api/file?path={pq}"><span>⬆ .. (на уровень выше)</span><span class="dir-meta">Папка</span></a>'
+            parent_lbl = _html.escape(_srv_t(lang, "dirParentLink"))
+            parent_link = f'<a class="dir-row is-dir" href="/api/file?path={pq}{lang_q}"><span>{parent_lbl}</span><span class="dir-meta">{dir_kind}</span></a>'
 
         rows = []
         for item in entries:
@@ -659,37 +702,42 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             try:
                 st = item.stat()
                 mtime = dt.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
-                size_str = f"{st.st_size:,} B".replace(",", " ") if not item.is_dir() else "Папка"
+                size_str = f"{st.st_size:,} B".replace(",", " ") if not item.is_dir() else dir_kind
             except OSError:
                 mtime, size_str = "", ""
             if item.is_dir():
                 rows.append(
-                    f'<a class="dir-row is-dir" href="/api/file?path={iq}">'
+                    f'<a class="dir-row is-dir" href="/api/file?path={iq}{lang_q}">'
                     f'<span>📁 {iname}/</span><span class="dir-meta">{_html.escape(size_str)} · {_html.escape(mtime)}</span></a>'
                 )
             else:
                 rows.append(
-                    f'<a class="dir-row" href="/api/file?path={iq}&fmt=1">'
+                    f'<a class="dir-row" href="/api/file?path={iq}&fmt=1{lang_q}">'
                     f'<span>📄 {iname}</span><span class="dir-meta">{_html.escape(size_str)} · {_html.escape(mtime)}</span></a>'
                 )
 
         caps = get_platform_capabilities()
         ext_btns = []
         if caps["open_explorer"]:
-            ext_btns.append('<button class="btn-sm" type="button" onclick="openExt(\'explorer\')">🗂 В Проводнике</button>')
+            ext_btns.append(f'<button class="btn-sm" type="button" onclick="openExt(\'explorer\')">{_html.escape(_srv_t(lang, "dirOpenExplorer"))}</button>')
         if caps["open_totalcmd"]:
-            ext_btns.append('<button class="btn-sm" type="button" onclick="openExt(\'totalcmd\')">⚡ В TotalCmd</button>')
+            ext_btns.append(f'<button class="btn-sm" type="button" onclick="openExt(\'totalcmd\')">{_html.escape(_srv_t(lang, "dirOpenTotalCmd"))}</button>')
         if not caps["is_windows"] and caps["open_folder_os"]:
-            ext_btns.append('<button class="btn-sm" type="button" onclick="openExt(\'system\')">📂 В файловом менеджере</button>')
+            ext_btns.append(f'<button class="btn-sm" type="button" onclick="openExt(\'system\')">{_html.escape(_srv_t(lang, "dirOpenFileMgr"))}</button>')
         ext_btns_html = "\n        ".join(ext_btns)
 
         safe_dir_json = json.dumps(str(dir_path), ensure_ascii=False).replace("</", "<\\/")
+        safe_open_err_json = json.dumps(_srv_t(lang, "openError"), ensure_ascii=False).replace("</", "<\\/")
+        safe_lang_json = json.dumps(lang, ensure_ascii=False)
+        dir_suffix = _html.escape(_srv_t(lang, "dirTitleSuffix"))
+        back_logs = _html.escape(_srv_t(lang, "backToLogs"))
+        empty_msg = _html.escape(_srv_t(lang, "dirEmpty"))
         page = f"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{title} — Папка</title>
+  <title>{title} — {dir_suffix}</title>
   {FAVICON_TAG}
   <link rel="stylesheet" href="/static/style.css">
   <style>
@@ -725,25 +773,27 @@ class TranscriptHandler(BaseHTTPRequestHandler):
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         {ext_btns_html}
-        <a class="btn-sm" href="/" style="text-decoration:none;">← К логам</a>
+        <a class="btn-sm" href="/" style="text-decoration:none;">{back_logs}</a>
       </div>
     </div>
     <div class="dir-list">
       {parent_link}
-      {''.join(rows) if rows else '<div style="padding:20px;color:var(--text-dim);">Папка пуста</div>'}
+      {''.join(rows) if rows else f'<div style="padding:20px;color:var(--text-dim);">{empty_msg}</div>'}
     </div>
   </div>
   <script>
     const DIR_PATH = {safe_dir_json};
+    const PAGE_LANG = {safe_lang_json};
+    const OPEN_ERR = {safe_open_err_json};
     async function openExt(mode) {{
       try {{
         const r = await fetch("/api/open-folder", {{
           method: "POST",
           headers: {{"Content-Type": "application/json"}},
-          body: JSON.stringify({{ path: DIR_PATH, mode }})
+          body: JSON.stringify({{ path: DIR_PATH, mode, lang: PAGE_LANG }})
         }});
         const d = await r.json();
-        if (!d.ok) alert(d.error || "Ошибка открытия");
+        if (!d.ok) alert(d.error || OPEN_ERR);
       }} catch (e) {{ alert(e.message); }}
     }}
   </script>
@@ -757,26 +807,29 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_markdown_html(self, file_path: Path) -> None:
+    def _send_markdown_html(self, file_path: Path, lang: str = "en") -> None:
+        lang = _norm_lang(lang)
         try:
             md_text = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND, "File not found")
             return
-        import html as _html
         title = _html.escape(file_path.name)
         full_path = _html.escape(str(file_path))
         raw_url = "/api/file?path=" + urllib.parse.quote(str(file_path)) + "&raw=1"
         safe_json = json.dumps(md_text, ensure_ascii=False).replace("</", "<\\/")
         safe_path_json = json.dumps(str(file_path), ensure_ascii=False).replace("</", "<\\/")
+        safe_npp_err = json.dumps(_srv_t(lang, "openNppError"), ensure_ascii=False).replace("</", "<\\/")
+        safe_lang_json = json.dumps(lang, ensure_ascii=False)
         caps = get_platform_capabilities()
         npp_btn = (
-            '<button class="btn-sm" id="openNppBtn" type="button">📝 Notepad++</button>'
+            f'<button class="btn-sm" id="openNppBtn" type="button">{_html.escape(_srv_t(lang, "openNppBtn"))}</button>'
             if caps.get("open_notepadpp")
             else ""
         )
+        back_logs = _html.escape(_srv_t(lang, "backToLogs"))
         page = f"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -819,7 +872,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         {npp_btn}
         <a class="btn-sm" href="{raw_url}" style="text-decoration:none;">Raw</a>
-        <a class="btn-sm" href="/" style="text-decoration:none;">← К логам</a>
+        <a class="btn-sm" href="/" style="text-decoration:none;">{back_logs}</a>
       </div>
     </div>
     <article class="md-card md" id="mdOut"></article>
@@ -828,6 +881,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   <script>
     (function() {{
       const FILE_PATH = {safe_path_json};
+      const PAGE_LANG = {safe_lang_json};
+      const NPP_ERR = {safe_npp_err};
       const nppBtn = document.getElementById("openNppBtn");
       if (nppBtn) {{
         nppBtn.addEventListener("click", async () => {{
@@ -835,10 +890,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             const r = await fetch("/api/open-file", {{
               method: "POST",
               headers: {{"Content-Type": "application/json"}},
-              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp" }})
+              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp", lang: PAGE_LANG }})
             }});
             const d = await r.json();
-            if (!d.ok) alert(d.error || "Ошибка открытия в Notepad++");
+            if (!d.ok) alert(d.error || NPP_ERR);
           }} catch (e) {{ alert(e.message); }}
         }});
       }}
@@ -855,7 +910,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
           if (href.startsWith("file:///")) {{
             let p = decodeURIComponent(href.slice(7)).replace(/#.*$/, "");
             if (/^\\/[A-Za-z]:/.test(p)) p = p.slice(1);
-            href = "/api/file?path=" + encodeURIComponent(p) + "&fmt=1";
+            href = "/api/file?path=" + encodeURIComponent(p) + "&fmt=1&lang={lang}";
           }} else if (!/^https?:\\/\\//i.test(href) && !href.startsWith("/")) {{
             return lbl;
           }}
@@ -938,7 +993,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_formatted_code_html(self, file_path: Path, is_json: bool = False) -> None:
+    def _send_formatted_code_html(self, file_path: Path, is_json: bool = False, lang: str = "en") -> None:
+        lang = _norm_lang(lang)
         try:
             raw_text = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -955,14 +1011,21 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         raw_url = "/api/file?path=" + urllib.parse.quote(str(file_path)) + "&raw=1"
         safe_json = json.dumps(display_text, ensure_ascii=False).replace("</", "<\\/")
         safe_path_json = json.dumps(str(file_path), ensure_ascii=False).replace("</", "<\\/")
+        safe_npp_err = json.dumps(_srv_t(lang, "openNppError"), ensure_ascii=False).replace("</", "<\\/")
+        safe_lang_json = json.dumps(lang, ensure_ascii=False)
+        copy_lbl = _srv_t(lang, "copyBtn")
+        copied_lbl = _srv_t(lang, "copiedBtn")
+        safe_copy_json = json.dumps(copy_lbl, ensure_ascii=False).replace("</", "<\\/")
+        safe_copied_json = json.dumps(copied_lbl, ensure_ascii=False).replace("</", "<\\/")
         caps = get_platform_capabilities()
         npp_btn = (
-            '<button class="btn-sm" id="openNppBtn" type="button">📝 Notepad++</button>'
+            f'<button class="btn-sm" id="openNppBtn" type="button">{_html.escape(_srv_t(lang, "openNppBtn"))}</button>'
             if caps.get("open_notepadpp")
             else ""
         )
+        back_logs = _html.escape(_srv_t(lang, "backToLogs"))
         page = f"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -991,10 +1054,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         <div class="code-path">{full_path}</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn-sm" id="copyCodeBtn" type="button">📋 Copy</button>
+        <button class="btn-sm" id="copyCodeBtn" type="button">{_html.escape(copy_lbl)}</button>
         {npp_btn}
         <a class="btn-sm" href="{raw_url}" style="text-decoration:none;">Raw</a>
-        <a class="btn-sm" href="/" style="text-decoration:none;">← К логам</a>
+        <a class="btn-sm" href="/" style="text-decoration:none;">{back_logs}</a>
       </div>
     </div>
     <div class="code-gutter-wrap" id="codeOut"></div>
@@ -1003,6 +1066,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   <script>
     (function() {{
       const FILE_PATH = {safe_path_json};
+      const PAGE_LANG = {safe_lang_json};
+      const NPP_ERR = {safe_npp_err};
+      const COPY_LBL = {safe_copy_json};
+      const COPIED_LBL = {safe_copied_json};
       const nppBtn = document.getElementById("openNppBtn");
       if (nppBtn) {{
         nppBtn.addEventListener("click", async () => {{
@@ -1010,10 +1077,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             const r = await fetch("/api/open-file", {{
               method: "POST",
               headers: {{"Content-Type": "application/json"}},
-              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp" }})
+              body: JSON.stringify({{ path: FILE_PATH, mode: "notepadpp", lang: PAGE_LANG }})
             }});
             const d = await r.json();
-            if (!d.ok) alert(d.error || "Ошибка открытия в Notepad++");
+            if (!d.ok) alert(d.error || NPP_ERR);
           }} catch (e) {{ alert(e.message); }}
         }});
       }}
@@ -1037,8 +1104,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
       out.appendChild(frag);
       document.getElementById("copyCodeBtn").addEventListener("click", (e) => {{
         navigator.clipboard.writeText(txt).then(() => {{
-          e.target.textContent = "✓ Скопировано";
-          setTimeout(() => (e.target.textContent = "📋 Copy"), 1200);
+          e.target.textContent = COPIED_LBL;
+          setTimeout(() => (e.target.textContent = COPY_LBL), 1200);
         }});
       }});
     }})();
@@ -1081,11 +1148,17 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/static/"):
-            rel = path[len("/static/"):]
-            if "/" in rel or "\\" in rel or ".." in rel:
+            rel = urllib.parse.unquote(path[len("/static/"):])
+            if not rel or "\\" in rel or ".." in rel or rel.startswith("/"):
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
-            target = STATIC_DIR / rel
+            try:
+                base_static = STATIC_DIR.resolve()
+                target = (STATIC_DIR / rel).resolve()
+                target.relative_to(base_static)
+            except Exception:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
             if not target.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -1167,8 +1240,9 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_error(HTTPStatus.FORBIDDEN, "Access denied")
                 return
+            lang = _norm_lang(qs.get("lang", ["en"])[0])
             if path == "/api/file" and resolved.is_dir():
-                self._send_dir_html(resolved, conv_id, project_root)
+                self._send_dir_html(resolved, conv_id, project_root, lang=lang)
                 return
             if not resolved.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -1187,7 +1261,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._send_file(resolved, ctype)
                 return
             if ext in {".md", ".markdown"}:
-                self._send_markdown_html(resolved)
+                self._send_markdown_html(resolved, lang=lang)
                 return
             if ext in {".html", ".htm"}:
                 self._send_file(resolved, "text/html")
@@ -1196,7 +1270,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._send_file(resolved, "image/svg+xml")
                 return
             if is_fmt and ext in text_like_exts:
-                self._send_formatted_code_html(resolved, is_json=(ext == ".json"))
+                self._send_formatted_code_html(resolved, is_json=(ext == ".json"), lang=lang)
                 return
             ctype = "text/plain" if ext in text_like_exts else None
             self._send_file(resolved, ctype)
@@ -1485,18 +1559,19 @@ def _send_ctrl_combo(vk: int) -> None:
 
 
 def send_text_to_antigravity_window(
-    text: str, prefer_project: str = "", prefer_title: str = ""
+    text: str, prefer_project: str = "", prefer_title: str = "", lang: str = "en"
 ) -> Tuple[bool, str, str]:
     """Copy text, focus Antigravity.exe (with EN layout for Ctrl+I), paste (Ctrl+V), and restore layout. Never presses Enter."""
+    lang = _norm_lang(lang)
     if sys.platform != "win32":
-        return False, "Поддерживается только на Windows", "error"
+        return False, _srv_t(lang, "agWinOnly"), "error"
 
     hwnd, title = find_antigravity_window(prefer_project, prefer_title)
     if not hwnd:
-        return False, "Окно Antigravity.exe не найдено", "not_found"
+        return False, _srv_t(lang, "agNotFound"), "not_found"
 
     if not _set_clipboard_unicode(text):
-        return False, "Не удалось записать текст в буфер обмена", "clipboard_error"
+        return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -1529,7 +1604,7 @@ def send_text_to_antigravity_window(
 
     time.sleep(0.14)
     if user32.GetForegroundWindow() != hwnd:
-        return False, "Не удалось активировать окно Antigravity.exe (текст в буфере)", "focus_error"
+        return False, _srv_t(lang, "agFocusErr"), "focus_error"
 
     # Temporarily switch target window's keyboard layout to English (0x0409) so Ctrl+I works under Russian layout
     target_tid = user32.GetWindowThreadProcessId(hwnd, None)
