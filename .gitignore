@@ -4,3 +4,5 @@ __pycache__/
 .commit_msg.txt
 .DS_Store
 Thumbs.db
+
+.commit_plan.json

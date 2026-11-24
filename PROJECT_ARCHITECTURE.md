@@ -18,6 +18,8 @@ transcript_viewer/
 ├── README.md               # User-facing English documentation (keep free of implementation internals)
 ├── README.ru.md            # User-facing Russian documentation (keep free of implementation internals)
 ├── PROJECT_ARCHITECTURE.md # This engineering & AI agent architectural guide
+├── tests/
+│   └── test_viewer_features.mjs # Zero-dependency Node unit tests for parsers, model tracking & deep links
 └── static/
     ├── index.html          # App shell, toolbar, feed stage, minimap, modals, prompt composer
     ├── style.css           # Dark/Day themes, virtual-scroll geometry, gutters, single-scrollbox rules
@@ -102,8 +104,13 @@ Modeled after TanStack Virtual / Virtuoso so 70,000+ step logs never blow up Chr
   - Toggle buttons (`Показать полностью` / `Свернуть в прокрутку`) are gated via `.overflow-btn-hidden` in the same `rAF` batch (`scrollHeight > 344` in `full` mode, `scrollHeight > clientHeight + 4` in `scroll` mode). Global default stays under TOC in `#optReadDisplayMode`.
 
 #### D. Rendering, Parsing & Minimap
-- **Raw Immutability:** Parsed `step` objects are NEVER mutated. All derived state uses `WeakMap`s (`stepErrCache`, `stepSearchBlobCache`, `rawStepMap`, `notchItemMap`, `toolArgsReplaceRowMap`, `cardOverflowChecksMap`, `_vElToItemMap`). `{ }` and `Shift + Right-Click` show verbatim disk JSON.
-- **User Prompt Envelope & Newlines:** `parseUserInputEnvelope()` extracts `<USER_REQUEST>` via EOF-validated suffix matching and surfaces `<ADDITIONAL_METADATA>` / `<USER_SETTINGS_CHANGE>` / unknown `<TAG>` badges (`extractTopLevelXmlTags()`). `unescapeNewlines()` normalizes `\r\n -> \n` only, leaving literal `\n` escapes intact.
+- **Raw Immutability:** Parsed `step` objects are NEVER mutated. All derived state uses `WeakMap`s (`stepErrCache`, `stepSearchBlobCache`, `stepModelMap`, `rawStepMap`, `notchItemMap`, `toolArgsReplaceRowMap`, `cardOverflowChecksMap`, `_vElToItemMap`). `{ }` and `Shift + Right-Click` show verbatim disk JSON.
+- **Model Tracking (`updateStepModels` & `stepModelMap`):** Scans `<USER_SETTINGS_CHANGE>` envelopes (never prose `<USER_REQUEST>`) in chronological order for `The user changed setting \`Model Selection\` from ... to <Model>.`, tracks live model switches dynamically (including incremental SSE batches), and renders a `.meta-chip-model` badge (`🤖 <Model>`) on every `PLANNER_RESPONSE` header.
+- **User Prompt Envelope, `SYSTEM_MESSAGE` & Deep Links:**
+  - `parseUserInputEnvelope()` extracts `<USER_REQUEST>` via EOF-validated suffix matching and surfaces `<ADDITIONAL_METADATA>` / `<USER_SETTINGS_CHANGE>` / unknown `<TAG>` badges (`extractTopLevelXmlTags()`). `unescapeNewlines()` normalizes `\r\n -> \n` only, leaving literal `\n` escapes intact.
+  - `SYSTEM_MESSAGE` cards render in clean monospace (`.system-msg-body` via `renderSystemMessageBody()`). `formatPairedSystemTagsInHtml()` uses LIFO stack matching outside `<pre>`/`<code>` so only paired `<SYSTEM_MESSAGE>...</SYSTEM_MESSAGE>` blocks receive `.xml-tag-badge.xml-tag-system`, leaving unpaired prose mentions as plain text.
+  - Clicking any `.step-num-chip` (`#N`) copies a canonical dual-purpose deep link (`#conv=<uuid>&step=<N>&project=<name>&file=<jsonl>`); `parseHashNavigation()` and the `hashchange` listener open that transcript (even in an already-open tab) and invoke `jumpToStep(N)`.
+- **TOC Wrapped Cache Grid (`.cache-strip` & `.toc-row`):** Renders all cached steps in a wrapping grid (`flex-wrap: wrap`) of `14×14px` `.cache-bar` squares with fast `data-tip-delay="80"` hover previews (first message line + timestamp + cache stats). Clicking a square highlights/scrolls `.toc-wrap` to the corresponding `.toc-row.is-selected` (`tabindex="-1"`); hitting `Enter` or clicking the row jumps `#feedWrap` to the message.
 - **Gutters & `:has()` Avoidance:** `.code-gutter-row` and `.md-gutter-row` use `display: block` + `position: relative` + absolute `.code-gutter-num` / `.md-gutter-num` (zero per-line flex overhead). Cards with media get `.has-media` in JS; `:has()` is banned in CSS. Media scales cleanly to container width (`max-width: 100%; max-height: none;`) via `.feed-wrap { min-width: 0; overflow-anchor: none; }`.
 - **Single-Scrollbox Invariant:** `.arg-val-md`, `.generic-pre`, `.arg-val` inside outer `.tool-args` or `.read-scroll-box` unroll naturally (`max-height: none; overflow: visible`) so nested vertical scrollbars never occur. `edit_file` highlights `.arg-row-replacement` and scrolls `.tool-args` directly to `Replacement` via batched `applyInitialEditScrolls()`.
 - **Zero-DOM Minimap:** `renderPromptMinimap()` and `syncMinimapPositions()` compute `pct` purely from `_vItems` + `offsetY` with zero DOM queries; `updateActiveMinimapNotch()` binary-searches cached `_userNotchCoords` (`O(log N)`) and resyncs settled heights after `750ms`. Hovering any notch removes the native `title` attribute from `#promptMinimap` (restoring it on empty track space) so browser tooltips never overlap `#minimapPreview`.
@@ -117,15 +124,19 @@ Modeled after TanStack Virtual / Virtuoso so 70,000+ step logs never blow up Chr
 4. **Native UX Conventions:** `thinking` and `tool_calls` `<details>` default to `open = true`; preserve native browser right-click menu; preserve colorblind text/symbol cues + tooltips on all color indicators; keep floating controls clear of the native scrollbar (`right: 54px`) and `#jumpTopBtn`/`#jumpBottomBtn` outside `#feedWrap` (`contain: content` clips `position: fixed`).
 5. **Virtual Scroller & Scroll Safety:** Never let `updateVSpacers()` collapse height to `0px` when `_vItems.length > 0`; never attach blocking `{ passive: false }` wheel listeners to `#feed` / `#feedWrap`; keep `overflow-anchor: none` on `.feed-wrap`; keep `#feedWrap`'s `ResizeObserver` width-only.
 6. **Documentation Separation:** Keep `README.md` and `README.ru.md` focused purely on user value and workflows; document all internal implementation mechanics here in `PROJECT_ARCHITECTURE.md`.
-7. **Privacy & Verification Gate (Zero-Tolerance):** Before every commit, scan ALL tracked and untracked files for secrets, `$env:USERNAME`, or local user paths (`git grep -n -i $env:USERNAME`, `git grep -n -i -F $env:USERPROFILE`, `git ls-files --others --exclude-standard`). Always trust disk tool output over memory and clean any match before committing.
+7. **Privacy & Verification Gate (Zero-Tolerance):** Never commit or publish secrets, `$env:USERNAME`, or local user paths (`C:\Users\...`, `E:\...`). Use the unified safe committer (`git_commit_safe.py` via `.commit_plan.json`) so syntax checks, tests, and full privacy scans run automatically before every commit.
 
 ## 6. Verification Checklist
-Run before committing:
+Standalone unit test suite (requires Node.js 18+, zero npm deps):
 ```powershell
-pwsh -c node --check static\app.js
-pwsh -c python -m compileall -q -x .venv .
-pwsh -c python server.py --check
-pwsh -c git grep -n -i $env:USERNAME
-pwsh -c git grep -n -i -F $env:USERPROFILE
-pwsh -c git ls-files --others --exclude-standard
+pwsh -c node tests\test_viewer_features.mjs
+```
+Tests extract real helpers directly from `static/app.js` and verify:
+- `formatPairedSystemTagsInHtml()` / `renderSystemMessageBody()` — paired `<SYSTEM_MESSAGE>` tag badging vs unpaired prose & inline `<code>` protection.
+- `updateStepModels()` / `extractModelNamesFromSettings()` — dynamic `Model Selection` tracking across `USER_SETTINGS_CHANGE` (dots in model names, multi-switch blocks, prose immunity, `None` resets).
+- `buildStepShareUrl()` / `parseHashNavigation()` — canonical `#conv=...&step=...&project=...&file=...` deep-link formatting and routing.
+
+For pre-commit checks + safe local commit, configure `.commit_plan.json` with custom `"checks"` (`["python", "server.py", "--check"]` and `["node", "tests/test_viewer_features.mjs"]`) and run:
+```powershell
+pwsh -c python $env:USERPROFILE\.gemini\config\skills\local-git-github-gh\scripts\git_commit_safe.py
 ```

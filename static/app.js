@@ -36,6 +36,7 @@
       open_file_os: true,
     },
     brainDir: "",
+    activeLogPath: "",
     projectRoot: "",
     projectFiles: [],
     projectDirs: new Set(),
@@ -105,6 +106,7 @@
   };
 
   const rawStepMap = new WeakMap();
+  const stepModelMap = new WeakMap();
   const notchItemMap = new WeakMap();
   const mdFenceBlocksMap = new WeakMap();
   const stepErrCache = new WeakMap();
@@ -113,6 +115,8 @@
   const _vElToItemMap = new WeakMap();
   const cardOverflowChecksMap = new WeakMap();
   let stepSearchBlobCache = new WeakMap();
+  let _lastDetectedModel = "";
+  let _suppressHashChange = false;
   const _vStepToItemMap = new Map();  // String(step_index) -> vItem (including attached GENERICs)
   const userNotchByStep = new Map();      // String(step_index) -> minimap notch
   const _lruMap = new Map();              // LRU of vItems holding offscreen rendered DOM nodes
@@ -1430,7 +1434,75 @@
     }
 
     // Restore any inline code-block placeholders if needed
-    return out.join("").replace(/\u0000CB(\d+)\u0000/g, (_, idx) => codeBlocks[Number(idx)]);
+    const finalHtml = out.join("").replace(/\u0000CB(\d+)\u0000/g, (_, idx) => codeBlocks[Number(idx)]);
+    return formatPairedSystemTagsInHtml(finalHtml);
+  }
+
+  function formatPairedSystemTagsInHtml(html) {
+    if (!html || !html.includes("SYSTEM_MESSAGE")) return html;
+    // Protect <pre>...</pre> and <code>...</code> blocks so code snippets never get badged
+    const saved = [];
+    const masked = html.replace(/<(pre|code)\b[^>]*>[\s\S]*?<\/\1>/gi, (m) => {
+      const idx = saved.length;
+      saved.push(m);
+      return `\u0000ST${idx}\u0000`;
+    });
+    if (!masked.includes("SYSTEM_MESSAGE")) return html;
+
+    const re = /&lt;(\/?)SYSTEM_MESSAGE&gt;/g;
+    const tokens = [];
+    let m;
+    while ((m = re.exec(masked)) !== null) {
+      tokens.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        isClose: m[1] === "/",
+        raw: m[0],
+        paired: false,
+      });
+    }
+    if (tokens.length < 2) return html;
+
+    // LIFO stack matching ensures a stray prose mention (e.g. "The following is a <SYSTEM_MESSAGE> not...")
+    // stays plain text while the real <SYSTEM_MESSAGE> ... </SYSTEM_MESSAGE> pair matches together.
+    const stack = [];
+    for (let k = 0; k < tokens.length; k++) {
+      if (!tokens[k].isClose) {
+        stack.push(k);
+      } else if (stack.length > 0) {
+        const openIdx = stack.pop();
+        tokens[openIdx].paired = true;
+        tokens[k].paired = true;
+      }
+    }
+
+    let anyPaired = false;
+    for (const t of tokens) {
+      if (t.paired) {
+        anyPaired = true;
+        break;
+      }
+    }
+    if (!anyPaired) return html;
+
+    const parts = [];
+    let pos = 0;
+    for (const t of tokens) {
+      if (t.start > pos) parts.push(masked.slice(pos, t.start));
+      if (t.paired) {
+        parts.push(`<span class="xml-tag-badge xml-tag-system">${t.raw}</span>`);
+      } else {
+        parts.push(t.raw);
+      }
+      pos = t.end;
+    }
+    if (pos < masked.length) parts.push(masked.slice(pos));
+    return parts.join("").replace(/\u0000ST(\d+)\u0000/g, (_, idx) => saved[Number(idx)]);
+  }
+
+  function renderSystemMessageBody(rawText) {
+    const escaped = escHtml(String(rawText || ""));
+    return formatPairedSystemTagsInHtml(escaped);
   }
 
   // ---------- Step Parsing & Card Creation ----------
@@ -1868,7 +1940,7 @@
         if (!node.nodeValue || node.nodeValue.length < 3) return NodeFilter.FILTER_REJECT;
         const p = node.parentElement;
         if (!p) return NodeFilter.FILTER_REJECT;
-        if (p.closest("a, button, script, style, textarea, input, select, .badge, .step-num-chip, .meta-chip, .status-pill, .tok-bar, .code-gutter-num, .md-gutter-num, .compaction-num, .tool-ok-badge, .tool-err-badge, .cmd-prefix, .copy-bar, .tool-name, .arg-key")) {
+        if (p.closest("a, button, script, style, textarea, input, select, .badge, .xml-tag-badge, .step-num-chip, .meta-chip, .status-pill, .tok-bar, .code-gutter-num, .md-gutter-num, .compaction-num, .tool-ok-badge, .tool-err-badge, .cmd-prefix, .copy-bar, .tool-name, .arg-key")) {
           return NodeFilter.FILTER_REJECT;
         }
         return NodeFilter.FILTER_ACCEPT;
@@ -2572,6 +2644,75 @@
     return results;
   }
 
+  function extractModelNamesFromSettings(settingsText) {
+    if (!settingsText) return null;
+    const clean = unescapeNewlines(settingsText);
+    const re = /The user changed setting\s+`Model Selection`\s+from\s+[\s\S]*?\s+to\s+(.+?)\.(?=\s*(?:No need to comment|The user changed setting|\r?\n|$))/gi;
+    let last = null;
+    let m;
+    while ((m = re.exec(clean)) !== null) {
+      const val = m[1].trim();
+      if (!val || val.toLowerCase() === "none") last = "";
+      else last = val;
+    }
+    return last;
+  }
+
+  function getSettingsChangeText(step) {
+    if (!step || !step.content) return "";
+    const env = parseUserInputEnvelope(step.content);
+    if (env.settings) return env.settings;
+    if (env.req === String(step.content || "")) {
+      const m = extractTopLevelXmlTags(step.content, null).find((t) => t.tag === "USER_SETTINGS_CHANGE");
+      return m ? m.body : "";
+    }
+    return "";
+  }
+
+  function updateStepModels(stepsList, reset = false) {
+    if (reset) _lastDetectedModel = "";
+    if (!Array.isArray(stepsList)) return;
+    for (const s of stepsList) {
+      if (!s) continue;
+      if (s.type === "USER_INPUT" && s.content) {
+        const settingsTxt = getSettingsChangeText(s);
+        if (settingsTxt) {
+          const foundModel = extractModelNamesFromSettings(settingsTxt);
+          if (foundModel !== null) {
+            _lastDetectedModel = foundModel;
+          }
+        }
+      } else if (s.type === "PLANNER_RESPONSE") {
+        if (_lastDetectedModel) stepModelMap.set(s, _lastDetectedModel);
+        else stepModelMap.delete(s);
+      }
+    }
+  }
+
+  function parseHashNavigation(rawHash = window.location.hash) {
+    const clean = String(rawHash || "").replace(/^#/, "");
+    if (!clean) return { convId: "", targetStep: "" };
+    const params = new URLSearchParams(clean);
+    return {
+      convId: params.get("conv") || "",
+      targetStep: params.get("step") || "",
+    };
+  }
+
+  function buildStepShareUrl(stepIndex) {
+    const convId = state.activeId || "";
+    const stepStr = String(stepIndex ?? "");
+    const proj = state.activeMeta?.project || "";
+    const logPath = state.activeLogPath || state.activeMeta?.path || "";
+    const logFile = (logPath ? String(logPath).split(/[/\\]/).pop() : "") || "transcript_full.jsonl";
+    const qs = new URLSearchParams();
+    if (convId) qs.set("conv", convId);
+    if (stepStr !== "") qs.set("step", stepStr);
+    if (proj) qs.set("project", proj);
+    if (logFile) qs.set("file", logFile);
+    return `${window.location.origin}/#${qs.toString()}`;
+  }
+
   function formatUnknownValPreview(val) {
     if (val === null) return "null";
     if (val === undefined) return "undefined";
@@ -2686,6 +2827,7 @@
       step.source || "",
       fmtStepTime(step.created_at),
       fmtFullDateTime(step.created_at),
+      stepModelMap.get(step) || "",
       unescapeNewlines(step.content || ""),
       unescapeNewlines(step.thinking || ""),
       unescapeNewlines(step.error || ""),
@@ -2827,6 +2969,9 @@
       `Отображается локальное время (${tzSourceNote}).\nВ JSONL хранится в формате ISO 8601 UTC.` +
       (tsUserLocalRaw ? `\nВ метаданных шага: The current local time is: ${tsUserLocalRaw}` : "");
 
+    const activeModel = step.type === "PLANNER_RESPONSE" ? (stepModelMap.get(step) || "") : "";
+    const shareStepUrl = buildStepShareUrl(step.step_index);
+
     let headHtml = `
       <span class="badge badge-${escHtml(step.type)}${isFinalPlanner ? " is-final" : ""}" ${makeTipAttrs(
         `type: ${step.type}${isFinalPlanner ? " (финальный ответ)" : ""}`,
@@ -2836,11 +2981,17 @@
         `"type": ${JSON.stringify(step.type)}`
       )}>${escHtml(step.type)}</span>
 
-      <span class="step-num-chip" ${makeTipAttrs(
-        "step_index (номер шага)",
-        "Порядковый индекс шага в логе сессии. Могут быть пропуски при ретраях.",
-        `"step_index": ${JSON.stringify(step.step_index)}`
+      <span class="step-num-chip" data-copy-step="${escHtml(step.step_index)}" ${makeTipAttrs(
+        `step_index #${step.step_index} (клик — скопировать ссылку)`,
+        "Порядковый индекс шага в логе сессии. Клик копирует активную ссылку для браузера и ИИ.",
+        shareStepUrl
       )}>#${escHtml(step.step_index)}</span>
+
+      ${activeModel ? `<span class="meta-chip meta-chip-model" ${makeTipAttrs(
+        `Модель ИИ: ${activeModel}`,
+        "Текущая активная модель, отслеженная по метаданным Model Selection из USER_INPUT.",
+        `Model Selection: ${activeModel}`
+      )}>🤖 ${escHtml(activeModel)}</span>` : ""}
 
       <span class="meta-chip" ${makeTipAttrs(
         `source: ${step.source || "—"}`,
@@ -3194,10 +3345,10 @@
                 TYPE_DOCS.GENERIC,
                 `"type": "GENERIC"`
               )}>OUTPUT</span>
-              <span class="step-num-chip" ${makeTipAttrs(
-                "step_index ответа",
-                "Порядковый номер шага ответа инструмента в JSONL.",
-                `"step_index": ${outStep.step_index}`
+              <span class="step-num-chip" data-copy-step="${escHtml(outStep.step_index)}" ${makeTipAttrs(
+                `step_index ответа #${outStep.step_index} (клик — скопировать ссылку)`,
+                "Порядковый номер шага ответа инструмента в JSONL. Клик копирует активную ссылку для браузера и ИИ.",
+                buildStepShareUrl(outStep.step_index)
               )}>#${escHtml(outStep.step_index)}</span>
               <span class="meta-chip" ${makeTipAttrs(
                 `source: ${outStep.source}`,
@@ -3418,6 +3569,14 @@
             }, localRawBtn);
           });
           stepBody.appendChild(localRawBtn);
+        } else if (step.type === "SYSTEM_MESSAGE") {
+          const extraTags = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
+          if (extraTags.length > 0) prependUnknownTagChips(extraTags);
+
+          const sysDiv = document.createElement("div");
+          sysDiv.className = "system-msg-body";
+          sysDiv.innerHTML = renderSystemMessageBody(unescapeNewlines(step.content));
+          stepBody.appendChild(sysDiv);
         } else {
           const extraTags = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
           if (extraTags.length > 0) prependUnknownTagChips(extraTags);
@@ -4266,12 +4425,34 @@
         if (totIn > maxIn) maxIn = totIn;
 
         let snippetHtml = "";
+        let rawFirstLineSource = "";
+        if (s.type === "USER_INPUT") {
+          rawFirstLineSource = parseUserInputEnvelope(s.content || "").req || s.content || "";
+        } else if (s.type === "CHECKPOINT") {
+          rawFirstLineSource = s.content || "🟣 Compaction";
+        } else if (s.type === "PLANNER_RESPONSE") {
+          if (s.content) rawFirstLineSource = s.content;
+          else if (Array.isArray(s.tool_calls) && s.tool_calls.length > 0) {
+            const tc0 = s.tool_calls[0];
+            const sum0 = summarizeToolArgs(tc0.name, tc0.args || {}).text;
+            rawFirstLineSource = `🛠 ${s.tool_calls.map((t) => t.name).join(", ")}${sum0 ? ` — ${sum0}` : ""}`;
+          } else if (s.thinking) {
+            rawFirstLineSource = `💭 ${s.thinking}`;
+          }
+        } else {
+          rawFirstLineSource = s.content || s.error || s.type || "";
+        }
+        const firstNonEmpty = unescapeNewlines(rawFirstLineSource)
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => l.length > 0) || s.type || "";
+        const firstLine = firstNonEmpty.length > 140 ? `${firstNonEmpty.slice(0, 139)}…` : firstNonEmpty;
+
         if (state.stepQuery) {
           const att = attachedByPlanner ? (attachedByPlanner.get(s) || null) : null;
           snippetHtml = extractMatchSnippet(s, state.stepQuery, att);
         } else if (s.type === "USER_INPUT") {
-          const req = parseUserInputEnvelope(s.content || "").req || "";
-          snippetHtml = escHtml("👤 " + req.replace(/\s+/g, " ").trim().slice(0, 90));
+          snippetHtml = escHtml("👤 " + rawFirstLineSource.replace(/\s+/g, " ").trim().slice(0, 90));
         } else if (s.type === "CHECKPOINT") {
           snippetHtml = escHtml("🟣 Сжатие контекста (Compaction)");
         } else if (Array.isArray(s.tool_calls) && s.tool_calls.length > 0) {
@@ -4293,23 +4474,23 @@
           out,
           totIn,
           hitPct: totIn > 0 ? (cache / totIn) * 100 : 0,
+          firstLine,
           snippetHtml,
         });
       }
 
-      // Visual bar strip (for steps with tokens)
+      // Visual square grid strip (for steps with tokens; all visible wrapped rows without horizontal scroll)
       const tokEntries = entries.filter((e) => e.hasTok && e.totIn > 0);
       hasTokBars = tokEntries.length > 0;
       barsHtml = tokEntries
         .map((e) => {
           const lvl = getCacheLevel(e.hitPct, e.totIn);
-          const h = Math.max(20, Math.round((e.totIn / maxIn) * 100));
           const deltaStr = fmtDeltaSec(e.deltaSec);
-          return `<div class="cache-bar ${lvl.cls}" style="height:${h}%" data-jump="${escHtml(e.stepIndex)}" ${makeTipAttrs(
-            `Шаг #${e.stepIndex} (${e.time}) · Δt ${deltaStr}`,
-            `Кэш: ${e.hitPct.toFixed(1)}% (${fmtNum(e.cache)} из ${fmtNum(e.totIn)})\nКлик — перейти к шагу`,
+          return `<button type="button" class="cache-bar ${lvl.cls}" data-toc-step="${escHtml(e.stepIndex)}" data-tip-delay="80" ${makeTipAttrs(
+            `Шаг #${e.stepIndex} · ${e.time} (Δt ${deltaStr})`,
+            `${e.firstLine}\n\nКэш: ${e.hitPct.toFixed(1)}% (${fmtNum(e.cache)} из ${fmtNum(e.totIn)}) · Клик — выделить в оглавлении`,
             `in=${e.inp}, cache=${e.cache}, out=${e.out}`
-          )}></div>`;
+          )}></button>`;
         })
         .join("");
 
@@ -4327,7 +4508,7 @@
           }
           const rowCls = e.type === "USER_INPUT" ? "is-user" : (e.type === "CHECKPOINT" ? "is-checkpoint" : "");
           return `
-            <tr class="toc-row ${rowCls}" data-jump="${escHtml(e.stepIndex)}">
+            <tr class="toc-row ${rowCls}" tabindex="-1" data-jump="${escHtml(e.stepIndex)}">
               <td class="toc-mono">#${escHtml(e.stepIndex)}</td>
               <td class="toc-mono">${escHtml(e.time)}</td>
               <td class="toc-mono ${deltaCls}">${escHtml(deltaStr)}</td>
@@ -4377,7 +4558,7 @@
           </div>
         </summary>
         <div class="cache-formula">
-          Формула кэша: <code>cache_read_tokens / (input_tokens + cache_read_tokens) × 100%</code>. Клик по столбцу или строке — переход к шагу.
+          Формула кэша: <code>cache_read_tokens / (input_tokens + cache_read_tokens) × 100%</code>. Клик по квадрату — выделить в оглавлении; Enter или клик по строке — переход к сообщению.
         </div>
         ${hasTokBars ? `<div class="cache-strip">${barsHtml}</div>` : ""}
         <div class="toc-wrap">
@@ -4510,7 +4691,8 @@
       } catch (_) {}
     });
 
-    attachInnerScrollGuard(card.querySelector(".toc-wrap"), { scrollOnHover: true });
+    const tocWrap = card.querySelector(".toc-wrap");
+    attachInnerScrollGuard(tocWrap, { scrollOnHover: true });
     _tocDirty = false;
     const tocDet = card.querySelector(".cache-map-details");
     if (tocDet) {
@@ -4520,10 +4702,69 @@
         }
       });
     }
+
+    let selectedTocStep = null;
+    const selectTocStep = (stepKey, focusRow = false) => {
+      const keyStr = String(stepKey ?? "");
+      if (!keyStr) return;
+      selectedTocStep = keyStr;
+      card.querySelectorAll(".cache-bar.is-selected, .toc-row.is-selected").forEach((el) => {
+        el.classList.remove("is-selected");
+      });
+      const bar = card.querySelector(`.cache-bar[data-toc-step="${CSS.escape(keyStr)}"]`);
+      if (bar) bar.classList.add("is-selected");
+      const row = card.querySelector(`.toc-row[data-jump="${CSS.escape(keyStr)}"]`);
+      if (row) {
+        row.classList.add("is-selected");
+        if (tocWrap) {
+          const rowRect = row.getBoundingClientRect();
+          const wrapRect = tocWrap.getBoundingClientRect();
+          const targetTop = tocWrap.scrollTop + (rowRect.top - wrapRect.top) - Math.max(28, (tocWrap.clientHeight - rowRect.height) / 2);
+          tocWrap.scrollTop = Math.max(0, targetTop);
+        }
+        if (focusRow) {
+          row.focus({ preventScroll: true });
+        }
+      }
+    };
+
     card.addEventListener("click", (ev) => {
-      const target = ev.target.closest("[data-jump]");
-      if (!target) return;
-      jumpToStep(target.dataset.jump);
+      const bar = ev.target.closest(".cache-bar[data-toc-step]");
+      if (bar) {
+        selectTocStep(bar.dataset.tocStep, true);
+        return;
+      }
+      const row = ev.target.closest(".toc-row[data-jump]");
+      if (row) {
+        selectTocStep(row.dataset.jump, false);
+        jumpToStep(row.dataset.jump);
+      }
+    });
+
+    card.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        const rows = Array.from(card.querySelectorAll(".toc-row[data-jump]"));
+        if (!rows.length) return;
+        const curIdx = selectedTocStep ? rows.findIndex((r) => r.dataset.jump === selectedTocStep) : -1;
+        const nextIdx = ev.key === "ArrowDown"
+          ? Math.min(rows.length - 1, curIdx + 1)
+          : Math.max(0, (curIdx === -1 ? 0 : curIdx - 1));
+        ev.preventDefault();
+        selectTocStep(rows[nextIdx].dataset.jump, true);
+        return;
+      }
+      if (ev.key === "Enter") {
+        const active = document.activeElement;
+        if (active && (active.tagName === "INPUT" || active.tagName === "SELECT" || active.tagName === "SUMMARY")) return;
+        const rowTarget = ev.target.closest(".toc-row[data-jump]");
+        if (rowTarget) {
+          ev.preventDefault();
+          jumpToStep(rowTarget.dataset.jump);
+        } else if (selectedTocStep) {
+          ev.preventDefault();
+          jumpToStep(selectedTocStep);
+        }
+      }
     });
 
     // Place TOC & Cache Map at the TOP of the feed so it never blocks new messages
@@ -4860,6 +5101,7 @@
     for (const s of newSteps) {
       state.steps.push(s);
     }
+    updateStepModels(newSteps, false);
     _tocBaseCache = null;
     if (state.userTzSource !== "transcript" && newSteps.some((s) => s.type === "USER_INPUT")) {
       if (calibrateUserTimezone(state.steps)) {
@@ -5274,6 +5516,7 @@
           state.steps = payload.steps || [];
           state.offset = payload.offset || 0;
           calibrateUserTimezone(state.steps);
+          updateStepModels(state.steps, true);
           renderFullFeed();
           if (wasScrolledUp && anchorStepKey) {
             jumpToStep(anchorStepKey, { topOffset: 18 });
@@ -5302,8 +5545,9 @@
     };
   }
 
-  async function selectTranscript(convId) {
+  async function selectTranscript(convId, opts = {}) {
     if (!convId) return;
+    const targetStep = opts && opts.targetStep !== undefined && opts.targetStep !== null ? String(opts.targetStep) : "";
     closeStream();
     cancelVirtualTimers();
     clearVWindowDom();
@@ -5312,9 +5556,14 @@
     _vTotalHeight = 0;
     _vStepToItemMap.clear();
     state.activeId = convId;
-    state.userScrolledUp = false;
+    state.activeLogPath = "";
+    state.userScrolledUp = Boolean(targetStep);
     state.firstUnreadStepIndex = null;
-    window.location.hash = `conv=${encodeURIComponent(convId)}`;
+    _suppressHashChange = true;
+    window.location.hash = targetStep
+      ? `conv=${encodeURIComponent(convId)}&step=${encodeURIComponent(targetStep)}`
+      : `conv=${encodeURIComponent(convId)}`;
+    setTimeout(() => { _suppressHashChange = false; }, 0);
     renderTranscriptList();
 
     els.feed.innerHTML = `<div class="empty-hint">Загрузка транскрипта…</div>`;
@@ -5326,6 +5575,7 @@
       const data = await res.json();
       const meta = data.meta || {};
       state.activeMeta = meta;
+      state.activeLogPath = data.path || "";
       state.projectRoot = data.project_root || "";
       state.projectFiles = Array.isArray(data.project_files) ? data.project_files : [];
       state.projectDirs = new Set(
@@ -5337,12 +5587,25 @@
       state.steps = data.steps || [];
       state.offset = data.offset || 0;
       calibrateUserTimezone(state.steps);
+      updateStepModels(state.steps, true);
+
+      if (targetStep && state.activeId === convId) {
+        const canonicalHash = buildStepShareUrl(targetStep).split("#")[1];
+        if (canonicalHash) {
+          _suppressHashChange = true;
+          history.replaceState(null, "", `#${canonicalHash}`);
+          setTimeout(() => { _suppressHashChange = false; }, 0);
+        }
+      }
 
       els.convTitle.textContent = meta.title || convId;
       els.convMeta.textContent = `[${meta.project || "general"}] ${convId} · ${data.path || ""}`;
       linkifyElement(els.convMeta, { treatTranscriptAsFile: true });
 
       renderFullFeed();
+      if (targetStep) {
+        jumpToStep(targetStep, { topOffset: 18 });
+      }
       if (els.feedWrap) els.feedWrap.focus({ preventScroll: true });
       if (!els.cmdMapModal.classList.contains("hidden")) {
         renderCommandMapModal();
@@ -5992,6 +6255,27 @@
 
   // Event delegation for local file/folder/transcript links across feed + topbar meta, plus Copy buttons
   document.addEventListener("click", (e) => {
+    const stepChip = e.target.closest(".step-num-chip[data-copy-step]");
+    if (stepChip && els.feed.contains(stepChip)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const stepIdx = stepChip.dataset.copyStep;
+      const shareUrl = buildStepShareUrl(stepIdx);
+      const origText = stepChip.dataset.origLabel || stepChip.textContent;
+      stepChip.dataset.origLabel = origText;
+      navigator.clipboard?.writeText(shareUrl).then(() => {
+        stepChip.classList.add("copied");
+        stepChip.textContent = `✓ #${stepIdx}`;
+        clearTimeout(Number(stepChip.dataset.copyTimer || 0));
+        const tid = setTimeout(() => {
+          stepChip.classList.remove("copied");
+          stepChip.textContent = origText;
+        }, 1200);
+        stepChip.dataset.copyTimer = String(tid);
+      }).catch(() => {});
+      return;
+    }
+
     const link = e.target.closest("a.transcript-link, a.local-path-link");
     if (link && (els.feed.contains(link) || els.convMeta.contains(link))) {
       if (e.button === 0) {
@@ -6230,6 +6514,8 @@
       activeTipTarget = el;
       lastMouseX = e.clientX;
       lastMouseY = e.clientY;
+      const rawDelay = el.dataset.tipDelay;
+      const tipDelay = rawDelay !== undefined && rawDelay !== "" ? Math.max(0, Number(rawDelay)) : 1200;
 
       hoverTimer = setTimeout(() => {
         if (activeTipTarget !== el) return;
@@ -6243,7 +6529,7 @@
         isTooltipVisible = true;
         els.tooltip.classList.remove("hidden");
         positionTooltip(lastMouseX, lastMouseY);
-      }, 1200);
+      }, Number.isFinite(tipDelay) ? tipDelay : 1200);
     },
     { passive: true }
   );
@@ -6711,12 +6997,23 @@
     if (savedComposerHeight) els.promptInput.style.height = savedComposerHeight;
     await loadTranscriptList();
     checkAntigravityWindow();
-    const m = window.location.hash.match(/conv=([^&]+)/);
-    if (m) {
-      selectTranscript(decodeURIComponent(m[1]));
+    const initialNav = parseHashNavigation(window.location.hash);
+    if (initialNav.convId) {
+      selectTranscript(initialNav.convId, { targetStep: initialNav.targetStep });
     } else if (state.transcripts.length > 0) {
       selectTranscript(state.transcripts[0].id);
     }
+    window.addEventListener("hashchange", () => {
+      if (_suppressHashChange) return;
+      const nav = parseHashNavigation(window.location.hash);
+      if (!nav.convId) return;
+      if (nav.convId !== state.activeId) {
+        selectTranscript(nav.convId, { targetStep: nav.targetStep });
+      } else if (nav.targetStep) {
+        state.userScrolledUp = true;
+        jumpToStep(nav.targetStep, { topOffset: 18 });
+      }
+    });
     // Periodically refresh sidebar list (Antigravity window polling timer is managed by applyCapabilitiesUI)
     setInterval(loadTranscriptList, 4000);
   })();
