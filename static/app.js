@@ -2321,15 +2321,29 @@
         ? (curReadMode !== "full" && totalLines > SCROLL_CAP)
         : (!state.expandAllOutputs && totalLines > LIMIT_LINES);
 
+      const lineLimit = needFold ? (hasModeCtrl ? SCROLL_CAP : LIMIT_LINES) : Infinity;
+      let effectiveLimit = lineLimit;
+      if (needFold && state.stepQuery) {
+        const searchTerms = getPositiveSearchTerms(getCachedSearchAst(state.stepQuery));
+        if (searchTerms.length) {
+          const headStr = lineNumInfo.strippedLines.slice(0, lineLimit).join("\n").toLowerCase();
+          const tailStr = lineNumInfo.strippedLines.slice(lineLimit).join("\n").toLowerCase();
+          if (searchTerms.some((t) => tailStr.includes(t) && !headStr.includes(t))) {
+            effectiveLimit = Infinity;
+          }
+        }
+      }
+      const needFoldEffective = effectiveLimit < totalLines;
+
       let codeViewEl = renderCodeWithGutter(
         lineNumInfo.strippedLines,
         lineNumInfo.lineNums,
-        needFold ? LIMIT_LINES : Infinity
+        needFoldEffective ? effectiveLimit : Infinity
       );
       viewTarget.appendChild(codeViewEl);
 
       let foldBtn = null;
-      if (!hasModeCtrl && needFold) {
+      if (!hasModeCtrl && needFoldEffective) {
         foldBtn = document.createElement("button");
         foldBtn.type = "button";
         foldBtn.className = "show-more-btn";
@@ -2411,16 +2425,28 @@
       const needFold = hasModeCtrl
         ? (curReadMode !== "full" && totalLines > SCROLL_CAP)
         : (!state.expandAllOutputs && totalLines > LIMIT_LINES);
+      let effectiveLimit = needFold ? LIMIT_LINES : Infinity;
+      if (needFold && state.stepQuery) {
+        const searchTerms = getPositiveSearchTerms(getCachedSearchAst(state.stepQuery));
+        if (searchTerms.length) {
+          const headStr = allLines.slice(0, LIMIT_LINES).join("\n").toLowerCase();
+          const tailStr = allLines.slice(LIMIT_LINES).join("\n").toLowerCase();
+          if (searchTerms.some((t) => tailStr.includes(t) && !headStr.includes(t))) {
+            effectiveLimit = Infinity;
+          }
+        }
+      }
+      const needFoldEffective = effectiveLimit < totalLines;
 
       const pre = document.createElement("pre");
       pre.className = hasModeCtrl ? "generic-pre expanded" : "generic-pre inner-scroll";
       if (!hasModeCtrl) {
         attachInnerScrollGuard(pre);
       }
-      pre.textContent = needFold ? allLines.slice(0, LIMIT_LINES).join("\n") : bodyText;
+      pre.textContent = needFoldEffective ? allLines.slice(0, effectiveLimit).join("\n") : bodyText;
       viewTarget.appendChild(pre);
 
-      if (!hasModeCtrl && needFold) {
+      if (!hasModeCtrl && needFoldEffective) {
         const btn = document.createElement("button");
         btn.className = "show-more-btn";
         btn.type = "button";
@@ -3101,18 +3127,43 @@
 
   function estimateCardHeight(step, attachedOutputs = null) {
     if (!step) return 240;
+    const isFullMode = Boolean(state.expandAllOutputs || state.readDisplayMode === "full");
+    const isHideMode = state.readDisplayMode === "hide";
     let lines = 4;
-    if (step.thinking) lines += Math.min(40, Math.ceil(String(step.thinking).length / 80));
-    if (step.content) lines += Math.min(60, Math.ceil(String(step.content).length / 75));
-    if (Array.isArray(step.tool_calls)) lines += step.tool_calls.length * 8;
-    if (Array.isArray(step.media) && step.media.length > 0) lines += step.media.length * 16;
+    if (step.thinking) lines += Math.min(36, Math.ceil(String(step.thinking).length / 80));
+    if (step.content) {
+      if (step.type === "GENERIC" && !isFullMode) {
+        lines += isHideMode ? 4 : Math.min(18, Math.max(4, Math.ceil(String(step.content).length / 80)));
+      } else {
+        lines += Math.min(isFullMode ? 140 : 50, Math.ceil(String(step.content).length / 75));
+      }
+    }
+    if (Array.isArray(step.tool_calls)) {
+      for (const tc of step.tool_calls) {
+        lines += 4;
+        if (tc && tc.args && typeof tc.args === "object") {
+          const argLen = Object.values(tc.args).reduce((s, v) => s + (typeof v === "string" ? v.length : 32), 0);
+          lines += isFullMode
+            ? Math.min(120, Math.ceil(argLen / 75))
+            : Math.min(17, Math.ceil(argLen / 75));
+        }
+      }
+    }
+    if (Array.isArray(step.media) && step.media.length > 0) lines += step.media.length * 14;
     if (Array.isArray(attachedOutputs)) {
       for (const g of attachedOutputs) {
         const len = g && g.content ? String(g.content).length : 0;
-        lines += Math.min(120, Math.max(4, Math.ceil(len / 75)));
+        if (isFullMode) {
+          lines += Math.min(160, Math.max(4, Math.ceil(len / 75)));
+        } else if (isHideMode) {
+          lines += 3;
+        } else {
+          lines += Math.min(18, Math.max(4, Math.ceil(len / 80)));
+        }
       }
     }
-    return Math.max(120, Math.min(4200, lines * 20));
+    const maxCap = isFullMode ? 9000 : 3200;
+    return Math.max(120, Math.min(maxCap, lines * 20));
   }
 
   function estimateStepBytes(step, attachedOutputs = null) {
@@ -3190,19 +3241,44 @@
     if (!step) return "";
     const cached = stepSearchBlobCache.get(step);
     if (cached !== undefined) return cached;
+    const fmtN = typeof fmtNum === "function" ? fmtNum : (v) => String(v ?? 0);
+    const tsTime = fmtStepTime(step.created_at);
+    const tsFull = fmtFullDateTime(step.created_at);
+    const activeModel = step.type === "PLANNER_RESPONSE" ? (stepModelMap.get(step) || "") : "";
     const parts = [
       step.step_index,
       `#${step.step_index}`,
       step.type,
       step.status || "",
       step.source || "",
-      fmtStepTime(step.created_at),
-      fmtFullDateTime(step.created_at),
-      stepModelMap.get(step) || "",
-      unescapeNewlines(step.content || ""),
-      unescapeNewlines(step.thinking || ""),
-      unescapeNewlines(step.error || ""),
+      step.created_at || "",
+      tsTime,
+      tsFull,
+      activeModel,
+      activeModel ? `🤖 ${activeModel}` : "",
     ];
+
+    if (step.content) {
+      parts.push(`txt:${fmtN(step.content.length)}`, `txt:${step.content.length}`);
+      const cleanContent = unescapeNewlines(step.content);
+      parts.push(cleanContent);
+      if (typeof stripLineNumbers === "function") {
+        const lnInfo = stripLineNumbers(cleanContent);
+        if (lnInfo && lnInfo.hadNumbers && lnInfo.stripped) parts.push(lnInfo.stripped);
+      }
+      if (typeof extractTopLevelXmlTags === "function") {
+        const extra = extractTopLevelXmlTags(step.content, KNOWN_TOP_TAGS);
+        for (const t of extra) parts.push(`<${t.tag}>`, `🆕 <${t.tag}>`, unescapeNewlines(t.body || ""));
+      }
+    }
+    if (step.thinking) {
+      parts.push(`think:${fmtN(step.thinking.length)}`, `think:${step.thinking.length}`, `Thinking (${fmtN(step.thinking.length)} симв.)`);
+      parts.push(unescapeNewlines(step.thinking));
+    }
+    if (step.error) {
+      parts.push(unescapeNewlines(step.error));
+    }
+
     if (
       step.input_tokens !== undefined ||
       step.cache_read_tokens !== undefined ||
@@ -3213,22 +3289,90 @@
       const out = Number(step.output_tokens || 0);
       const tot = inp + cache;
       const pct = tot > 0 ? ((cache / tot) * 100).toFixed(1) : "0.0";
-      parts.push(`in: ${inp}`, `cache: ${cache}`, `out: ${out}`, `${pct}%`);
+      parts.push(
+        `in: ${inp}`, `in: ${fmtN(inp)}`,
+        `cache: ${cache}`, `cache: ${fmtN(cache)}`, `(${pct}%)`, `${pct}%`,
+        `out: ${out}`, `out: ${fmtN(out)}`
+      );
     }
+
+    // Dynamic task-link pills in card / tool / result headers
+    if (typeof stepTaskMetaMap !== "undefined" && stepTaskMetaMap.has(step)) {
+      const evs = stepTaskMetaMap.get(step) || [];
+      for (const ev of evs) {
+        if (ev.taskId) parts.push(ev.taskId);
+        if (ev.awaitedTaskId) parts.push(ev.awaitedTaskId);
+        if (typeof resolveTaskLinkDestination === "function") {
+          const d = resolveTaskLinkDestination(ev.taskId || ev.awaitedTaskId, step, ev.role);
+          if (d && d.label) parts.push(d.label);
+        }
+      }
+    }
+
+    // Unknown extra step keys rendered as 🆕 chips in header
+    const knownKeys = new Set([
+      "step_index", "source", "type", "status", "created_at",
+      "content", "thinking", "tool_calls", "media", "error",
+      "input_tokens", "cache_read_tokens", "output_tokens",
+    ]);
+    for (const k of Object.keys(step)) {
+      if (!knownKeys.has(k)) {
+        const preview = typeof formatUnknownValPreview === "function" ? formatUnknownValPreview(step[k]) : String(step[k]);
+        parts.push(`🆕 ${k}: ${preview}`, k);
+        try { parts.push(JSON.stringify(step[k])); } catch (_) {}
+      }
+    }
+
+    // Media URIs & MIME metadata + CHECKPOINT inline brain images
+    if (Array.isArray(step.media) && step.media.length > 0) {
+      parts.push(`media:${step.media.length}`);
+      for (const m of step.media) {
+        if (!m) continue;
+        if (m.uri) parts.push(m.uri);
+        if (m.mime_type) parts.push(m.mime_type);
+      }
+    }
+    if (step.type === "CHECKPOINT" && step.content && typeof extractInlineBrainImages === "function") {
+      for (const imgP of extractInlineBrainImages(step.content)) parts.push(imgP);
+    }
+
+    // GENERIC metadata chips + standalone caller tool metadata
     if (step.type === "GENERIC" && step.content) {
       const parsed = parseGenericOutput(step.content);
       parts.push("OUTPUT", parsed.chips.map((c) => c.label).join(" "));
+      if (parsed.body && typeof stripLineNumbers === "function") {
+        const bln = stripLineNumbers(parsed.body);
+        if (bln && bln.hadNumbers && bln.stripped) parts.push(bln.stripped);
+      }
+      if (typeof stepToolMetaMap !== "undefined") {
+        const tm = stepToolMetaMap.get(step);
+        if (tm) {
+          if (tm.toolName) parts.push(tm.toolName);
+          if (tm.toolArgs && typeof summarizeToolArgs === "function") {
+            const sumInfo = summarizeToolArgs(tm.toolName, tm.toolArgs);
+            if (sumInfo.text) parts.push(sumInfo.text);
+          }
+        }
+      }
     }
-    if (Array.isArray(step.tool_calls)) {
+
+    // Tool calls, count chip, summaries, and all args
+    if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+      parts.push(`tools:${step.tool_calls.length}`, `Tool Calls (${step.tool_calls.length})`);
       for (const tc of step.tool_calls) {
         parts.push(tc.name || "");
         if (tc.args && typeof tc.args === "object") {
+          if (typeof summarizeToolArgs === "function") {
+            const sumInfo = summarizeToolArgs(tc.name, tc.args);
+            if (sumInfo.text) parts.push(sumInfo.text);
+          }
           for (const [ak, av] of Object.entries(tc.args)) {
             parts.push(ak, typeof av === "string" ? unescapeNewlines(av) : JSON.stringify(av));
           }
         }
       }
     }
+
     const blob = parts.join(" ").toLowerCase();
     stepSearchBlobCache.set(step, blob);
     return blob;
@@ -3268,11 +3412,6 @@
         i++;
         continue;
       }
-      if (raw[i] === "-" && (raw[i + 1] === '"' || raw[i + 1] === "(")) {
-        tokens.push({ type: "NOT" });
-        i++;
-        continue;
-      }
       if (raw[i] === '"') {
         i++;
         let buf = "";
@@ -3303,10 +3442,6 @@
         tokens.push({ type: "AND" });
       } else if (w === "NOT") {
         tokens.push({ type: "NOT" });
-      } else if (w.startsWith("-") && w.length > 1) {
-        const inner = w.slice(1);
-        tokens.push({ type: "NOT" });
-        tokens.push({ type: "TERM", text: inner, lower: inner.toLowerCase(), quoted: false });
       } else {
         tokens.push({ type: "TERM", text: w, lower: w.toLowerCase(), quoted: false });
       }
@@ -4511,7 +4646,7 @@
               fw.scrollTop = Math.max(0, fw.scrollTop + scrollAdjust);
               _lastScrollFrameTop = fw.scrollTop;
             }
-            scheduleMinimapSettledSync();
+            scheduleMinimapSync();
           }
         })
       : null;
@@ -4950,7 +5085,17 @@
       step.type === "GENERIC" && step.content
         ? parseGenericOutput(step.content).chips.map((c) => c.label).join(" ")
         : "";
-    const metaLabel = `#${step.step_index} ${step.type || ""} ${step.status || ""} ${step.source || ""} ${fmtStepTime(step.created_at)} ${selfChips} ${attachedChips}`;
+    const taskEvs = typeof stepTaskMetaMap !== "undefined" ? (stepTaskMetaMap.get(step) || []) : [];
+    const taskLabels = taskEvs
+      .map((ev) => {
+        const d = typeof resolveTaskLinkDestination === "function"
+          ? resolveTaskLinkDestination(ev.taskId || ev.awaitedTaskId, step, ev.role)
+          : null;
+        return [ev.taskId || "", ev.awaitedTaskId || "", d ? d.label : ""].join(" ");
+      })
+      .join(" ");
+    const modelLbl = stepModelMap.get(step) ? `🤖 ${stepModelMap.get(step)}` : "";
+    const metaLabel = `#${step.step_index} ${step.type || ""} ${step.status || ""} ${step.source || ""} ${fmtStepTime(step.created_at)} ${modelLbl} ${taskLabels} ${selfChips} ${attachedChips}`;
     const sources = [
       ["content", step.content || ""],
       ["thinking", step.thinking || ""],
@@ -4960,6 +5105,22 @@
       ["meta", metaLabel],
     ];
     if (terms.length > 0) {
+      const renderSliceHtml = (label, clean, idx, termLen) => {
+        const start = Math.max(0, idx - 34);
+        const end = Math.min(clean.length, idx + termLen + 48);
+        const prefix = start > 0 ? "…" : "";
+        const suffix = end < clean.length ? "…" : "";
+        const before = escHtml(clean.slice(start, idx));
+        const match = escHtml(clean.slice(idx, idx + termLen));
+        const after = escHtml(clean.slice(idx + termLen, end));
+        const tag = label === "content" ? "" : `[${label}] `;
+        return {
+          html: `${escHtml(tag)}${prefix}${before}<mark class="hl">${match}</mark>${after}${suffix}`,
+          windowLower: clean.slice(start, end).toLowerCase(),
+        };
+      };
+
+      let firstSnip = null;
       for (const [label, raw] of sources) {
         if (!raw) continue;
         const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
@@ -4974,16 +5135,24 @@
           }
         }
         if (bestIdx !== -1) {
-          const start = Math.max(0, bestIdx - 36);
-          const end = Math.min(clean.length, bestIdx + bestTerm.length + 54);
-          const prefix = start > 0 ? "…" : "";
-          const suffix = end < clean.length ? "…" : "";
-          const before = escHtml(clean.slice(start, bestIdx));
-          const match = escHtml(clean.slice(bestIdx, bestIdx + bestTerm.length));
-          const after = escHtml(clean.slice(bestIdx + bestTerm.length, end));
-          const tag = label === "content" ? "" : `[${label}] `;
-          return `${escHtml(tag)}${prefix}${before}<mark class="hl">${match}</mark>${after}${suffix}`;
+          firstSnip = renderSliceHtml(label, clean, bestIdx, bestTerm.length);
+          break;
         }
+      }
+      if (firstSnip) {
+        const missingTerm = terms.find((t) => !firstSnip.windowLower.includes(t));
+        if (missingTerm) {
+          for (const [label, raw] of sources) {
+            if (!raw) continue;
+            const clean = unescapeNewlines(raw).replace(/\s+/g, " ").trim();
+            const idx = clean.toLowerCase().indexOf(missingTerm);
+            if (idx !== -1) {
+              const secondSnip = renderSliceHtml(label, clean, idx, missingTerm.length);
+              return `${firstSnip.html} <span style="opacity:.6">·</span> ${secondSnip.html}`;
+            }
+          }
+        }
+        return firstSnip.html;
       }
     }
     const fallbackSrc = unescapeNewlines(step.content || step.thinking || step.error || "").replace(/\s+/g, " ").trim();
@@ -5572,6 +5741,8 @@
     const HIT_BLOCK_SEL = [
       ".arg-row",
       ".tool-head",
+      ".tool-result-head",
+      "details > summary",
       ".tool-result",
       ".tool-card",
       ".code-gutter-row",
@@ -6061,7 +6232,12 @@
     if (touchedEarlierSteps.size > 0) {
       for (const sk of touchedEarlierSteps) {
         const oldIt = _vStepToItemMap.get(sk);
-        if (!oldIt || oldIt.idx >= dirtyFromIdx) continue;
+        if (!oldIt) continue;
+        stepSearchBlobCache.delete(oldIt.step);
+        if (Array.isArray(oldIt.attached)) {
+          for (const g of oldIt.attached) stepSearchBlobCache.delete(g);
+        }
+        if (oldIt.idx >= dirtyFromIdx) continue;
         _lruMap.delete(oldIt);
         if (oldIt.el) {
           if (vResizeObserver) vResizeObserver.unobserve(oldIt.el);
@@ -6602,7 +6778,7 @@
   function syncMinimapPositions(totalHOverride = 0) {
     if (!els.promptMinimap) return;
     const baseTop = getVListBaseTop();
-    const totalH = Math.max(1, totalHOverride || (els.feedWrap ? els.feedWrap.scrollHeight : 0) || (baseTop + _vTotalHeight + 48));
+    const totalH = Math.max(1, totalHOverride || baseTop + _vTotalHeight + 60);
     const allNotches = els.promptMinimap.children;
     const updates = [];
     const nextUserCoords = [];
@@ -6737,7 +6913,7 @@
     _lastActiveUserNotch = null;
 
     const baseTop = getVListBaseTop();
-    const totalH = Math.max(1, (els.feedWrap ? els.feedWrap.scrollHeight : 0) || (baseTop + _vTotalHeight + 48));
+    const totalH = Math.max(1, baseTop + _vTotalHeight + 60);
     _lastMinimapTotalH = totalH;
     const nextUserCoords = [];
     const frag = document.createDocumentFragment();
@@ -6847,7 +7023,7 @@
         const qNotch = document.createElement("button");
         qNotch.type = "button";
         qNotch.className = "minimap-notch-search";
-        qNotch.textContent = "🔎";
+        qNotch.setAttribute("aria-label", `Поиск · Шаг #${stepIdx}`);
         qNotch.style.top = `${pct.toFixed(2)}%`;
         qNotch.dataset.jump = stepIdx;
         qNotch.dataset.meta = `🔎 Совпадение · Шаг #${stepIdx}${st.created_at ? " · " + fmtStepTime(st.created_at) : ""}`;

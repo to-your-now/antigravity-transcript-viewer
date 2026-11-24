@@ -20,6 +20,7 @@ const helpersCode = [
   `const escHtml = (s) => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");`,
   `const unescapeNewlines = (s) => String(s || "").replace(/\\r\\n/g, "\\n");`,
   `const KNOWN_USER_TAGS = new Set(["USER_REQUEST", "ADDITIONAL_METADATA", "USER_SETTINGS_CHANGE"]);`,
+  `const KNOWN_TOP_TAGS = new Set(["USER_REQUEST", "ADDITIONAL_METADATA", "USER_SETTINGS_CHANGE", "SUMMARY", "SYSTEM_MESSAGE"]);`,
   `const stepModelMap = new WeakMap();`,
   `let stepSearchBlobCache = new WeakMap();`,
   `let stepToolMetaMap = new WeakMap();`,
@@ -142,16 +143,41 @@ const attachedOutStep = {
 const turnBlob = api.getTurnSearchBlob(plannerStep, [attachedOutStep]);
 
 assert.equal(api.evalSearchAst(api.parseSearchQuery('"pwsh -c git diff"'), turnBlob), true, "Exact quoted command must match");
+assert.equal(api.evalSearchAst(api.parseSearchQuery("pwsh -c git diff"), turnBlob), true, "Unquoted CLI flags like -c must search literally, not act as NOT");
 assert.equal(api.evalSearchAst(api.parseSearchQuery('"git diff pwsh"'), turnBlob), false, "Wrong order inside quotes must NOT match");
 assert.equal(api.evalSearchAst(api.parseSearchQuery("diff server.py pwsh"), turnBlob), true, "Unordered multi-word AND must match across caller + output");
+assert.equal(
+  api.evalSearchAst(
+    api.parseSearchQuery("git diff"),
+    api.getTurnSearchBlob({ step_index: 99, type: "PLANNER_RESPONSE", content: "only git here" }, null)
+  ),
+  false,
+  "Space-separated terms without quotes require BOTH terms (AND), not OR"
+);
 assert.equal(api.evalSearchAst(api.parseSearchQuery("pytest OR compileall OR server.py"), turnBlob), true, "OR operator must match");
-assert.equal(api.evalSearchAst(api.parseSearchQuery('run_command -"exit: 1" -traceback'), turnBlob), true, "Negative phrase/word exclusion must pass when absent");
-assert.equal(api.evalSearchAst(api.parseSearchQuery('run_command -"exit: 0"'), turnBlob), false, "Negative quoted chip must exclude match");
+assert.equal(api.evalSearchAst(api.parseSearchQuery('run_command !"exit: 1" !traceback'), turnBlob), true, "Negative !phrase/word exclusion must pass when absent");
+assert.equal(api.evalSearchAst(api.parseSearchQuery('run_command !"exit: 0"'), turnBlob), false, "Negative !\"exit: 0\" must exclude match");
 assert.equal(api.evalSearchAst(api.parseSearchQuery("(pytest OR server.py) AND NOT checking"), turnBlob), false, "Grouped OR + NOT must exclude");
 assert.deepEqual(
-  api.getPositiveSearchTerms(api.parseSearchQuery('"pwsh -c git diff" server.py -traceback -"exit: 1"')),
+  api.getPositiveSearchTerms(api.parseSearchQuery('"pwsh -c git diff" server.py !traceback !"exit: 1" NOT error')),
   ["pwsh -c git diff", "server.py"]
 );
+
+// Dynamic visible badges/pills must be searchable too
+const metaStep = {
+  step_index: 500,
+  type: "PLANNER_RESPONSE",
+  status: "DONE",
+  source: "MODEL",
+  content: "Hello",
+  input_tokens: 100,
+  cache_read_tokens: 900,
+  output_tokens: 50,
+  custom_flag: "experimental_v2",
+};
+api.stepModelMap.set(metaStep, "Gemini 3.1 Pro");
+const metaBlob = api.getTurnSearchBlob(metaStep, null);
+assert.equal(api.evalSearchAst(api.parseSearchQuery('"Gemini 3.1 Pro" 90.0% txt:5 experimental_v2'), metaBlob), true, "All dynamic chips/badges must be searchable");
 
 // 7. Bidirectional background task lifecycle linking (#2612->#2614->#2615->#2616->#2617 and #2642..#2649)
 const tid1 = "a5608f81-e9d6-4f69-98be-9895d727b2e5/task-166";
