@@ -7366,12 +7366,14 @@
       return { visible: true, outerBox };
     };
 
-    const indexWithin = (root, sel, node) => {
-      if (!root || !node) return -1;
+    const findWithin = (root, sel, node) => {
+      if (!root || !node) return null;
       try {
-        return Array.from(root.querySelectorAll(sel)).indexOf(node);
+        const list = Array.from(root.querySelectorAll(sel));
+        const idx = list.findIndex((el) => el === node || el.contains(node));
+        return idx >= 0 ? { el: list[idx], idx } : null;
       } catch (_) {
-        return -1;
+        return null;
       }
     };
 
@@ -7386,65 +7388,81 @@
       if (resEl && card.contains(resEl)) {
         const resSelectors = [
           ".tool-result-head",
+          ".code-gutter-row",
+          ".md-gutter-row",
+          ".md li",
+          ".md tr",
+          ".md p",
+          ".md pre",
+          ".md > *",
           ".read-scroll-box",
           ".generic-pre",
           ".inline-raw-pre",
-          ".code-gutter-row",
-          ".md-gutter-row",
-          ".md > *",
           "pre",
           "p",
           "li",
         ];
         for (const sel of resSelectors) {
-          const hit = targetEl.closest(sel);
-          if (hit && resEl.contains(hit)) {
-            const idx = indexWithin(resEl, sel, hit);
-            if (idx >= 0) {
-              subAnchor = { scope: "res", sel, idx };
-              anchorEl = hit;
-              break;
-            }
+          const found = findWithin(resEl, sel, targetEl);
+          if (found) {
+            subAnchor = { scope: "res", sel, idx: found.idx };
+            anchorEl = found.el;
+            break;
           }
         }
       } else if (tcEl && card.contains(tcEl)) {
         const tcSelectors = [
           ":scope > .tool-head",
+          ".arg-row .diff-line",
+          ".arg-row .md li",
+          ".arg-row .md tr",
+          ".arg-row .md > *",
           ".arg-row",
           ".tool-args",
         ];
         for (const sel of tcSelectors) {
-          const hit = targetEl.closest(sel);
-          if (hit && tcEl.contains(hit)) {
-            const idx = indexWithin(tcEl, sel, hit);
-            if (idx >= 0) {
-              subAnchor = { scope: "tc", sel, idx };
-              anchorEl = hit;
-              break;
-            }
+          const found = findWithin(tcEl, sel, targetEl);
+          if (found) {
+            subAnchor = { scope: "tc", sel, idx: found.idx };
+            anchorEl = found.el;
+            break;
           }
         }
       } else {
         const cardSelectors = [
           ":scope > .step-head",
+          ":scope > .step-body > details.block-tools > summary",
+          ":scope > .step-body > details.block-tools",
+          ":scope > .step-body > details.block-thinking > .md li",
+          ":scope > .step-body > details.block-thinking > .md tr",
+          ":scope > .step-body > details.block-thinking > .md p",
+          ":scope > .step-body > details.block-thinking > .md pre",
           ":scope > .step-body > details.block-thinking > .md > *",
           ":scope > .step-body > details.block-thinking",
+          ":scope > .step-body > .md li",
+          ":scope > .step-body > .md tr",
+          ":scope > .step-body > .md p",
+          ":scope > .step-body > .md pre",
           ":scope > .step-body > .md > *",
           ":scope > .step-body > .md",
           ":scope > .step-body > .system-msg-body",
+          ":scope > .step-body > .generic-content-wrap .code-gutter-row",
+          ":scope > .step-body > .generic-content-wrap .md-gutter-row",
+          ":scope > .step-body > .generic-content-wrap .md li",
+          ":scope > .step-body > .generic-content-wrap .md tr",
+          ":scope > .step-body > .generic-content-wrap .md > *",
+          ":scope > .step-body > .generic-content-wrap .read-scroll-box",
+          ":scope > .step-body > .generic-content-wrap .generic-pre",
           ":scope > .step-body > .generic-content-wrap",
           ":scope > .step-body > details.block-meta",
           ":scope > .step-body > details.block-unknown-tag",
         ];
         for (const sel of cardSelectors) {
-          const hit = targetEl.closest(sel);
-          if (hit && card.contains(hit)) {
-            const idx = indexWithin(card, sel, hit);
-            if (idx >= 0) {
-              subAnchor = { scope: "card", sel, idx };
-              anchorEl = hit;
-              break;
-            }
+          const found = findWithin(card, sel, targetEl);
+          if (found) {
+            subAnchor = { scope: "card", sel, idx: found.idx };
+            anchorEl = found.el;
+            break;
           }
         }
       }
@@ -7459,27 +7477,6 @@
       };
     };
 
-    const pickVisibleInCard = (card, selectorList) => {
-      for (const sel of selectorList) {
-        const candidates = [];
-        for (const el of card.querySelectorAll(sel)) {
-          const r = el.getBoundingClientRect();
-          if (r.height <= 0 || r.bottom <= wrapRect.top + 6 || r.top >= wrapRect.bottom - 6) continue;
-          const st = getScrollBoxState(el, card);
-          if (!st.visible) continue;
-          const visEl = st.outerBox || el;
-          const vr = st.outerBox ? visEl.getBoundingClientRect() : r;
-          if (vr.height <= 0 || vr.bottom <= wrapRect.top + 6 || vr.top >= wrapRect.bottom - 6) continue;
-          candidates.push({ el: visEl, rect: vr });
-        }
-        if (candidates.length > 0) {
-          const inView = candidates.find(({ rect }) => rect.top >= wrapRect.top - 12);
-          return (inView || candidates[0]).el;
-        }
-      }
-      return null;
-    };
-
     if (_vWindow) {
       const cards = Array.from(_vWindow.children).filter(
         (el) => el.tagName === "ARTICLE" && el.dataset.isSkeleton !== "1" && el.dataset.stepIndex
@@ -7488,25 +7485,46 @@
         .map((card) => ({ card, rect: card.getBoundingClientRect() }))
         .filter(({ rect }) => rect.bottom > wrapRect.top + 8 && rect.top < wrapRect.bottom - 8);
 
+      const pickAcrossCards = (selectorList) => {
+        for (const sel of selectorList) {
+          const candidates = [];
+          for (const { card } of visibleCards) {
+            for (const el of card.querySelectorAll(sel)) {
+              const r = el.getBoundingClientRect();
+              if (r.height <= 0 || r.bottom <= wrapRect.top + 6 || r.top >= wrapRect.bottom - 6) continue;
+              const st = getScrollBoxState(el, card);
+              if (!st.visible) continue;
+              const visEl = st.outerBox || el;
+              const vr = st.outerBox ? visEl.getBoundingClientRect() : r;
+              if (vr.height <= 0 || vr.bottom <= wrapRect.top + 6 || vr.top >= wrapRect.bottom - 6) continue;
+              candidates.push({ card, el: visEl, rect: vr });
+            }
+          }
+          if (candidates.length > 0) {
+            const inView = candidates.find(({ rect }) => rect.top >= wrapRect.top - 12);
+            return inView || candidates[0];
+          }
+        }
+        return null;
+      };
+
       if (visibleCards.length > 0) {
-        // Prefer the most specific visible matched element inside the viewport
-        for (const { card } of visibleCards) {
-          const hitEl = pickVisibleInCard(card, [
-            "mark.hl",
-            ".search-hit-sub",
-            ".tool-result[data-step-index].search-hit-target, .tool-card.search-hit-target",
-            ".search-hit-target",
-          ]);
-          if (hitEl) return buildAnchorFromEl(card, hitEl);
-        }
+        // Prefer the most specific visible matched element across ALL visible cards before falling back to outer hit boxes
+        const hitPick = pickAcrossCards([
+          "mark.hl",
+          ".search-hit-sub",
+          ".tool-result[data-step-index].search-hit-target, .tool-card.search-hit-target",
+          ".search-hit-target",
+        ]);
+        if (hitPick) return buildAnchorFromEl(hitPick.card, hitPick.el);
+
         // Fallback: anchor to the topmost visible block (for negation-only search or scrolled long cards)
-        for (const { card } of visibleCards) {
-          const structEl = pickVisibleInCard(card, [
-            ".step-head, .tool-head, .tool-result-head, details.block-thinking > .md > *, .step-body > .md > *",
-            "details.block-thinking, .tool-result[data-step-index], .tool-card[data-tool-idx], .step-body > .md, .step-body > .system-msg-body, .step-body > .generic-content-wrap",
-          ]);
-          if (structEl) return buildAnchorFromEl(card, structEl);
-        }
+        const structPick = pickAcrossCards([
+          ".step-head, .tool-head, .tool-result-head, .code-gutter-row, .md-gutter-row, .arg-row, details.block-thinking > .md > *, .step-body > .md > *, .tool-result .md > *",
+          "details.block-thinking, .tool-result[data-step-index], .tool-card[data-tool-idx], .step-body > .md, .step-body > .system-msg-body, .step-body > .generic-content-wrap",
+        ]);
+        if (structPick) return buildAnchorFromEl(structPick.card, structPick.el);
+
         const chosen =
           visibleCards.find(({ rect }) => rect.top >= wrapRect.top - 10) ||
           visibleCards[0];

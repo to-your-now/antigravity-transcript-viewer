@@ -461,8 +461,205 @@ assert.ok(
   "renderFullFeed must invalidate previously measured trimmed card heights when clearing search"
 );
 assert.ok(
-  appJs.includes("subAnchor") && appJs.includes("pickVisibleInCard") && appJs.includes("skipWindowSync"),
-  "captureSearchContextAnchor and jumpToStep must track sub-block anchors and skip stale initial window mounts before jumping"
+  appJs.includes("subAnchor") && appJs.includes("pickAcrossCards") && appJs.includes("findWithin") && appJs.includes("skipWindowSync"),
+  "captureSearchContextAnchor and jumpToStep must track sub-block anchors via findWithin/pickAcrossCards without :scope closest bugs"
 );
+
+// 11. Functional simulation of captureSearchContextAnchor() under trimmed searchFocusedOnly mode
+function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bottom: 0, height: 0 }, scrollH = 0, clientH = 0 } = {}) {
+  const clsSet = new Set(cls);
+  const children = [];
+  const node = {
+    tagName: tag.toUpperCase(),
+    dataset: { ...dataset },
+    parentElement: null,
+    children,
+    scrollHeight: scrollH,
+    clientHeight: clientH,
+    classList: {
+      contains: (c) => clsSet.has(c),
+      add: (c) => clsSet.add(c),
+    },
+    getBoundingClientRect: () => ({ ...rect, left: 0, right: 800, width: 800 }),
+    append: (...kids) => {
+      for (const k of kids) {
+        k.parentElement = node;
+        children.push(k);
+      }
+      return node;
+    },
+    contains: (other) => {
+      let cur = other;
+      while (cur) {
+        if (cur === node) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    },
+    matchesSimple(part) {
+      // Minimal matcher for tag, .class, [data-attr] and [data-attr="val"]
+      let rest = part.trim();
+      if (!rest) return false;
+      if (rest === "*") return true;
+      const tagM = rest.match(/^[a-zA-Z0-9]+/);
+      if (tagM) {
+        if (tagM[0].toUpperCase() !== node.tagName) return false;
+        rest = rest.slice(tagM[0].length);
+      }
+      while (rest.length) {
+        if (rest.startsWith(".")) {
+          const cm = rest.slice(1).match(/^[a-zA-Z0-9_-]+/);
+          if (!cm || !clsSet.has(cm[0])) return false;
+          rest = rest.slice(1 + cm[0].length);
+        } else if (rest.startsWith("[")) {
+          const am = rest.match(/^\[([a-zA-Z0-9-]+)(?:="([^"]*)")?\]/);
+          if (!am) return false;
+          const dsKey = am[1].replace(/^data-/, "").replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+          const val = node.dataset[dsKey];
+          if (val === undefined) return false;
+          if (am[2] !== undefined && String(val) !== am[2]) return false;
+          rest = rest.slice(am[0].length);
+        } else {
+          return false;
+        }
+      }
+      return true;
+    },
+    matchesChain(chain, scopeRoot) {
+      const tokens = chain.trim().split(/\s+/);
+      let idx = tokens.length - 1;
+      let cur = node;
+      while (idx >= 0) {
+        const tok = tokens[idx];
+        if (tok === ">") {
+          return false;
+        }
+        if (tok === ":scope") {
+          return cur === scopeRoot && idx === 0;
+        }
+        if (!cur || !cur.matchesSimple(tok)) return false;
+        idx--;
+        if (idx >= 0 && tokens[idx] === ">") {
+          idx--;
+          cur = cur.parentElement;
+        } else if (idx >= 0) {
+          // Descendant match
+          let anc = cur.parentElement;
+          const remChain = tokens.slice(0, idx + 1).join(" ");
+          while (anc) {
+            if (anc.matchesChain(remChain, scopeRoot)) return true;
+            if (anc === scopeRoot) break;
+            anc = anc.parentElement;
+          }
+          return false;
+        }
+      }
+      return true;
+    },
+    matches(sel, scopeRoot = null) {
+      return sel.split(",").some((part) => node.matchesChain(part, scopeRoot));
+    },
+    closest(sel) {
+      let cur = node;
+      while (cur) {
+        if (cur.matches(sel, node)) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    },
+    querySelectorAll(sel) {
+      const out = [];
+      const walk = (n) => {
+        for (const ch of n.children) {
+          if (ch.matches(sel, node)) out.push(ch);
+          walk(ch);
+        }
+      };
+      walk(node);
+      return out;
+    },
+  };
+  return node;
+}
+
+const makeAnchorRunner = (cards, items) => {
+  const vWin = makeMockNode({ tag: "DIV", cls: ["v-window"] }).append(...cards);
+  const feedWrap = makeMockNode({ tag: "DIV", cls: ["feed-wrap"], rect: { top: 50, bottom: 850, height: 800 } });
+  const captureFn = new Function(
+    "els",
+    "state",
+    "_vItems",
+    "_vWindow",
+    "getVListBaseTop",
+    "findVItemAtY",
+    `${sliceFunc(appJs, "captureSearchContextAnchor")}\nreturn captureSearchContextAnchor;`
+  )(
+    { feedWrap },
+    { steps: items.map((it) => it.step) },
+    items,
+    vWin,
+    () => 0,
+    () => 0
+  );
+  return captureFn();
+};
+
+{
+  // Case A: Peeking top card A (mark offscreen at -100, only .search-hit-target tail at 60) + Card B with visible mark in .step-body > .md > p
+  const cardA = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1260" }, rect: { top: -200, bottom: 68, height: 268 } });
+  const tcA = makeMockNode({ tag: "DIV", cls: ["tool-card", "search-hit-target"], dataset: { toolIdx: "0" }, rect: { top: -180, bottom: 65, height: 245 } });
+  const markA = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: -120, bottom: -102, height: 18 } });
+  cardA.append(tcA.append(markA));
+
+  const cardB = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1267" }, rect: { top: 80, bottom: 320, height: 240 } });
+  const headB = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: 80, bottom: 116, height: 36 } });
+  const bodyB = makeMockNode({ tag: "DIV", cls: ["step-body"], rect: { top: 116, bottom: 320, height: 204 } });
+  const omittedThink = makeMockNode({ tag: "DETAILS", cls: ["block-thinking", "search-omitted"], rect: { top: 0, bottom: 0, height: 0 } });
+  const mdB = makeMockNode({ tag: "DIV", cls: ["md", "search-hit-target"], rect: { top: 120, bottom: 280, height: 160 } });
+  const pB = makeMockNode({ tag: "P", cls: ["search-hit-sub"], rect: { top: 140, bottom: 164, height: 24 } });
+  const markB = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: 142, bottom: 160, height: 18 } });
+  cardB.append(headB, bodyB.append(omittedThink, mdB.append(pB.append(markB))));
+
+  const anchorB = makeAnchorRunner([cardA, cardB], [{ step: {}, stepKey: "1260" }, { step: {}, stepKey: "1267" }]);
+  assert.equal(anchorB.stepIndex, "1267", "Visible mark.hl in card B must beat peeking .search-hit-target tail of card A");
+  assert.deepEqual(
+    anchorB.subAnchor,
+    { scope: "card", sel: ":scope > .step-body > .md p", idx: 0 },
+    "Match inside .md must capture :scope > .step-body > .md p subAnchor instead of collapsing to article.step"
+  );
+  assert.equal(anchorB.topInWrap, 140 - 50, "topInWrap must anchor the .md <p> offset relative to #feedWrap");
+
+  // Case B: Match inside .tool-card > .tool-head with omitted sibling tool-card above it
+  const cardC = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1270" }, rect: { top: 60, bottom: 260, height: 200 } });
+  const headC = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: 60, bottom: 96, height: 36 } });
+  const bodyC = makeMockNode({ tag: "DIV", cls: ["step-body"], rect: { top: 96, bottom: 260, height: 164 } });
+  const toolsDet = makeMockNode({ tag: "DETAILS", cls: ["block-tools"], rect: { top: 96, bottom: 260, height: 164 } });
+  const toolsBody = makeMockNode({ tag: "DIV", cls: ["block-body"], rect: { top: 120, bottom: 260, height: 140 } });
+  const tc0 = makeMockNode({ tag: "DIV", cls: ["tool-card", "search-omitted"], dataset: { toolIdx: "0" }, rect: { top: 0, bottom: 0, height: 0 } });
+  const tc1 = makeMockNode({ tag: "DIV", cls: ["tool-card", "search-hit-target"], dataset: { toolIdx: "1" }, rect: { top: 120, bottom: 240, height: 120 } });
+  const tc1Head = makeMockNode({ tag: "DIV", cls: ["tool-head", "search-hit-sub"], rect: { top: 120, bottom: 152, height: 32 } });
+  const markTc1 = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: 126, bottom: 144, height: 18 } });
+  cardC.append(headC, bodyC.append(toolsDet.append(toolsBody.append(tc0, tc1.append(tc1Head.append(markTc1))))));
+
+  const anchorC = makeAnchorRunner([cardC], [{ step: {}, stepKey: "1270" }]);
+  assert.equal(anchorC.toolIdx, "1");
+  assert.deepEqual(anchorC.subAnchor, { scope: "tc", sel: ":scope > .tool-head", idx: 0 });
+  assert.equal(anchorC.topInWrap, 120 - 50);
+
+  // Case C: Match inside expanded (non-overflowing) .read-scroll-box code line anchors exact .code-gutter-row
+  const cardD = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1280" }, rect: { top: -200, bottom: 700, height: 900 } });
+  const tcD = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "0" }, rect: { top: -150, bottom: 680, height: 830 } });
+  const resD = makeMockNode({ tag: "DIV", cls: ["tool-result"], dataset: { stepIndex: "1281" }, rect: { top: -120, bottom: 680, height: 800 } });
+  const boxD = makeMockNode({ tag: "DIV", cls: ["read-scroll-box", "is-full"], rect: { top: -90, bottom: 680, height: 770 }, scrollH: 770, clientH: 770 });
+  const row0 = makeMockNode({ tag: "DIV", cls: ["code-gutter-row"], rect: { top: -90, bottom: -70, height: 20 } });
+  const row1 = makeMockNode({ tag: "DIV", cls: ["code-gutter-row", "search-hit-sub"], rect: { top: 210, bottom: 230, height: 20 } });
+  const markD = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: 211, bottom: 229, height: 18 } });
+  cardD.append(tcD.append(resD.append(boxD.append(row0, row1.append(markD)))));
+
+  const anchorD = makeAnchorRunner([cardD], [{ step: {}, stepKey: "1280" }]);
+  assert.equal(anchorD.toolOutStep, "1281");
+  assert.deepEqual(anchorD.subAnchor, { scope: "res", sel: ".code-gutter-row", idx: 1 });
+  assert.equal(anchorD.topInWrap, 210 - 50);
+}
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");
