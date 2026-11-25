@@ -95,7 +95,14 @@
     composerForm: document.getElementById("composerForm"),
     promptInput: document.getElementById("promptInput"),
     composerStatus: document.getElementById("composerStatus"),
+    composerLogRow: document.getElementById("composerLogRow"),
+    toggleComposerTraceBtn: document.getElementById("toggleComposerTraceBtn"),
     composerSendBtn: document.getElementById("composerSendBtn"),
+    composerTraceBar: document.getElementById("composerTraceBar"),
+    composerTraceTitle: document.getElementById("composerTraceTitle"),
+    composerTracePre: document.getElementById("composerTracePre"),
+    copyComposerTraceBtn: document.getElementById("copyComposerTraceBtn"),
+    closeComposerTraceBtn: document.getElementById("closeComposerTraceBtn"),
     collapseHeaderBtn: document.getElementById("collapseHeaderBtn"),
     floatingTopBar: document.getElementById("floatingTopBar"),
     floatingSidebarBtn: document.getElementById("floatingSidebarBtn"),
@@ -4014,7 +4021,9 @@
       }
       for (let i = 0; i < attachedOutputs.length; i++) {
         if (!pairedOutIdxs.has(i) && attachedOutputs[i]) {
-          out.push(...getStepSearchUnits(attachedOutputs[i]));
+          for (const gU of getStepSearchUnits(attachedOutputs[i])) {
+            out.push({ ...gU, toolIdx: i });
+          }
         }
       }
       return out;
@@ -4024,6 +4033,35 @@
       units.push(...getStepSearchUnits(g));
     }
     return units;
+  }
+
+  function filterUnitsByCmdMapScope(units, scope) {
+    if (!scope || !scope.restricted) return units;
+    return units.filter((u) => {
+      if (u.kind === "header") return true;
+      if (u.kind === "tool") return u.toolIdx !== undefined && scope.allowedToolIdxs.has(u.toolIdx);
+      if (u.kind === "thinking") return scope.allowThinking;
+      if (u.kind === "content" || u.kind === "tag") return scope.allowFinalContent;
+      if (u.kind === "error") return scope.allowError;
+      if (u.kind === "generic") return u.toolIdx !== undefined && scope.allowedToolIdxs.has(u.toolIdx);
+      return false;
+    });
+  }
+
+  function getVisibleTurnSearchUnits(step, attachedOutputs = null) {
+    const units = getTurnSearchUnits(step, attachedOutputs);
+    const scope = getStepCmdMapScope(step, attachedOutputs);
+    return scope.restricted ? filterUnitsByCmdMapScope(units, scope) : units;
+  }
+
+  function getVisibleTurnSearchBlob(step, attachedOutputs = null) {
+    const scope = getStepCmdMapScope(step, attachedOutputs);
+    if (!scope.restricted) {
+      return getTurnSearchBlob(step, attachedOutputs);
+    }
+    const visUnits = filterUnitsByCmdMapScope(getTurnSearchUnits(step, attachedOutputs), scope);
+    const raw = visUnits.map((u) => u.raw).join(" ");
+    return { raw, lower: raw.toLowerCase() };
   }
 
   function getBgTaskResultOutcome(resultStep) {
@@ -4120,6 +4158,63 @@
     return matched;
   }
 
+  function getStepCmdMapScope(step, attachedOutputs = null) {
+    const keys = state.cmdMapKeys;
+    if (
+      !step ||
+      step.type !== "PLANNER_RESPONSE" ||
+      !state.cmdMapFilterOnly ||
+      !state.cmdMapFocusedOnly ||
+      !keys ||
+      keys.size === 0
+    ) {
+      return { restricted: false };
+    }
+    const resolvedAttached = attachedOutputs || stepPairedOutputsMap.get(step) || null;
+    const isFinalPlanner = Boolean(step.content && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0));
+    const allowedToolIdxs = new Set();
+    let matchedCount = 0;
+
+    if (Array.isArray(step.tool_calls)) {
+      step.tool_calls.forEach((tc, idx) => {
+        const out = resolvedAttached ? resolvedAttached[idx] : null;
+        if (doesToolCallMatchCmdKeys(step, tc, out, keys)) {
+          allowedToolIdxs.add(idx);
+          matchedCount++;
+        }
+      });
+    }
+
+    const allowThinking = Boolean(step.thinking) && keys.has("sub:thinking");
+    if (allowThinking) matchedCount++;
+
+    const allowFinalContent = isFinalPlanner && keys.has("sub:final");
+    if (allowFinalContent) matchedCount++;
+
+    const allowMedia = Array.isArray(step.media) && step.media.length > 0 && keys.has("sub:media");
+    if (allowMedia) matchedCount++;
+
+    const allowError = (step.status === "ERROR" || Boolean(step.error)) && keys.has("sub:errors");
+    if (Boolean(step.error) && allowError) matchedCount++;
+
+    // Keep full step unfiltered when only step-level filters (e.g., type:PLANNER_RESPONSE) matched
+    if (matchedCount === 0) {
+      return { restricted: false };
+    }
+
+    return {
+      restricted: true,
+      keys,
+      allowedToolIdxs,
+      allowThinking,
+      allowFinalContent,
+      allowMedia,
+      allowError,
+      isFinalPlanner,
+      resolvedAttached,
+    };
+  }
+
   function stepMatchesFilter(step, attachedOutputs = null) {
     if (state.filter === "dialog") {
       if (step.type === "GENERIC" || step.type === "SYSTEM_MESSAGE") return false;
@@ -4147,9 +4242,9 @@
       if (!ast) return true;
       const sOpts = getSearchOpts();
       if (sOpts.acrossWholeTurn) {
-        return evalSearchAst(ast, getTurnSearchBlob(step, attachedOutputs), sOpts);
+        return evalSearchAst(ast, getVisibleTurnSearchBlob(step, attachedOutputs), sOpts);
       }
-      const units = getTurnSearchUnits(step, attachedOutputs);
+      const units = getVisibleTurnSearchUnits(step, attachedOutputs);
       const hasPositives = getPositiveSearchTermObjs(ast).length > 0;
       if (hasPositives) {
         return units.some((u) => evalSearchAst(ast, u, sOpts));
@@ -4681,7 +4776,7 @@
     // Error
     if (step.error) {
       const errDiv = document.createElement("div");
-      errDiv.className = "md";
+      errDiv.className = "md step-error-box";
       errDiv.innerHTML = `<pre><code>${escHtml(unescapeNewlines(step.error))}</code></pre>`;
       stepBody.appendChild(errDiv);
     }
@@ -5052,10 +5147,10 @@
           cmdMatch = Boolean(step.thinking) && keys.has("sub:thinking");
         } else if (child.classList.contains("media-strip")) {
           cmdMatch = Array.isArray(step.media) && step.media.length > 0 && keys.has("sub:media");
+        } else if (child.classList.contains("step-error-box") || child.classList.contains("error-box")) {
+          cmdMatch = (step.status === "ERROR" || Boolean(step.error)) && keys.has("sub:errors");
         } else if (child.classList.contains("md")) {
           cmdMatch = isFinalPlanner && keys.has("sub:final");
-        } else if (child.classList.contains("error-box")) {
-          cmdMatch = (step.status === "ERROR" || Boolean(step.error)) && keys.has("sub:errors");
         }
         const searchOmitted = child.classList.contains("search-omitted");
         if (cmdMatch) {
@@ -6008,12 +6103,21 @@
     const ast = getCachedSearchAst(query);
     const termObjs = getPositiveSearchTermObjs(ast);
     const sOpts = getSearchOpts();
+    const cmdScope = getStepCmdMapScope(step, attachedOutputs);
     const attachedChips = Array.isArray(attachedOutputs)
-      ? attachedOutputs.flatMap((g) => (g.content ? parseGenericOutput(g.content).chips.map((c) => c.label) : [])).join(" ")
+      ? attachedOutputs
+          .map((g, idx) =>
+            !g || (cmdScope.restricted && !cmdScope.allowedToolIdxs.has(idx))
+              ? ""
+              : (g.content ? parseGenericOutput(g.content).chips.map((c) => c.label).join(" ") : "")
+          )
+          .filter(Boolean)
+          .join(" ")
       : "";
-    const attachedText = Array.isArray(attachedOutputs)
-      ? attachedOutputs.map((g) => `#${g.step_index} ${g.status || ""} ${g.error || ""} ${g.content || ""}`).join("\n")
-      : "";
+    const attachedText =
+      Array.isArray(attachedOutputs) && !cmdScope.restricted
+        ? attachedOutputs.map((g) => `#${g.step_index} ${g.status || ""} ${g.error || ""} ${g.content || ""}`).join("\n")
+        : "";
     const selfChips =
       step.type === "GENERIC" && step.content
         ? parseGenericOutput(step.content).chips.map((c) => c.label).join(" ")
@@ -6030,9 +6134,12 @@
     const modelLbl = stepModelMap.get(step) ? `🤖 ${stepModelMap.get(step)}` : "";
     const metaLabel = `#${step.step_index} ${step.type || ""} ${step.status || ""} ${step.source || ""} ${fmtStepTime(step.created_at)} ${modelLbl} ${taskLabels} ${selfChips} ${attachedChips}`;
     const sources = [];
-    if (step.content) sources.push(["content", step.content]);
+    if (step.content && (!cmdScope.restricted || cmdScope.allowFinalContent)) {
+      sources.push(["content", step.content]);
+    }
     if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
       step.tool_calls.forEach((tc, tcIdx) => {
+        if (cmdScope.restricted && !cmdScope.allowedToolIdxs.has(tcIdx)) return;
         const out = Array.isArray(attachedOutputs) ? attachedOutputs[tcIdx] : null;
         const outPart = out ? ` #${out.step_index} ${out.status || ""} ${out.error || ""} ${out.content || ""}` : "";
         sources.push([tc.name || "tool", `${tc.name || ""} ${formatToolArgsForSnippet(tc.args || {})}${outPart}`]);
@@ -6040,8 +6147,12 @@
     } else if (attachedText) {
       sources.push(["output", attachedText]);
     }
-    if (step.thinking) sources.push(["thinking", step.thinking]);
-    if (step.error) sources.push(["error", step.error]);
+    if (step.thinking && (!cmdScope.restricted || cmdScope.allowThinking)) {
+      sources.push(["thinking", step.thinking]);
+    }
+    if (step.error && (!cmdScope.restricted || cmdScope.allowError)) {
+      sources.push(["error", step.error]);
+    }
     sources.push(["meta", metaLabel]);
 
     if (termObjs.length > 0) {
@@ -6109,7 +6220,13 @@
         return firstSnip.html;
       }
     }
-    const fallbackSrc = unescapeNewlines(step.content || step.thinking || step.error || "").replace(/\s+/g, " ").trim();
+    const fallbackRaw = cmdScope.restricted
+      ? (cmdScope.allowFinalContent ? step.content : "") ||
+        (cmdScope.allowThinking ? step.thinking : "") ||
+        (cmdScope.allowError ? step.error : "") ||
+        ""
+      : step.content || step.thinking || step.error || "";
+    const fallbackSrc = unescapeNewlines(fallbackRaw).replace(/\s+/g, " ").trim();
     return escHtml(fallbackSrc ? `[${step.type}] #${step.step_index}: ${fallbackSrc.slice(0, 80)}` : `[${step.type}] #${step.step_index}`);
   }
 
@@ -6195,16 +6312,41 @@
 
         let snippetHtml = "";
         let rawFirstLineSource = "";
+        const att = attachedByPlanner ? (attachedByPlanner.get(s) || null) : null;
+        const rowCmdScope =
+          isFiltered && s.type === "PLANNER_RESPONSE" ? getStepCmdMapScope(s, att) : { restricted: false };
+        const visibleRowTools =
+          Array.isArray(s.tool_calls) && s.tool_calls.length > 0
+            ? (rowCmdScope.restricted
+                ? s.tool_calls.filter((_, tcIdx) => rowCmdScope.allowedToolIdxs.has(tcIdx))
+                : s.tool_calls)
+            : [];
+
         if (s.type === "USER_INPUT") {
           rawFirstLineSource = parseUserInputEnvelope(s.content || "").req || s.content || "";
         } else if (s.type === "CHECKPOINT") {
           rawFirstLineSource = s.content || "🟣 Compaction";
         } else if (s.type === "PLANNER_RESPONSE") {
-          if (s.content) rawFirstLineSource = s.content;
-          else if (Array.isArray(s.tool_calls) && s.tool_calls.length > 0) {
-            const tc0 = s.tool_calls[0];
+          if (rowCmdScope.restricted) {
+            if (visibleRowTools.length > 0) {
+              const tc0 = visibleRowTools[0];
+              const sum0 = summarizeToolArgs(tc0.name, tc0.args || {}).text;
+              rawFirstLineSource = `🛠 ${visibleRowTools.map((tc) => tc.name).join(", ")}${sum0 ? ` — ${sum0}` : ""}`;
+            } else if (rowCmdScope.allowFinalContent && s.content) {
+              rawFirstLineSource = s.content;
+            } else if (rowCmdScope.allowThinking && s.thinking) {
+              rawFirstLineSource = `💭 ${s.thinking}`;
+            } else if (rowCmdScope.allowError && s.error) {
+              rawFirstLineSource = s.error;
+            } else {
+              rawFirstLineSource = s.type;
+            }
+          } else if (s.content) {
+            rawFirstLineSource = s.content;
+          } else if (visibleRowTools.length > 0) {
+            const tc0 = visibleRowTools[0];
             const sum0 = summarizeToolArgs(tc0.name, tc0.args || {}).text;
-            rawFirstLineSource = `🛠 ${s.tool_calls.map((t) => t.name).join(", ")}${sum0 ? ` — ${sum0}` : ""}`;
+            rawFirstLineSource = `🛠 ${visibleRowTools.map((tc) => tc.name).join(", ")}${sum0 ? ` — ${sum0}` : ""}`;
           } else if (s.thinking) {
             rawFirstLineSource = `💭 ${s.thinking}`;
           }
@@ -6218,14 +6360,25 @@
         const firstLine = firstNonEmpty.length > 140 ? `${firstNonEmpty.slice(0, 139)}…` : firstNonEmpty;
 
         if (state.stepQuery) {
-          const att = attachedByPlanner ? (attachedByPlanner.get(s) || null) : null;
           snippetHtml = extractMatchSnippet(s, state.stepQuery, att);
         } else if (s.type === "USER_INPUT") {
           snippetHtml = escHtml("👤 " + rawFirstLineSource.replace(/\s+/g, " ").trim().slice(0, 90));
         } else if (s.type === "CHECKPOINT") {
           snippetHtml = escHtml(t("toc.compactionRow"));
+        } else if (rowCmdScope.restricted) {
+          if (visibleRowTools.length > 0) {
+            snippetHtml = escHtml("🛠 " + visibleRowTools.map((tc) => tc.name).join(", "));
+          } else if (rowCmdScope.allowFinalContent && s.content) {
+            snippetHtml = escHtml("💬 " + s.content.replace(/\s+/g, " ").trim().slice(0, 90));
+          } else if (rowCmdScope.allowThinking && s.thinking) {
+            snippetHtml = escHtml("💭 " + s.thinking.replace(/\s+/g, " ").trim().slice(0, 90));
+          } else if (rowCmdScope.allowError && s.error) {
+            snippetHtml = escHtml("⚠ " + s.error.replace(/\s+/g, " ").trim().slice(0, 90));
+          } else {
+            snippetHtml = escHtml(s.type);
+          }
         } else if (Array.isArray(s.tool_calls) && s.tool_calls.length > 0) {
-          snippetHtml = escHtml("🛠 " + s.tool_calls.map((t) => t.name).join(", "));
+          snippetHtml = escHtml("🛠 " + s.tool_calls.map((tc) => tc.name).join(", "));
         } else if (s.content) {
           snippetHtml = escHtml("💬 " + s.content.replace(/\s+/g, " ").trim().slice(0, 90));
         } else {
@@ -6587,6 +6740,38 @@
     const isStandaloneGeneric = isCard && rootEl.classList.contains("type-GENERIC");
     const stepHeadEl = isCard ? rootEl.querySelector(":scope > .step-head") : null;
     const stepBodyEl = isCard ? rootEl.querySelector(":scope > .step-body") : null;
+    const cardStep = isCard ? (rawStepMap.get(rootEl) || opts?.step || null) : null;
+    const cardAttached = isCard ? (cardAttachedMap.get(rootEl) || opts?.attachedOutputs || null) : null;
+    const cmdMapScope =
+      isCard && !isStandaloneGeneric ? getStepCmdMapScope(cardStep, cardAttached) : { restricted: false };
+
+    const isUnitScopeAllowedByCmdMap = (uEl) => {
+      if (!cmdMapScope || !cmdMapScope.restricted) return true;
+      if (!uEl || uEl === rootEl || uEl === stepHeadEl) return true;
+      if (uEl.classList.contains("tool-card")) {
+        const idx = Number(uEl.dataset.toolIdx);
+        return Number.isFinite(idx) && cmdMapScope.allowedToolIdxs.has(idx);
+      }
+      if (uEl.classList.contains("block-thinking")) {
+        return cmdMapScope.allowThinking;
+      }
+      if (uEl.matches("details.block-tools > summary") || uEl.classList.contains("block-tools")) {
+        return cmdMapScope.allowedToolIdxs.size > 0;
+      }
+      if (uEl.classList.contains("step-error-box") || uEl.classList.contains("error-box")) {
+        return cmdMapScope.allowError;
+      }
+      if (uEl.classList.contains("md")) {
+        return cmdMapScope.allowFinalContent;
+      }
+      if (uEl.classList.contains("media-strip")) {
+        return cmdMapScope.allowMedia;
+      }
+      if (uEl.classList.contains("block-unknown-tag")) {
+        return cmdMapScope.allowFinalContent;
+      }
+      return false;
+    };
 
     const BLOCK_TAGS = new Set([
       "ARTICLE", "SECTION", "DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6",
@@ -6697,6 +6882,7 @@
         matchedUnitScopes = new Set();
         const unitTexts = new Map();
         for (const r of preparedRuns) {
+          if (!isUnitScopeAllowedByCmdMap(r.unitScope)) continue;
           let arr = unitTexts.get(r.unitScope);
           if (!arr) {
             arr = [];
@@ -6763,6 +6949,7 @@
 
     const createdMarks = [];
     for (const run of preparedRuns) {
+      if (!isUnitScopeAllowedByCmdMap(run.unitScope)) continue;
       if (matchedUnitScopes && !matchedUnitScopes.has(run.unitScope)) continue;
       const ranges = findMatchRanges(run.fullText, run.fullLower);
       if (!ranges.length) continue;
@@ -10162,6 +10349,9 @@
         _agWindowPollTimer = 0;
       }
       setComposerStatus("clipboard_only");
+      if (els.composerLogRow) {
+        els.composerLogRow.classList.add("hidden");
+      }
       if (els.composerSendBtn) {
         els.composerSendBtn.textContent = t("composer.sendBtnPosix");
         els.composerSendBtn.title = t("composer.sendBtnPosixTitle");
@@ -10170,6 +10360,9 @@
         els.promptInput.placeholder = t("composer.placeholderPosix");
       }
     } else {
+      if (els.composerLogRow) {
+        els.composerLogRow.classList.remove("hidden");
+      }
       if (els.composerSendBtn) {
         els.composerSendBtn.textContent = t("composer.sendBtnWin");
         els.composerSendBtn.title = t("composer.sendBtnWinTitle");
@@ -10242,8 +10435,73 @@
     }
   }
 
+  let _lastSendResultMs = 0;
+
+  function syncComposerTraceToggleBtn() {
+    if (!els.toggleComposerTraceBtn || !els.composerTraceBar) return;
+    const isOpen = !els.composerTraceBar.classList.contains("hidden");
+    els.toggleComposerTraceBtn.classList.toggle("is-open", isOpen);
+    els.toggleComposerTraceBtn.setAttribute("aria-expanded", String(isOpen));
+  }
+
+  function renderComposerTrace(ok, statusLabel, summaryMsg, traceText) {
+    if (!els.composerTraceBar || !els.composerTracePre || !els.composerTraceTitle) return;
+    const body = String(traceText || summaryMsg || "").trim();
+    if (!body) return;
+    els.composerTraceTitle.textContent = `[status=${statusLabel || (ok ? "ok" : "error")}] ${summaryMsg || ""}`.trim();
+    els.composerTracePre.textContent = body;
+    els.composerTraceBar.classList.toggle("is-ok", Boolean(ok));
+    els.composerTraceBar.classList.toggle("is-error", !ok);
+    if (els.toggleComposerTraceBtn) {
+      els.toggleComposerTraceBtn.disabled = false;
+      els.toggleComposerTraceBtn.classList.add("has-trace");
+      els.toggleComposerTraceBtn.classList.toggle("is-error", !ok);
+    }
+    syncComposerTraceToggleBtn();
+  }
+
+  if (els.toggleComposerTraceBtn) {
+    els.toggleComposerTraceBtn.addEventListener("click", () => {
+      if (!els.composerTraceBar || els.toggleComposerTraceBtn.disabled) return;
+      els.composerTraceBar.classList.toggle("hidden");
+      syncComposerTraceToggleBtn();
+    });
+  }
+
+  if (els.copyComposerTraceBtn) {
+    els.copyComposerTraceBtn.addEventListener("click", async () => {
+      const hdr = els.composerTraceTitle ? els.composerTraceTitle.textContent : "";
+      const logBody = els.composerTracePre ? els.composerTracePre.textContent : "";
+      const full = `${hdr}\n${logBody}`.trim();
+      if (!full) return;
+      try {
+        await navigator.clipboard.writeText(full);
+        const orig = t("composer.traceCopy");
+        els.copyComposerTraceBtn.textContent = t("composer.traceCopied");
+        setTimeout(() => {
+          if (els.copyComposerTraceBtn) els.copyComposerTraceBtn.textContent = orig;
+        }, 1200);
+      } catch (_) {}
+    });
+  }
+  if (els.closeComposerTraceBtn) {
+    els.closeComposerTraceBtn.addEventListener("click", () => {
+      if (els.composerTraceBar) els.composerTraceBar.classList.add("hidden");
+      syncComposerTraceToggleBtn();
+    });
+  }
+
   async function checkAntigravityWindow() {
     if (state.capabilities && state.capabilities.antigravity_paste === false) return;
+    if (
+      _lastSendResultMs &&
+      Date.now() - _lastSendResultMs < 15000 &&
+      _lastComposerStatusMode &&
+      _lastComposerStatusMode !== "found" &&
+      _lastComposerStatusMode !== "not_found"
+    ) {
+      return;
+    }
     try {
       const qs = new URLSearchParams();
       if (state.activeMeta?.project) qs.set("project", state.activeMeta.project);
@@ -10260,7 +10518,9 @@
     } catch (_) {}
   }
 
+  let _agSendInFlight = false;
   async function submitToAntigravity() {
+    if (_agSendInFlight) return;
     const text = els.promptInput.value;
     if (!text.trim()) return;
     if (state.capabilities && state.capabilities.antigravity_paste === false) {
@@ -10273,6 +10533,7 @@
       }
       return;
     }
+    _agSendInFlight = true;
     setComposerStatus("sending");
     try {
       const res = await fetch("/api/send-to-antigravity", {
@@ -10286,16 +10547,24 @@
         }),
       });
       const data = await res.json();
+      _lastSendResultMs = Date.now();
       if (data.ok) {
         els.promptInput.value = "";
         const stMode = data.status === "sent" ? "sent" : data.status === "appended" ? "appended" : "pasted";
         setComposerStatus(stMode, data.info || "");
+        renderComposerTrace(true, data.status || stMode, data.info || "", data.trace || "");
       } else {
         try { await navigator.clipboard.writeText(text); } catch (_) {}
-        setComposerStatus("error", t("composer.copiedErrorSuffix", { msg: data.info || data.error || t("topbar.liveError") }));
+        const errMsg = data.info || data.error || t("topbar.liveError");
+        setComposerStatus("error", t("composer.copiedErrorSuffix", { msg: errMsg }));
+        renderComposerTrace(false, data.status || `http_${res.status}`, errMsg, data.trace || "");
       }
     } catch (err) {
+      _lastSendResultMs = Date.now();
       setComposerStatus("error", err.message);
+      renderComposerTrace(false, "fetch_error", err.message, err.stack || err.message);
+    } finally {
+      _agSendInFlight = false;
     }
   }
 
@@ -10308,7 +10577,9 @@
     _lastComposerTypeMs = Date.now();
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      submitToAntigravity();
+      if (!_agSendInFlight) {
+        setTimeout(() => submitToAntigravity(), 35);
+      }
     }
   });
 

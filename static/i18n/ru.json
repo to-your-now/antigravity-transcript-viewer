@@ -146,7 +146,12 @@
     "agPastedTitle": "Текст вставлен в Antigravity.exe",
     "agPastedDesc": "Текущий цвет индикатора: ЗЕЛЁНЫЙ (🟢).\nТекст вставлен в поле ввода Antigravity (без нажатия Enter) — проверьте и отправьте вручную.",
     "agErrorTitle": "Предупреждение / ошибка вставки",
-    "agErrorDesc": "Текущий цвет значка: КРАСНО-ЖЁЛТЫЙ (⚠).\n{msg}"
+    "agErrorDesc": "Текущий цвет значка: КРАСНО-ЖЁЛТЫЙ (⚠).\n{msg}",
+    "traceCopy": "Копировать лог",
+    "traceCopied": "✓ Скопировано",
+    "traceClose": "Закрыть лог",
+    "traceToggleBtn": "LOG",
+    "traceToggleTitle": "Показать или скрыть лог последней вставки в Antigravity"
   },
   "cmdMap": {
     "modalTitle": "📊 Карта всех выполненных команд и событий",

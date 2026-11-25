@@ -60,6 +60,7 @@ const helpersCode = [
   sliceFunc(appJs, "classifyToolCallOutcome"),
   sliceFunc(appJs, "doesToolCallMatchCmdKeys"),
   sliceFunc(appJs, "getStepMatchingCmdKeys"),
+  sliceFunc(appJs, "getStepCmdMapScope"),
   sliceFunc(appJs, "buildCommandMapStats"),
   sliceFunc(appJs, "formatSpecialBracketTagsInHtml"),
   sliceFunc(appJs, "formatPairedSystemTagsInHtml"),
@@ -84,6 +85,9 @@ const helpersCode = [
   sliceFunc(appJs, "getPositiveSearchTerms"),
   sliceFunc(appJs, "getTurnSearchBlob"),
   sliceFunc(appJs, "getTurnSearchUnits"),
+  sliceFunc(appJs, "filterUnitsByCmdMapScope"),
+  sliceFunc(appJs, "getVisibleTurnSearchUnits"),
+  sliceFunc(appJs, "getVisibleTurnSearchBlob"),
   sliceFunc(appJs, "stepMatchesFilter"),
   sliceFunc(appJs, "buildStepMetadataAndTaskIndex"),
   sliceFunc(appJs, "resolveTaskLinkDestination"),
@@ -91,7 +95,7 @@ const helpersCode = [
   sliceFunc(appJs, "extractMatchSnippet"),
   sliceFunc(appJs, "serializeFeedSelectionRange"),
   sliceFunc(appJs, "addSearchHistoryEntry"),
-  `return { state, isCommandErrorStep, pairToolOutputs, getBgTaskResultOutcome, classifyToolCallOutcome, doesToolCallMatchCmdKeys, getStepMatchingCmdKeys, buildCommandMapStats, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; }, get stepPairedOutputsMap() { return stepPairedOutputsMap; } };`,
+  `return { state, isCommandErrorStep, pairToolOutputs, getBgTaskResultOutcome, classifyToolCallOutcome, doesToolCallMatchCmdKeys, getStepMatchingCmdKeys, getStepCmdMapScope, buildCommandMapStats, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, filterUnitsByCmdMapScope, getVisibleTurnSearchUnits, getVisibleTurnSearchBlob, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; }, get stepPairedOutputsMap() { return stepPairedOutputsMap; } };`,
 ].join("\n\n");
 
 const api = new Function(helpersCode)();
@@ -1250,6 +1254,107 @@ const makeAnchorRunner = (cards, items) => {
     cloneContents: () => fragRoot,
   });
   assert.equal(singlePillCopy, "edit_file", "Selecting just the edit_file pill inside .tool-head must copy 'edit_file' instead of empty string");
+}
+
+// 18. Search specificity inside active Command Map selection & focused turn trimming
+{
+  const stepA = {
+    step_index: 501,
+    type: "PLANNER_RESPONSE",
+    source: "MODEL",
+    status: "DONE",
+    thinking: "Hidden thinking mentions needle_target and timeout_flag",
+    content: "Hidden intermediate prose mentions needle_target",
+    tool_calls: [
+      { name: "read_file", args: { Path: "needle_target.py", Note: "timeout_flag" } },
+      { name: "run_command", args: { CommandLine: "echo clean_ok" } },
+    ],
+  };
+  const outA0 = { step_index: 502, type: "GENERIC", status: "DONE", content: "needle_target from read_file" };
+  const outA1 = { step_index: 503, type: "GENERIC", status: "DONE", content: "Exit code: 0\nclean_ok" };
+
+  const stepB = {
+    step_index: 504,
+    type: "PLANNER_RESPONSE",
+    source: "MODEL",
+    status: "DONE",
+    thinking: "Thinking also mentions needle_target early",
+    tool_calls: [
+      { name: "read_file", args: { Path: "needle_target_ignored.py" } },
+      { name: "run_command", args: { CommandLine: "pytest needle_target.py" } },
+    ],
+  };
+  const outB0 = { step_index: 505, type: "GENERIC", status: "DONE", content: "needle_target in hidden read_file" };
+  const outB1 = { step_index: 506, type: "GENERIC", status: "DONE", content: "Exit code: 0\nneedle_target passed" };
+
+  const prevSteps = api.state.steps;
+  const prevAttached = api.state.attachToolOutputs;
+  const prevFilterOnly = api.state.cmdMapFilterOnly;
+  const prevFocusedOnly = api.state.cmdMapFocusedOnly;
+  const prevKeys = api.state.cmdMapKeys;
+  const prevQuery = api.state.stepQuery;
+  const prevWholeTurn = api.state.searchAcrossWholeTurn;
+  const prevSearchFocused = api.state.searchFocusedOnly;
+
+  try {
+    api.state.steps = [stepA, outA0, outA1, stepB, outB0, outB1];
+    api.state.attachToolOutputs = true;
+    api.buildStepMetadataAndTaskIndex(api.state.steps);
+    const { attachedByPlanner } = api.pairToolOutputs(api.state.steps);
+    const attA = attachedByPlanner.get(stepA);
+    const attB = attachedByPlanner.get(stepB);
+
+    api.state.cmdMapFilterOnly = true;
+    api.state.cmdMapFocusedOnly = true;
+    api.state.cmdMapKeys = new Set(["tool:run_command"]);
+
+    // 18a. Query hitting only hidden thinking/read_file/content must NOT match stepA
+    api.state.stepQuery = "needle_target";
+    api.state.searchAcrossWholeTurn = false;
+    assert.equal(api.stepMatchesFilter(stepA, attA), false, "Hidden read_file/thinking/prose must NOT match when only run_command is shown");
+    assert.equal(api.stepMatchesFilter(stepB, attB), true, "Visible run_command containing needle_target must match");
+
+    // 18b. Even with searchAcrossWholeTurn=true, hidden blocks cannot bridge a query across visible run_command
+    api.state.searchAcrossWholeTurn = true;
+    assert.equal(api.stepMatchesFilter(stepA, attA), false, "Across-whole-turn must also exclude hidden blocks under focused Command Map");
+    api.state.stepQuery = "needle_target clean_ok";
+    assert.equal(api.stepMatchesFilter(stepA, attA), false, "Hidden thinking + visible run_command must NOT combine when focused Command Map is active");
+
+    // 18c. Pure negation skips hidden blocks too
+    api.state.searchAcrossWholeTurn = false;
+    api.state.stepQuery = "!timeout_flag";
+    assert.equal(api.stepMatchesFilter(stepA, attA), true, "Pure negation !timeout_flag must ignore timeout_flag in hidden read_file");
+
+    // 18d. TOC snippet must quote visible [run_command], never [thinking] or [read_file]
+    api.state.stepQuery = "needle_target";
+    const snipB = api.extractMatchSnippet(stepB, "needle_target", attB);
+    assert.ok(snipB.startsWith("[run_command]"), `TOC snippet must quote visible [run_command], got: ${snipB}`);
+    assert.ok(!snipB.includes("[thinking]") && !snipB.includes("[read_file]"), "TOC snippet must never quote hidden blocks");
+
+    // 18e. When cmdMapFocusedOnly=false (full cards displayed), hidden-in-focused blocks match normally
+    api.state.cmdMapFocusedOnly = false;
+    assert.equal(api.stepMatchesFilter(stepA, attA), true, "Full step mode (cmdMapFocusedOnly=false) searches all blocks of matched cards");
+
+    // 18f. When only step-level key (type:PLANNER_RESPONSE) is checked with cmdMapFocusedOnly=true, whole card stays searchable
+    api.state.cmdMapFocusedOnly = true;
+    api.state.cmdMapKeys = new Set(["type:PLANNER_RESPONSE"]);
+    assert.equal(api.getStepCmdMapScope(stepA, attA).restricted, false);
+    assert.equal(api.stepMatchesFilter(stepA, attA), true, "Step-level type filter keeps entire turn searchable");
+
+    // 18g. Highlight + trim invariants on DOM cards
+    assert.ok(appJs.includes("isUnitScopeAllowedByCmdMap("), "highlightMatches must restrict text runs and unit scopes to Command-Map-visible blocks");
+    assert.ok(appJs.includes("getVisibleTurnSearchUnits(") && appJs.includes("getVisibleTurnSearchBlob("), "stepMatchesFilter must evaluate only Command-Map-visible units/blob");
+  } finally {
+    api.state.steps = prevSteps;
+    api.state.attachToolOutputs = prevAttached;
+    api.state.cmdMapFilterOnly = prevFilterOnly;
+    api.state.cmdMapFocusedOnly = prevFocusedOnly;
+    api.state.cmdMapKeys = prevKeys;
+    api.state.stepQuery = prevQuery;
+    api.state.searchAcrossWholeTurn = prevWholeTurn;
+    api.state.searchFocusedOnly = prevSearchFocused;
+    api.buildStepMetadataAndTaskIndex(prevSteps);
+  }
 }
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");

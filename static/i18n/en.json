@@ -146,7 +146,12 @@
     "agPastedTitle": "Text pasted into Antigravity.exe",
     "agPastedDesc": "Indicator color: GREEN (🟢).\nText pasted into Antigravity input (without pressing Enter) — review and send manually.",
     "agErrorTitle": "Paste warning / error",
-    "agErrorDesc": "Indicator color: WARNING (⚠).\n{msg}"
+    "agErrorDesc": "Indicator color: WARNING (⚠).\n{msg}",
+    "traceCopy": "Copy log",
+    "traceCopied": "✓ Copied",
+    "traceClose": "Close log",
+    "traceToggleBtn": "LOG",
+    "traceToggleTitle": "Show or hide last Antigravity paste log"
   },
   "cmdMap": {
     "modalTitle": "📊 Executed Commands & Events Map",

@@ -127,8 +127,21 @@
               <span class="composer-status" id="composerStatus"></span>
               <button type="button" class="icon-btn" id="collapseComposerBtn" title="Collapse input box (Ctrl+')" data-i18n-title="composer.collapseTitle">▼</button>
             </div>
+            <div class="composer-log-row" id="composerLogRow">
+              <button type="button" class="btn-xs composer-log-btn" id="toggleComposerTraceBtn" disabled title="Show/hide last Antigravity paste log" data-i18n="composer.traceToggleBtn" data-i18n-title="composer.traceToggleTitle">LOG</button>
+            </div>
             <button type="submit" class="btn-sm composer-send" id="composerSendBtn" title="Focus Antigravity.exe chat (Ctrl+I), verify empty -> paste, verify match, press Enter & return focus after ~1.8s; if draft exists (non-code) -> append at end without Enter">Send to Antigravity ↗</button>
           </div>
+        </div>
+        <div class="composer-trace hidden" id="composerTraceBar">
+          <div class="composer-trace-head">
+            <span class="composer-trace-title" id="composerTraceTitle">Antigravity paste log</span>
+            <div class="composer-trace-actions">
+              <button type="button" class="btn-xs" id="copyComposerTraceBtn" data-i18n="composer.traceCopy">Copy log</button>
+              <button type="button" class="icon-btn" id="closeComposerTraceBtn" title="Close log" data-i18n-title="composer.traceClose">✕</button>
+            </div>
+          </div>
+          <pre class="composer-trace-pre" id="composerTracePre"></pre>
         </div>
       </form>
       <button type="button" class="btn-sm floating-pill expand-composer-btn hidden" id="expandComposerBtn" title="Expand input box (Ctrl+')" data-i18n="composer.expandBtn" data-i18n-title="composer.expandTitle">▲ Write</button>

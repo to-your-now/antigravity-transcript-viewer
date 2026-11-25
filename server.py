@@ -826,9 +826,15 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             if not text.strip():
                 self._send_json({"ok": False, "error": _srv_t(lang, "emptyText")}, status=400)
                 return
-            ok, info, status_code = send_text_to_antigravity_window(text, prefer_project, prefer_title, lang=lang)
+            trace_lines: List[str] = []
+            ok, info, status_code = send_text_to_antigravity_window(
+                text, prefer_project, prefer_title, lang=lang, trace_out=trace_lines
+            )
             http_status = 200 if ok else (404 if status_code == "not_found" else 409)
-            self._send_json({"ok": ok, "info": info, "status": status_code}, status=http_status)
+            self._send_json(
+                {"ok": ok, "info": info, "status": status_code, "trace": "\n".join(trace_lines)},
+                status=http_status,
+            )
             return
 
         if parsed.path == "/api/open-folder":
@@ -1747,13 +1753,23 @@ def find_antigravity_window(
     return matches[0]
 
 
+def _open_clipboard_retry(attempts: int = 10, delay_s: float = 0.012) -> bool:
+    user32 = ctypes.windll.user32
+    user32.OpenClipboard.argtypes = [ctypes.wintypes.HWND]
+    for i in range(max(1, attempts)):
+        if user32.OpenClipboard(None):
+            return True
+        if i + 1 < attempts:
+            time.sleep(delay_s)
+    return False
+
+
 def _set_clipboard_unicode(text: str) -> bool:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
 
-    user32.OpenClipboard.argtypes = [ctypes.wintypes.HWND]
     user32.SetClipboardData.argtypes = [ctypes.wintypes.UINT, ctypes.wintypes.HANDLE]
     user32.SetClipboardData.restype = ctypes.wintypes.HANDLE
     kernel32.GlobalAlloc.argtypes = [ctypes.wintypes.UINT, ctypes.c_size_t]
@@ -1763,7 +1779,7 @@ def _set_clipboard_unicode(text: str) -> bool:
     kernel32.GlobalUnlock.argtypes = [ctypes.wintypes.HGLOBAL]
 
     data = text.encode("utf-16-le") + b"\x00\x00"
-    if not user32.OpenClipboard(None):
+    if not _open_clipboard_retry():
         return False
     try:
         user32.EmptyClipboard()
@@ -1789,14 +1805,13 @@ def _get_clipboard_unicode() -> str:
     kernel32 = ctypes.windll.kernel32
     CF_UNICODETEXT = 13
 
-    user32.OpenClipboard.argtypes = [ctypes.wintypes.HWND]
     user32.GetClipboardData.argtypes = [ctypes.wintypes.UINT]
     user32.GetClipboardData.restype = ctypes.wintypes.HANDLE
     kernel32.GlobalLock.argtypes = [ctypes.wintypes.HGLOBAL]
     kernel32.GlobalLock.restype = ctypes.c_void_p
     kernel32.GlobalUnlock.argtypes = [ctypes.wintypes.HGLOBAL]
 
-    if not user32.OpenClipboard(None):
+    if not _open_clipboard_retry():
         return ""
     try:
         hmem = user32.GetClipboardData(CF_UNICODETEXT)
@@ -1815,8 +1830,7 @@ def _get_clipboard_unicode() -> str:
 
 def _clear_clipboard() -> None:
     user32 = ctypes.windll.user32
-    user32.OpenClipboard.argtypes = [ctypes.wintypes.HWND]
-    if user32.OpenClipboard(None):
+    if _open_clipboard_retry():
         try:
             user32.EmptyClipboard()
         finally:
@@ -1901,13 +1915,12 @@ def _send_key(vk: int) -> None:
     user32.SendInput(2, seq, ctypes.sizeof(INPUT))
 
 
-def _send_ctrl_combo(vk: int) -> None:
+def _send_mod_combo(mod_vk: int, vk: int) -> None:
     user32 = ctypes.windll.user32
     INPUT_KEYBOARD = 1
     KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
-    VK_CONTROL = 0x11
-    ctrl_scan = user32.MapVirtualKeyW(VK_CONTROL, 0) & 0xFFFF
+    mod_scan = user32.MapVirtualKeyW(mod_vk, 0) & 0xFFFF
     key_scan = user32.MapVirtualKeyW(vk, 0) & 0xFFFF
     key_ext = KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
 
@@ -1943,12 +1956,20 @@ def _send_ctrl_combo(vk: int) -> None:
         return inp
 
     seq = (INPUT * 4)(
-        _make_key(VK_CONTROL, ctrl_scan, 0),
+        _make_key(mod_vk, mod_scan, 0),
         _make_key(vk, key_scan, key_ext),
         _make_key(vk, key_scan, KEYEVENTF_KEYUP | key_ext),
-        _make_key(VK_CONTROL, ctrl_scan, KEYEVENTF_KEYUP),
+        _make_key(mod_vk, mod_scan, KEYEVENTF_KEYUP),
     )
     user32.SendInput(4, seq, ctypes.sizeof(INPUT))
+
+
+def _send_ctrl_combo(vk: int) -> None:
+    _send_mod_combo(0x11, vk)
+
+
+def _send_shift_combo(vk: int) -> None:
+    _send_mod_combo(0x10, vk)
 
 
 def _activate_hwnd(hwnd: int, settle_s: float = 0.14) -> bool:
@@ -1965,19 +1986,25 @@ def _activate_hwnd(hwnd: int, settle_s: float = 0.14) -> bool:
     user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
     fg_hwnd = user32.GetForegroundWindow()
     fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
     cur_tid = kernel32.GetCurrentThreadId()
-    attached = False
+    attached_fg = False
+    attached_tgt = False
     if fg_tid and fg_tid != cur_tid:
-        attached = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+        attached_fg = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+    if target_tid and target_tid != cur_tid and target_tid != fg_tid:
+        attached_tgt = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
     try:
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
         if user32.GetForegroundWindow() != hwnd:
-            user32.keybd_event(0x12, 0, 0, 0)
-            user32.keybd_event(0x12, 0, 0x0002, 0)
+            _send_key(0x12)  # Alt unlock fallback
+            user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
     finally:
-        if attached:
+        if attached_tgt:
+            user32.AttachThreadInput(cur_tid, target_tid, False)
+        if attached_fg:
             user32.AttachThreadInput(cur_tid, fg_tid, False)
     if settle_s > 0:
         time.sleep(settle_s)
@@ -1985,7 +2012,18 @@ def _activate_hwnd(hwnd: int, settle_s: float = 0.14) -> bool:
 
 
 def _norm_clipboard_cmp(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ").strip()
+    s = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u00a0", " ")
+        .replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+        .replace("\ufeff", "")
+        .strip()
+    )
+    # Rich-text editors (Lexical/Chromium) often serialize <p> breaks as \n\n on Ctrl+C
+    return re.sub(r"[ \t]*\n+[ \t]*", "\n", s)
 
 
 def _looks_like_code_or_file_buffer(text: str) -> Tuple[bool, int]:
@@ -2074,6 +2112,7 @@ def _default_win_paste_ops() -> Dict[str, Any]:
         "clip_seq": lambda: int(user32.GetClipboardSequenceNumber()),
         "send_key": _send_key,
         "send_ctrl": _send_ctrl_combo,
+        "send_shift": _send_shift_combo,
         "sleep": time.sleep,
         "schedule_restore": _schedule_restore,
     }
@@ -2086,15 +2125,25 @@ def send_text_to_antigravity_window(
     lang: str = "en",
     *,
     _win_ops: Optional[Dict[str, Any]] = None,
+    trace_out: Optional[List[str]] = None,
 ) -> Tuple[bool, str, str]:
     """Safely inspect Antigravity's input, verify empty vs draft, paste, and auto-send only on verified empty fields."""
     lang = _norm_lang(lang)
+    t_start = time.monotonic()
+
+    def _trace(msg: str) -> None:
+        if trace_out is not None:
+            dt_ms = int(round((time.monotonic() - t_start) * 1000))
+            trace_out.append(f"[+{dt_ms:>4d}ms] {msg}")
+
     if _win_ops is None and sys.platform != "win32":
+        _trace("ERR: Windows-only")
         return False, _srv_t(lang, "agWinOnly"), "error"
 
     ops = _win_ops if _win_ops is not None else _default_win_paste_ops()
 
     VK_RETURN = 0x0D
+    VK_END = 0x23
     VK_RIGHT = 0x27
     VK_A = 0x41
     VK_C = 0x43
@@ -2102,80 +2151,201 @@ def send_text_to_antigravity_window(
     VK_V = 0x56
 
     hwnd, title = ops["find_window"](prefer_project, prefer_title)
+    _trace(f"find_window -> hwnd={hwnd} title={title!r}")
     if not hwnd:
         return False, _srv_t(lang, "agNotFound"), "not_found"
 
     caller_hwnd = int(ops["get_foreground"]() or 0)
-    if not ops["focus_window"](hwnd):
+    focused_ok = bool(ops["focus_window"](hwnd))
+    fg_after_focus = int(ops["get_foreground"]() or 0)
+    _trace(f"focus_window: caller={caller_hwnd} -> target={hwnd} ok={focused_ok} fg_now={fg_after_focus}")
+    if not focused_ok:
         ops["set_clip"](text)
+        _trace("ABORT: focus_window failed -> text copied to clipboard")
         return False, _srv_t(lang, "agFocusErr"), "focus_error"
 
-    def _copy_focused(timeout_s: float = 0.22) -> Tuple[bool, str]:
-        ops["clear_clip"]()
+    def _copy_focused(label: str, timeout_s: float = 0.35, select_delay_s: float = 0.08) -> Tuple[bool, str]:
+        probe = f"__AGY_CLIP_PROBE_{ops['clip_seq']()}__"
+        probe_ok = bool(ops["set_clip"](probe))
+        if not probe_ok:
+            ops["clear_clip"]()
         seq0 = ops["clip_seq"]()
+        ops["sleep"](0.02)
         ops["send_ctrl"](VK_A)
-        ops["sleep"](0.045)
+        ops["sleep"](select_delay_s)
         ops["send_ctrl"](VK_C)
         elapsed = 0.0
+        seq_bumps = 0
         while elapsed < timeout_s:
-            if ops["clip_seq"]() != seq0:
-                ops["sleep"](0.015)
-                return True, ops["get_clip"]()
+            cur_seq = ops["clip_seq"]()
+            if cur_seq != seq0:
+                seq_bumps += 1
+                ops["sleep"](0.025)
+                val = ops["get_clip"]()
+                if val == "":
+                    ops["sleep"](0.025)
+                    val = ops["get_clip"]()
+                if val != probe:
+                    _trace(
+                        f"{label}: OK (Ctrl+A -> Ctrl+C, seq {seq0}->{cur_seq}, bumps={seq_bumps}, "
+                        f"len={len(val)}, preview={val[:35]!r})"
+                    )
+                    return True, val
+                seq0 = cur_seq
             ops["sleep"](0.015)
             elapsed += 0.015
-        return False, ops["get_clip"]()
+        val = ops["get_clip"]()
+        if val == probe:
+            ops["clear_clip"]()
+            _trace(
+                f"{label}: NO_CHANGE / TIMEOUT (probe unchanged after {int(timeout_s * 1000)}ms, "
+                f"seq0={seq0}, fg={ops['get_foreground']()})"
+            )
+            return False, ""
+        _trace(
+            f"{label}: FALLBACK (ok={bool(val)}, len={len(val)}, fg={ops['get_foreground']()}, preview={val[:35]!r})"
+        )
+        return bool(val), val
+
+    def _deselect_to_end() -> None:
+        # Collapse any Ctrl+A selection, then jump unconditionally to end of multiline/rich-text box
+        ops["send_key"](VK_RIGHT)
+        ops["sleep"](0.02)
+        ops["send_ctrl"](VK_END)
+        ops["sleep"](0.04)
+
+    def _log_paste_trace(
+        status_label: str,
+        *,
+        pre_ok: bool = False,
+        pre_len: int = 0,
+        after_ok: bool = False,
+        exp_len: int = 0,
+        got_len: int = 0,
+    ) -> None:
+        if _win_ops is not None:
+            return
+        fg_now = int(ops["get_foreground"]() or 0)
+        print(
+            f"[ag-paste] status={status_label} caller={caller_hwnd} ag={hwnd} fg={fg_now} "
+            f"pre=({pre_ok},{pre_len}) after=({after_ok},{got_len}/{exp_len})",
+            file=sys.stderr,
+            flush=True,
+        )
 
     switched_layout, orig_hkl = ops["switch_en"](hwnd)
+    _trace(f"switch_en: switched={switched_layout} orig_hkl=0x{int(orig_hkl or 0):x}")
     try:
-        # 1. Focus Agent Chat input in Antigravity IDE (Ctrl+I)
+        # 1. Focus Agent Chat input in Antigravity App (Ctrl+I)
         ops["send_ctrl"](VK_I)
-        ops["sleep"](0.18)
+        ops["sleep"](0.22)
+        _trace(f"Ctrl+I sent -> sleep 220ms -> fg={ops['get_foreground']()}")
 
-        # 2. Check existing input content via Ctrl+A -> Ctrl+C
-        _, pre_text = _copy_focused(0.20)
+        # 2. Check existing input content via sentinel-probed Ctrl+A -> Ctrl+C
+        pre_copy_ok, pre_text = _copy_focused("pre_check", 0.30, select_delay_s=0.08)
         is_code, line_count = _looks_like_code_or_file_buffer(pre_text)
         if is_code:
-            # Collapse Ctrl+A selection safely inside code editor; never paste into source code
-            ops["send_key"](VK_RIGHT)
+            _deselect_to_end()
             ops["set_clip"](text)
+            _trace(f"ABORT: code editor heuristic triggered (lines={line_count})")
+            _log_paste_trace("aborted_code_editor", pre_ok=pre_copy_ok, pre_len=len(pre_text))
             return False, _srv_t(lang, "agCodeEditorAborted", lines=line_count), "aborted_code_editor"
 
         if pre_text.strip() == "":
-            # 3a. Empty box: paste -> re-select & verify -> press Enter -> return focus to browser after delay
+            _trace("branch=EMPTY -> deselect_to_end -> set_clip -> Ctrl+V")
+            # 3a. Empty (or copy timed out): ALWAYS collapse selection + Ctrl+End BEFORE pasting so any hidden draft is never overwritten
+            _deselect_to_end()
             if not ops["set_clip"](text):
+                _trace("ABORT: set_clip(text) failed")
+                _log_paste_trace("clipboard_error", pre_ok=pre_copy_ok, pre_len=len(pre_text))
                 return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
-            ops["sleep"](0.03)
+            ops["sleep"](0.035)
             ops["send_ctrl"](VK_V)
-            ops["sleep"](0.11)
+            wait_paste_s = 0.20 if len(text) <= 500 else 0.26
+            ops["sleep"](wait_paste_s)
+            _trace(f"Ctrl+V sent (input_len={len(text)}, sleep={int(wait_paste_s * 1000)}ms)")
 
-            _, after_text = _copy_focused(0.25)
+            after_ok, after_text = _copy_focused("post_check_1", 0.45, select_delay_s=0.09)
+            if not after_ok:
+                ops["sleep"](0.14)
+                after_ok, after_text = _copy_focused("post_check_2", 0.45, select_delay_s=0.12)
+
             norm_after = _norm_clipboard_cmp(after_text)
             norm_expected = _norm_clipboard_cmp(text)
             if not norm_after or norm_after != norm_expected:
-                ops["send_key"](VK_RIGHT)
+                diff_idx = -1
+                for idx, (ca, ce) in enumerate(zip(norm_after, norm_expected)):
+                    if ca != ce:
+                        diff_idx = idx
+                        break
+                if diff_idx == -1 and len(norm_after) != len(norm_expected):
+                    diff_idx = min(len(norm_after), len(norm_expected))
+                _trace(
+                    f"VERIFY_FAILED: after_ok={after_ok} norm_exp_len={len(norm_expected)} "
+                    f"norm_got_len={len(norm_after)} first_diff_idx={diff_idx}"
+                )
+                _deselect_to_end()
                 ops["set_clip"](text)
-                return False, _srv_t(lang, "agVerifyFailed", title=title), "verify_failed"
+                _log_paste_trace(
+                    "verify_failed",
+                    pre_ok=pre_copy_ok,
+                    pre_len=len(pre_text),
+                    after_ok=after_ok,
+                    exp_len=len(norm_expected),
+                    got_len=len(norm_after),
+                )
+                msg = _srv_t(lang, "agVerifyFailed", title=title)
+                if not after_ok or len(norm_after) != len(norm_expected):
+                    msg = f"{msg} [post={after_ok}:{len(norm_after)}/{len(norm_expected)}]"
+                return False, msg, "verify_failed"
 
-            ops["send_key"](VK_RIGHT)
+            _trace(f"VERIFY_OK: len={len(norm_after)} -> deselect_to_end -> ENTER")
+            _deselect_to_end()
             ops["sleep"](0.04)
             ops["send_key"](VK_RETURN)
+            _trace("ENTER sent")
+            _log_paste_trace(
+                "sent",
+                pre_ok=pre_copy_ok,
+                pre_len=len(pre_text),
+                after_ok=after_ok,
+                exp_len=len(norm_expected),
+                got_len=len(norm_after),
+            )
             if caller_hwnd and caller_hwnd != hwnd:
                 ops["schedule_restore"](1.8, caller_hwnd, hwnd)
+                _trace(f"schedule_restore(1.8s -> hwnd={caller_hwnd})")
             return True, title, "sent"
 
-        # 3b. Safe non-empty draft: deselect to end, append cleanly, NEVER press Enter, stay in Antigravity
-        ops["send_key"](VK_RIGHT)
-        ops["sleep"](0.05)
-        append_text = text if pre_text[-1] in ("\n", "\r", " ", "\t") else f"\n{text}"
+        # 3b. Safe non-empty draft: deselect and jump to absolute end, insert real line break (Shift+Enter) if needed, append cleanly, NEVER press Enter
+        _trace(f"branch=APPEND (pre_len={len(pre_text)}) -> deselect_to_end -> Shift+Enter -> Ctrl+V (no Enter)")
+        _deselect_to_end()
+        clean_pre = pre_text.rstrip("\u200b\u200c\u200d\ufeff")
+        tail_ch = clean_pre[-1] if clean_pre else ""
+        needs_newline = tail_ch not in ("\n", "\r")
+        append_text = text
+        if needs_newline:
+            send_shift = ops.get("send_shift")
+            if send_shift is not None:
+                send_shift(VK_RETURN)
+                ops["sleep"](0.045)
+                _trace("Shift+Enter sent before append paste")
+            else:
+                append_text = f"\n{text}"
         if not ops["set_clip"](append_text):
+            _trace("ABORT: set_clip(append_text) failed")
+            _log_paste_trace("clipboard_error", pre_ok=pre_copy_ok, pre_len=len(pre_text))
             return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
-        ops["sleep"](0.03)
+        ops["sleep"](0.035)
         ops["send_ctrl"](VK_V)
-        ops["sleep"](0.06)
+        ops["sleep"](0.08)
+        _trace("Ctrl+V (append) sent -> done")
+        _log_paste_trace("appended", pre_ok=pre_copy_ok, pre_len=len(pre_text))
         return True, title, "appended"
     finally:
         if switched_layout and orig_hkl:
             ops["restore_hkl"](hwnd, orig_hkl)
+            _trace(f"restore_hkl -> 0x{int(orig_hkl):x}")
 
 
 def run_self_check() -> int:

@@ -2563,6 +2563,36 @@ a.link-auto:hover {
   white-space: nowrap;
   cursor: help;
 }
+.composer-log-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin-top: -2px;
+}
+.composer-log-btn {
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.25;
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+  opacity: 0.55;
+}
+.composer-log-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.composer-log-btn.has-trace {
+  opacity: 0.92;
+}
+.composer-log-btn.is-open {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.composer-log-btn.is-error {
+  border-color: var(--err, #e06c75);
+  color: var(--err, #e06c75);
+  opacity: 1;
+}
 .composer-send {
   width: 100%;
   background: var(--accent);
@@ -2570,6 +2600,55 @@ a.link-auto:hover {
   border-color: var(--accent);
   padding: 7px 10px;
   text-align: center;
+}
+.composer-trace {
+  margin: 0 18px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  overflow: hidden;
+}
+.composer-trace.is-error {
+  border-color: var(--err, #e06c75);
+}
+.composer-trace.is-ok {
+  border-color: var(--ok, #4ade80);
+}
+.composer-trace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px;
+  background: var(--bg-muted);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.composer-trace-title {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-trace-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.composer-trace-pre {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 118px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.38;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
 }
 
 /* Command Map Modal */
