@@ -121,17 +121,17 @@
       <form class="composer" id="composerForm">
         <div class="composer-resizer" id="composerResizer" title="Drag up or down to resize input height" data-i18n-title="composer.resizerTitle"></div>
         <div class="composer-inner">
-          <textarea id="promptInput" class="composer-input" rows="3" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Write a message… (Enter — paste into Antigravity without sending, Shift+Enter — newline)"></textarea>
+          <textarea id="promptInput" class="composer-input" rows="3" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Write a message… (Ctrl+' — toggle panel, Enter — smart send/append into Antigravity, Shift+Enter — newline)"></textarea>
           <div class="composer-actions">
             <div class="composer-top-row">
               <span class="composer-status" id="composerStatus"></span>
-              <button type="button" class="icon-btn" id="collapseComposerBtn" title="Collapse input box" data-i18n-title="composer.collapseTitle">▼</button>
+              <button type="button" class="icon-btn" id="collapseComposerBtn" title="Collapse input box (Ctrl+')" data-i18n-title="composer.collapseTitle">▼</button>
             </div>
-            <button type="submit" class="btn-sm composer-send" id="composerSendBtn" title="Copy text, activate Antigravity.exe window, and paste (does not press Enter)">Paste into Antigravity ↗</button>
+            <button type="submit" class="btn-sm composer-send" id="composerSendBtn" title="Focus Antigravity.exe chat (Ctrl+I), verify empty -> paste, verify match, press Enter & return focus after ~1.8s; if draft exists (non-code) -> append at end without Enter">Send to Antigravity ↗</button>
           </div>
         </div>
       </form>
-      <button type="button" class="btn-sm floating-pill expand-composer-btn hidden" id="expandComposerBtn" title="Expand input box" data-i18n="composer.expandBtn" data-i18n-title="composer.expandTitle">▲ Write</button>
+      <button type="button" class="btn-sm floating-pill expand-composer-btn hidden" id="expandComposerBtn" title="Expand input box (Ctrl+')" data-i18n="composer.expandBtn" data-i18n-title="composer.expandTitle">▲ Write</button>
     </main>
   </div>
 
@@ -143,6 +143,10 @@
           <label class="toggle-btn" title="When enabled, the feed shows only the event types and tools checked here" data-i18n-title="cmdMap.filterOnlyTitle">
             <input type="checkbox" id="cmdMapFilterOnly">
             <span data-i18n="cmdMap.filterOnly">Show selected only</span>
+          </label>
+          <label class="toggle-btn" title="When filtering, hide surrounding thinking, text, and sibling tools inside matched steps (keeping a local button to expand the full turn)" data-i18n-title="cmdMap.focusedOnlyTitle">
+            <input type="checkbox" id="cmdMapFocusedOnly" checked>
+            <span data-i18n="cmdMap.focusedOnly">Selected commands only in steps</span>
           </label>
           <button type="button" class="btn-sm" id="cmdMapSelectAll" data-i18n="cmdMap.selectAll">Select all</button>
           <button type="button" class="btn-sm" id="cmdMapClear" data-i18n="cmdMap.clear">Reset</button>

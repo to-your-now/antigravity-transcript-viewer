@@ -25,6 +25,7 @@
     readDisplayMode: "scroll", // scroll (18 lines) | full | hide
     onlyCmdErrors: false,
     cmdMapFilterOnly: false,
+    cmdMapFocusedOnly: true,
     cmdMapKeys: new Set(),
     disableAutoLinks: false,
     folderOpenMode: "browser",   // browser | explorer | totalcmd | system
@@ -106,6 +107,7 @@
     cmdMapModal: document.getElementById("cmdMapModal"),
     cmdMapBody: document.getElementById("cmdMapBody"),
     cmdMapFilterOnly: document.getElementById("cmdMapFilterOnly"),
+    cmdMapFocusedOnly: document.getElementById("cmdMapFocusedOnly"),
     cmdMapSelectAll: document.getElementById("cmdMapSelectAll"),
     cmdMapClear: document.getElementById("cmdMapClear"),
     cmdMapClose: document.getElementById("cmdMapClose"),
@@ -202,8 +204,10 @@
   }
 
   const rawStepMap = new WeakMap();
+  const cardAttachedMap = new WeakMap();
   const stepModelMap = new WeakMap();
   let stepToolMetaMap = new WeakMap();
+  let stepPairedOutputsMap = new WeakMap();
   let taskIndexMap = new Map();
   let stepTaskMetaMap = new WeakMap();
   const notchItemMap = new WeakMap();
@@ -290,15 +294,16 @@
     );
   }
 
-  let _pendingEditScrolls = [];
+  let _pendingEditScrolls = new Map();
   let _editScrollRaf = 0;
   function scheduleEditScroll(wrap, rowEl, topMargin = 4) {
-    _pendingEditScrolls.push([wrap, rowEl, topMargin]);
+    if (!wrap || !rowEl) return;
+    _pendingEditScrolls.set(wrap, [wrap, rowEl, topMargin]);
     if (_editScrollRaf) return;
     _editScrollRaf = requestAnimationFrame(() => {
       _editScrollRaf = 0;
-      const batch = _pendingEditScrolls;
-      _pendingEditScrolls = [];
+      const batch = Array.from(_pendingEditScrolls.values());
+      _pendingEditScrolls.clear();
       const targets = [];
       // Batch read phase
       for (const [w, r, margin] of batch) {
@@ -355,7 +360,7 @@
       const firstMark = box.querySelector("mark.hl");
       if (!firstMark) continue;
       const target =
-        firstMark.closest(".code-gutter-row, .md-gutter-row, .arg-row, p, li, h1, h2, h3, h4, h5, h6") ||
+        firstMark.closest(".code-gutter-row, .md-gutter-row, .diff-line, .arg-row-inline, p, li, h1, h2, h3, h4, h5, h6") ||
         firstMark;
       scheduleEditScroll(box, target, 16);
     }
@@ -2130,6 +2135,7 @@
 
   function _buildAutoAnchor(kind, rawVal, displayText, opts = {}) {
     const a = document.createElement("a");
+    a.draggable = false;
     const openModeLabel =
       state.folderOpenMode === "totalcmd"
         ? "Total Commander"
@@ -2849,6 +2855,7 @@
 
   function buildStepMetadataAndTaskIndex(steps) {
     stepToolMetaMap = new WeakMap();
+    stepPairedOutputsMap = new WeakMap();
     taskIndexMap = new Map();
     stepTaskMetaMap = new WeakMap();
     if (!Array.isArray(steps) || !steps.length) return;
@@ -2873,6 +2880,7 @@
           launchStepIndex: null,
           callerStepIndex: null,
           resultStepIndex: null,
+          resultStep: null,
           taskType: "task",
           waitSteps: new Set(),
           cancelSteps: new Set(),
@@ -2898,6 +2906,7 @@
       }
       if (found.length) {
         plannerOutputsMap.set(s, found);
+        stepPairedOutputsMap.set(s, found);
         for (let k = 0; k < found.length; k++) {
           const tc = s.tool_calls[k];
           if (tc) {
@@ -2978,6 +2987,7 @@
           const taskId = mRes[1];
           const t = getTask(taskId);
           t.resultStepIndex = s.step_index;
+          t.resultStep = s;
           addStepTaskEvent(s, { role: "result", taskId });
         }
       }
@@ -3189,11 +3199,11 @@
     }
   }
 
-  function pairToolOutputs(steps) {
+  function pairToolOutputs(steps, forceAttach = false) {
     const attachedByPlanner = new Map(); // plannerStep -> array of genericSteps
     const attachedSet = new Set();       // genericSteps consumed into a planner
 
-    if (!state.attachToolOutputs) {
+    if (!forceAttach && !state.attachToolOutputs) {
       return { attachedByPlanner, attachedSet };
     }
 
@@ -4016,6 +4026,54 @@
     return units;
   }
 
+  function getBgTaskResultOutcome(resultStep) {
+    if (!resultStep) return "other";
+    if (isCommandErrorStep(resultStep)) return "err";
+    const txt = unescapeNewlines(resultStep.content || "");
+    const exitM = txt.match(/Command exited with code\s+(-?\d+)\.?/i);
+    if (exitM) {
+      return Number(exitM[1]) === 0 ? "ok" : "err";
+    }
+    if (/Encountered error in step execution:/i.test(txt)) return "err";
+    return "ok";
+  }
+
+  function classifyToolCallOutcome(callerStep, outStep) {
+    if (!outStep) {
+      return isCommandErrorStep(callerStep) ? "err" : "other";
+    }
+    if (isCommandErrorStep(outStep)) return "err";
+    if (outStep.status === "DONE") return "ok";
+    if (outStep.status === "RUNNING") {
+      const evs = stepTaskMetaMap.get(outStep);
+      if (Array.isArray(evs)) {
+        for (const ev of evs) {
+          if (ev.role === "launch" && ev.taskId) {
+            const tInfo = taskIndexMap.get(ev.taskId);
+            if (tInfo && tInfo.resultStep) {
+              return getBgTaskResultOutcome(tInfo.resultStep);
+            }
+          }
+        }
+      }
+    }
+    return "other";
+  }
+
+  function doesToolCallMatchCmdKeys(callerStep, tc, outStep, keys) {
+    if (!tc || !keys || keys.size === 0) return false;
+    const name = tc.name || "tool";
+    if (keys.has(`tool:${name}`)) return true;
+    const outcome = classifyToolCallOutcome(callerStep, outStep);
+    if (keys.has(`tool:${name}:${outcome}`)) return true;
+    if (outcome === "err" && keys.has("sub:errors")) return true;
+    if (outStep) {
+      if (outStep.status && keys.has(`status:${outStep.status}`)) return true;
+      if (keys.has(`type:${outStep.type || "GENERIC"}`)) return true;
+    }
+    return false;
+  }
+
   function getStepMatchingCmdKeys(step, attachedOutputs = null) {
     const matched = [];
     if (!step) return matched;
@@ -4036,16 +4094,28 @@
       matched.push("sub:final");
     }
 
+    const resolvedAttached = attachedOutputs || stepPairedOutputsMap.get(step) || null;
     if (Array.isArray(step.tool_calls)) {
       step.tool_calls.forEach((tc, idx) => {
         const name = tc.name || "tool";
-        const out = attachedOutputs && attachedOutputs[idx];
-        const isErr = out ? isCommandErrorStep(out) : false;
-        const isOk = out ? !isErr && out.status === "DONE" : false;
+        const out = resolvedAttached && resolvedAttached[idx];
+        const outcome = classifyToolCallOutcome(step, out);
         if (keys.has(`tool:${name}`)) matched.push(name);
-        if (isOk && keys.has(`tool:${name}:ok`)) matched.push(`${name} ✓`);
-        if (isErr && keys.has(`tool:${name}:err`)) matched.push(`${name} ⚠`);
+        if (outcome === "ok" && keys.has(`tool:${name}:ok`)) matched.push(`${name} ✓`);
+        if (outcome === "err" && keys.has(`tool:${name}:err`)) matched.push(`${name} ⚠`);
+        if (outcome === "other" && keys.has(`tool:${name}:other`)) matched.push(`${name} ⋯`);
+        if (outcome === "err" && keys.has("sub:errors") && !matched.includes("sub:errors")) matched.push("sub:errors");
       });
+    } else if (step.type === "GENERIC") {
+      const meta = stepToolMetaMap.get(step);
+      if (meta && meta.toolName) {
+        const name = meta.toolName;
+        const outcome = classifyToolCallOutcome(meta.callerStep || null, step);
+        if (keys.has(`tool:${name}`)) matched.push(name);
+        if (outcome === "ok" && keys.has(`tool:${name}:ok`)) matched.push(`${name} ✓`);
+        if (outcome === "err" && keys.has(`tool:${name}:err`)) matched.push(`${name} ⚠`);
+        if (outcome === "other" && keys.has(`tool:${name}:other`)) matched.push(`${name} ⋯`);
+      }
     }
     return matched;
   }
@@ -4095,6 +4165,7 @@
       existingCard.innerHTML = "";
     }
     rawStepMap.set(card, step);
+    cardAttachedMap.set(card, attachedOutputs || null);
     const statusCls = step.status ? `status-${step.status}` : "";
     const hasAnyErr =
       isCommandErrorStep(step) ||
@@ -4886,30 +4957,193 @@
     _tocBaseCache = null;
   }
 
+  function isAnyFocusedTrimActive() {
+    return Boolean(
+      (state.stepQuery && state.searchFocusedOnly) ||
+      (state.cmdMapFilterOnly && state.cmdMapFocusedOnly && state.cmdMapKeys && state.cmdMapKeys.size > 0)
+    );
+  }
+
+  function getCmdMapSigPart() {
+    if (!state.cmdMapFilterOnly || !state.cmdMapFocusedOnly || !state.cmdMapKeys || state.cmdMapKeys.size === 0) {
+      return "";
+    }
+    return `cmd:${Array.from(state.cmdMapKeys).sort().join("\x02")}`;
+  }
+
   function getHighlightSig() {
-    if (!state.stepQuery) return "";
-    return `${state.stepQuery}\x01${state.searchWholeWord ? 1 : 0}\x01${state.searchCaseSensitive ? 1 : 0}\x01${state.searchAcrossWholeTurn ? 1 : 0}\x01${state.searchFocusedOnly ? 1 : 0}\x01${state.lang || "en"}`;
+    const cmdPart = getCmdMapSigPart();
+    if (!state.stepQuery && !cmdPart) return "";
+    return `${state.stepQuery || ""}\x01${state.searchWholeWord ? 1 : 0}\x01${state.searchCaseSensitive ? 1 : 0}\x01${state.searchAcrossWholeTurn ? 1 : 0}\x01${state.searchFocusedOnly ? 1 : 0}\x01${cmdPart}\x01${state.lang || "en"}`;
+  }
+
+  function attachSearchRevealBar(rootEl, stepBodyEl, omittedCount) {
+    if (!rootEl || !stepBodyEl) return;
+    const oldBar = stepBodyEl.querySelector(":scope > .search-reveal-bar");
+    if (oldBar) oldBar.remove();
+    if (!omittedCount || omittedCount <= 0) {
+      rootEl.classList.remove("has-search-omitted");
+      return;
+    }
+    rootEl.classList.add("has-search-omitted");
+    const isUntrimmed = rootEl.classList.contains("is-search-untrimmed");
+    const bar = document.createElement("div");
+    bar.className = "search-reveal-bar";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "search-reveal-btn";
+    btn.textContent = isUntrimmed
+      ? t("card.searchHideTurn", { count: omittedCount })
+      : t("card.searchRevealTurn", { count: omittedCount });
+    btn.addEventListener("click", () => {
+      preserveScrollAnchor(() => {
+        const untrimmed = rootEl.classList.toggle("is-search-untrimmed");
+        btn.textContent = untrimmed
+          ? t("card.searchHideTurn", { count: omittedCount })
+          : t("card.searchRevealTurn", { count: omittedCount });
+        scheduleCardOverflowCheck(rootEl);
+      }, btn);
+      requestAnimationFrame(scheduleMinimapSync);
+    });
+    bar.appendChild(btn);
+    stepBodyEl.appendChild(bar);
+  }
+
+  function applyCmdMapFocusTrim(card, step, attachedOutputs = null) {
+    if (!card || !step || step.type !== "PLANNER_RESPONSE") return;
+    const keys = state.cmdMapKeys;
+    if (!state.cmdMapFilterOnly || !state.cmdMapFocusedOnly || !keys || keys.size === 0) return;
+    const stepBodyEl = card.querySelector(":scope > .step-body");
+    if (!stepBodyEl) return;
+    const resolvedAttached = attachedOutputs || cardAttachedMap.get(card) || stepPairedOutputsMap.get(step) || null;
+    const isFinalPlanner = Boolean(step.content && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0));
+
+    const evaluations = [];
+    let matchedCmdCount = 0;
+    let intersectKeptCount = 0;
+
+    for (const child of Array.from(stepBodyEl.children)) {
+      if (
+        child.classList.contains("search-reveal-bar") ||
+        child.classList.contains("inline-raw-pre") ||
+        child.classList.contains("show-more-btn") ||
+        child.classList.contains("read-hidden-note")
+      ) {
+        continue;
+      }
+      if (child.classList.contains("block-tools")) {
+        const toolCards = Array.from(child.querySelectorAll(":scope > .block-body > .tool-card"));
+        const tcEntries = toolCards.map((tcCard) => {
+          const idx = Number(tcCard.dataset.toolIdx);
+          const tc = Array.isArray(step.tool_calls) && Number.isFinite(idx) ? step.tool_calls[idx] : null;
+          const out = resolvedAttached && Number.isFinite(idx) ? resolvedAttached[idx] : null;
+          const cmdMatch = doesToolCallMatchCmdKeys(step, tc, out, keys);
+          const searchOmitted = child.classList.contains("search-omitted") || tcCard.classList.contains("search-omitted");
+          if (cmdMatch) {
+            matchedCmdCount++;
+            if (!searchOmitted) intersectKeptCount++;
+          }
+          return { tcCard, cmdMatch, searchOmitted };
+        });
+        evaluations.push({ kind: "tools", el: child, tcEntries });
+      } else {
+        let cmdMatch = false;
+        if (child.classList.contains("block-thinking")) {
+          cmdMatch = Boolean(step.thinking) && keys.has("sub:thinking");
+        } else if (child.classList.contains("media-strip")) {
+          cmdMatch = Array.isArray(step.media) && step.media.length > 0 && keys.has("sub:media");
+        } else if (child.classList.contains("md")) {
+          cmdMatch = isFinalPlanner && keys.has("sub:final");
+        } else if (child.classList.contains("error-box")) {
+          cmdMatch = (step.status === "ERROR" || Boolean(step.error)) && keys.has("sub:errors");
+        }
+        const searchOmitted = child.classList.contains("search-omitted");
+        if (cmdMatch) {
+          matchedCmdCount++;
+          if (!searchOmitted) intersectKeptCount++;
+        }
+        evaluations.push({ kind: "block", el: child, cmdMatch, searchOmitted });
+      }
+    }
+
+    // Never collapse an entire step body into zero visible blocks (e.g., when filtering by type:PLANNER_RESPONSE alone)
+    if (matchedCmdCount === 0 || (state.stepQuery && state.searchFocusedOnly && intersectKeptCount === 0)) {
+      return;
+    }
+
+    let omittedCount = 0;
+    for (const item of evaluations) {
+      if (item.kind === "tools") {
+        let keptTools = 0;
+        let omittedTools = 0;
+        for (const tce of item.tcEntries) {
+          const keep = tce.cmdMatch && !tce.searchOmitted;
+          if (keep) {
+            keptTools++;
+            tce.tcCard.classList.remove("search-omitted");
+            tce.tcCard.classList.add("search-hit-target");
+          } else {
+            tce.tcCard.classList.add("search-omitted");
+            omittedTools++;
+          }
+        }
+        if (keptTools > 0) {
+          item.el.classList.remove("search-omitted");
+          item.el.open = true;
+          omittedCount += omittedTools;
+        } else {
+          for (const tce of item.tcEntries) tce.tcCard.classList.remove("search-omitted");
+          item.el.classList.add("search-omitted");
+          omittedCount += Math.max(1, item.tcEntries.length);
+        }
+      } else {
+        const keep = item.cmdMatch && !item.searchOmitted;
+        if (keep) {
+          item.el.classList.remove("search-omitted");
+          if (item.el.tagName === "DETAILS") item.el.open = true;
+          if (!state.stepQuery) item.el.classList.add("search-hit-target");
+        } else {
+          item.el.classList.add("search-omitted");
+          omittedCount++;
+          if (item.el.classList.contains("generic-content-wrap")) {
+            for (const extra of stepBodyEl.querySelectorAll(":scope > .show-more-btn, :scope > .read-hidden-note")) {
+              extra.classList.add("search-omitted");
+            }
+          }
+        }
+      }
+    }
+
+    if (omittedCount > 0) {
+      attachSearchRevealBar(card, stepBodyEl, omittedCount);
+    }
   }
 
   function enhanceCardNow(card) {
     if (!card) return;
+    const step = rawStepMap.get(card) || null;
     if (card.dataset.enhanced !== "1") {
       card.dataset.enhanced = "1";
-      linkifyTaskIdsInElement(card, rawStepMap.get(card) || null);
+      linkifyTaskIdsInElement(card, step);
       linkifyElement(card);
     }
     const hlSig = getHighlightSig();
-    if (state.stepQuery) {
+    if (hlSig) {
       if (card.dataset.hlQuery !== hlSig) {
         if (card.dataset.hlQuery) clearCardHighlight(card);
-        highlightMatches(card, state.stepQuery, {
-          ...getSearchOpts(),
-          trimNonMatching: state.searchFocusedOnly && card.tagName === "ARTICLE",
-          cardEl: card,
-        });
+        if (state.stepQuery) {
+          highlightMatches(card, state.stepQuery, {
+            ...getSearchOpts(),
+            trimNonMatching: state.searchFocusedOnly && card.tagName === "ARTICLE",
+            cardEl: card,
+          });
+        }
+        if (card.tagName === "ARTICLE" && !card.classList.contains("type-GENERIC")) {
+          applyCmdMapFocusTrim(card, step, cardAttachedMap.get(card) || null);
+        }
         card.dataset.hlQuery = hlSig;
         _highlightedCards.add(card);
-        if (card.isConnected) applyInitialSearchScrolls(card);
+        if (card.isConnected && state.stepQuery) applyInitialSearchScrolls(card);
       }
     } else if (card.dataset.hlQuery) {
       clearCardHighlight(card);
@@ -4998,6 +5232,107 @@
     return false;
   }
 
+  // ---------- Newly Arrived Step Blinking Border (deferred until tab visible & scrolled into view) ----------
+  const FRESH_PULSE_DURATION_MS = 4500;
+  const FRESH_PENDING_MAX = 120;
+  const _freshPendingKeys = new Set();
+  const _freshActiveUntilMap = new Map();
+  let _freshCleanupTimer = 0;
+
+  function clearFreshPulses() {
+    _freshPendingKeys.clear();
+    _freshActiveUntilMap.clear();
+    if (_freshCleanupTimer) {
+      clearTimeout(_freshCleanupTimer);
+      _freshCleanupTimer = 0;
+    }
+  }
+
+  function markFreshSteps(keys) {
+    if (!keys) return;
+    for (const rawKey of keys) {
+      if (rawKey === null || rawKey === undefined || rawKey === "") continue;
+      const key = String(rawKey);
+      if (!_freshActiveUntilMap.has(key)) {
+        if (_freshPendingKeys.has(key)) _freshPendingKeys.delete(key);
+        _freshPendingKeys.add(key);
+      }
+    }
+    while (_freshPendingKeys.size > FRESH_PENDING_MAX) {
+      const oldest = _freshPendingKeys.values().next().value;
+      _freshPendingKeys.delete(oldest);
+    }
+  }
+
+  function isStepFreshNow(stepKey, now = Date.now()) {
+    if (!stepKey) return false;
+    const key = String(stepKey);
+    if (_freshPendingKeys.has(key)) return true;
+    const exp = _freshActiveUntilMap.get(key);
+    return typeof exp === "number" && exp > now;
+  }
+
+  function syncCardFreshPulse(card, stepKey, now = Date.now()) {
+    if (!card || !card.classList) return;
+    card.classList.toggle("step-new-pulse", isStepFreshNow(stepKey, now));
+  }
+
+  function scheduleFreshPulseCleanup(now = Date.now()) {
+    if (_freshCleanupTimer) {
+      clearTimeout(_freshCleanupTimer);
+      _freshCleanupTimer = 0;
+    }
+    let minExp = Infinity;
+    for (const exp of _freshActiveUntilMap.values()) {
+      if (exp < minExp) minExp = exp;
+    }
+    if (Number.isFinite(minExp)) {
+      const waitMs = Math.max(40, Math.ceil(minExp - now) + 25);
+      _freshCleanupTimer = setTimeout(() => {
+        _freshCleanupTimer = 0;
+        activateVisibleFreshPulses();
+      }, waitMs);
+    }
+  }
+
+  function activateVisibleFreshPulses() {
+    const now = Date.now();
+    for (const [k, exp] of _freshActiveUntilMap.entries()) {
+      if (exp <= now) _freshActiveUntilMap.delete(k);
+    }
+
+    const canSeeNow =
+      typeof document !== "undefined" &&
+      document.visibilityState === "visible" &&
+      els.feedWrap &&
+      els.feedWrap.clientHeight > 0;
+
+    if (canSeeNow && _freshPendingKeys.size > 0 && _vWindow) {
+      const wrapRect = els.feedWrap.getBoundingClientRect();
+      for (const el of _vWindow.children) {
+        const key = el.dataset?.stepIndex;
+        if (!key || !_freshPendingKeys.has(key) || el.dataset?.isSkeleton === "1") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.height > 0 && rect.bottom > wrapRect.top + 8 && rect.top < wrapRect.bottom - 8) {
+          _freshPendingKeys.delete(key);
+          _freshActiveUntilMap.set(key, now + FRESH_PULSE_DURATION_MS);
+        }
+      }
+    }
+
+    if (_vWindow) {
+      for (const el of _vWindow.children) {
+        if (el.dataset?.isSkeleton === "1") continue;
+        const key = el.dataset?.stepIndex || "";
+        if (el.classList.contains("step-new-pulse") || isStepFreshNow(key, now)) {
+          syncCardFreshPulse(el, key, now);
+        }
+      }
+    }
+
+    scheduleFreshPulseCleanup(now);
+  }
+
   function touchLruItem(item, el, cfgKey) {
     item.el = el;
     item.cfgKey = cfgKey;
@@ -5018,6 +5353,7 @@
     const cfgKey = _cardRenderConfigKey || getRenderConfigKey();
     if (item.el && item.cfgKey === cfgKey) {
       enhanceCardNow(item.el);
+      if (item.kind !== "expand") syncCardFreshPulse(item.el, item.stepKey);
       touchLruItem(item, item.el, cfgKey);
       return item.el;
     }
@@ -5027,6 +5363,7 @@
     } else {
       el = buildStepElement(item.step, item.attached);
       enhanceCardNow(el);
+      syncCardFreshPulse(el, item.stepKey);
     }
     el.dataset.vIdx = String(item.idx);
     touchLruItem(item, el, cfgKey);
@@ -5203,8 +5540,8 @@
     _prewarmIsIdle = false;
     if (!_vItems.length || !els.feedWrap || _scrollbarDragging) return;
     const now = Date.now();
-    if (now - _lastUserScrollMs < 220 || now - _lastComposerTypeMs < 300) {
-      _schedulePrewarmLru(240);
+    if (now - _lastUserScrollMs < 220 || now - _lastComposerTypeMs < 420) {
+      _schedulePrewarmLru(260);
       return;
     }
     const n = _vItems.length;
@@ -5468,6 +5805,9 @@
       }
     } else {
       _schedulePrewarmLru(160);
+    }
+    if (_freshPendingKeys.size > 0 || _freshActiveUntilMap.size > 0) {
+      activateVisibleFreshPulses();
     }
   }
 
@@ -5785,7 +6125,7 @@
     return txt;
   }
 
-  function renderCacheMapAndToc(preAttachedByPlanner = null) {
+  function renderCacheMapAndToc(preAttachedByPlanner = null, preMatchedSet = null) {
     const existing = document.getElementById("cacheMapCard");
     if (existing) existing.remove();
     if (!state.steps.length) return;
@@ -5824,8 +6164,12 @@
 
       for (const s of state.steps) {
         if (isFiltered) {
-          const attached = attachedByPlanner.get(s) || null;
-          if (!stepMatchesFilter(s, attached)) continue;
+          if (preMatchedSet) {
+            if (!preMatchedSet.has(s)) continue;
+          } else {
+            const attached = attachedByPlanner.get(s) || null;
+            if (!stepMatchesFilter(s, attached)) continue;
+          }
         }
 
         const hasTok =
@@ -6589,25 +6933,7 @@
       }
 
       if (omittedCount > 0) {
-        rootEl.classList.add("has-search-omitted");
-        const bar = document.createElement("div");
-        bar.className = "search-reveal-bar";
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "search-reveal-btn";
-        btn.textContent = t("card.searchRevealTurn", { count: omittedCount });
-        btn.addEventListener("click", () => {
-          preserveScrollAnchor(() => {
-            const untrimmed = rootEl.classList.toggle("is-search-untrimmed");
-            btn.textContent = untrimmed
-              ? t("card.searchHideTurn", { count: omittedCount })
-              : t("card.searchRevealTurn", { count: omittedCount });
-            scheduleCardOverflowCheck(rootEl);
-          }, btn);
-          requestAnimationFrame(scheduleMinimapSync);
-        });
-        bar.appendChild(btn);
-        stepBodyEl.appendChild(bar);
+        attachSearchRevealBar(rootEl, stepBodyEl, omittedCount);
       }
     }
   }
@@ -6705,14 +7031,14 @@
       _tocBaseCache = null;
       _cardRenderConfigKey = cfgKey;
     }
-    const curSearchTrim = Boolean(state.stepQuery && state.searchFocusedOnly);
+    const curSearchTrim = isAnyFocusedTrimActive();
     els.feed.classList.toggle("is-read-full", state.readDisplayMode === "full" || state.expandAllOutputs);
     els.feed.classList.toggle("is-search-focused", curSearchTrim);
 
-    // Strip stale search highlights ONLY from the small set of previously highlighted cards
+    // Strip stale search/cmdMap highlights ONLY from the small set of previously highlighted cards
     const curHlSig = getHighlightSig();
     for (const hCard of Array.from(_highlightedCards)) {
-      if (!state.stepQuery || hCard.dataset.hlQuery !== curHlSig) {
+      if (!curHlSig || hCard.dataset.hlQuery !== curHlSig) {
         clearCardHighlight(hCard);
       }
     }
@@ -6721,6 +7047,7 @@
     const { attachedByPlanner, attachedSet } = pairToolOutputs(state.steps);
     let shown = 0;
     let hiddenBetween = [];
+    const matchedStepSet = new Set();
 
     const pushExpandItem = (stepsList) => {
       _vItems.push({
@@ -6775,7 +7102,7 @@
       };
       if (item.el) {
         item.el.dataset.vIdx = String(item.idx);
-        if (item.el.dataset.hasEditDiff === "1") {
+        if (!state.stepQuery && item.el.dataset.hasEditDiff === "1") {
           const argWraps = item.el.querySelectorAll(".tool-args");
           for (const aw of argWraps) {
             const rr = toolArgsReplaceRowMap.get(aw);
@@ -6791,6 +7118,7 @@
       if (attachedSet.has(s)) continue;
       const attached = attachedByPlanner.get(s) || null;
       if (stepMatchesFilter(s, attached)) {
+        matchedStepSet.add(s);
         if (state.filter === "dialog" && hiddenBetween.length > 0 && shown > 0) {
           pushExpandItem(hiddenBetween);
           hiddenBetween = [];
@@ -6832,7 +7160,7 @@
 
     els.feed.appendChild(_vListBox);
     updateVSpacers();
-    renderCacheMapAndToc(attachedByPlanner);
+    renderCacheMapAndToc(attachedByPlanner, matchedStepSet);
     appendBottomTocLink();
     recomputeTotals();
 
@@ -6951,10 +7279,17 @@
     const cfgKey = getRenderConfigKey();
     if (!_cardRenderConfigKey) _cardRenderConfigKey = cfgKey;
     els.feed.classList.toggle("is-read-full", state.readDisplayMode === "full" || state.expandAllOutputs);
-    els.feed.classList.toggle("is-search-focused", Boolean(state.stepQuery && state.searchFocusedOnly));
+    els.feed.classList.toggle("is-search-focused", isAnyFocusedTrimActive());
 
     const newStepSet = new Set(newSteps);
     const renderedNewIndices = new Set();
+    const freshStepKeys = new Set();
+    for (const s of newSteps) {
+      if (s && s.step_index !== undefined && s.step_index !== null) {
+        freshStepKeys.add(String(s.step_index));
+      }
+    }
+    for (const sk of touchedEarlierSteps) freshStepKeys.add(String(sk));
 
     const hint = _vWindow ? _vWindow.querySelector(".empty-hint") : els.feed.querySelector(".empty-hint");
     if (hint) hint.remove();
@@ -6992,6 +7327,7 @@
       }
       if (newStepSet.has(s) || (attached && attached.some((g) => newStepSet.has(g)))) {
         addedVisible++;
+        if (item.stepKey) freshStepKeys.add(item.stepKey);
       }
     };
 
@@ -7112,6 +7448,7 @@
 
     recomputeVItemOffsets(dirtyFromIdx);
     updateVSpacers();
+    markFreshSteps(freshStepKeys);
     appendBottomTocLink();
     addStepTotals(newSteps);
 
@@ -7191,6 +7528,7 @@
         if (state.firstUnreadStepIndex !== null) notifyNewMessageButton();
       }
     }
+    requestAnimationFrame(activateVisibleFreshPulses);
   }
 
   function clearHashStepIfScrolledAway() {
@@ -7467,6 +7805,7 @@
     const targetStep = opts && opts.targetStep !== undefined && opts.targetStep !== null ? String(opts.targetStep) : "";
     _pendingNavStep = targetStep;
     closeStream();
+    clearFreshPulses();
     cancelVirtualTimers();
     clearVWindowDom();
     _lruMap.clear();
@@ -7816,19 +8155,88 @@
     return null;
   }
 
+  function captureTocSearchView() {
+    const fw = els.feedWrap;
+    const mapCard = typeof document !== "undefined" ? document.getElementById("cacheMapCard") : null;
+    if (!fw || !mapCard) return null;
+    const wrapRect = fw.getBoundingClientRect();
+    const mapRect = mapCard.getBoundingClientRect();
+    if (mapRect.height <= 0 || mapRect.bottom <= wrapRect.top + 20 || mapRect.top >= wrapRect.bottom - 20) {
+      return null;
+    }
+    const det = mapCard.querySelector(".cache-map-details");
+    const detOpen = det ? Boolean(det.open) : true;
+    const tocMain = (detOpen && mapCard.querySelector(".toc-wrap")) || mapCard;
+    const mainRect = tocMain.getBoundingClientRect();
+    const headVisible = mapRect.top >= wrapRect.top - 24;
+    const tocVisiblePx = Math.min(mainRect.bottom, wrapRect.bottom) - Math.max(mainRect.top, wrapRect.top);
+    if (!headVisible && tocVisiblePx < 48) {
+      return null;
+    }
+    return {
+      inView: true,
+      headVisible,
+      scrollTop: fw.scrollTop,
+      topInWrap: mapRect.top - wrapRect.top,
+    };
+  }
+
+  function restoreTocSearchView(tocView) {
+    const fw = els.feedWrap;
+    if (!fw || !tocView) return;
+    const mapCard = typeof document !== "undefined" ? document.getElementById("cacheMapCard") : null;
+    if (!mapCard) {
+      _suppressScrollTsUntil = performance.now() + 260;
+      fw.scrollTop = 0;
+      _lastScrollFrameTop = 0;
+      syncVirtualWindow({ forceRender: true });
+      updateScrollUiOnFrame();
+      return;
+    }
+    const det = mapCard.querySelector(".cache-map-details");
+    const detOpen = det ? Boolean(det.open) : true;
+    const tocMain = (detOpen && mapCard.querySelector(".toc-wrap")) || mapCard;
+    const fwRect = fw.getBoundingClientRect();
+    const mainRect = tocMain.getBoundingClientRect();
+    const curScroll = fw.scrollTop;
+    const mainBotInContent = curScroll + (mainRect.bottom - fwRect.top);
+    const mainH = Math.max(0, mainRect.height || tocMain.offsetHeight || 0);
+    const desiredMinVis = mainH > 0 ? Math.min(mainH, 120) : 40;
+    const maxScrollForToc = Math.max(0, mainBotInContent - desiredMinVis);
+    let targetTop = Math.max(0, Math.min(tocView.scrollTop || 0, maxScrollForToc));
+    const maxPossible = Math.max(0, fw.scrollHeight - fw.clientHeight);
+    targetTop = Math.max(0, Math.min(targetTop, maxPossible));
+    if (maxPossible > 20) {
+      state.userScrolledUp = true;
+    }
+    _suppressScrollTsUntil = performance.now() + 260;
+    fw.scrollTop = targetTop;
+    _lastScrollFrameTop = targetTop;
+    syncVirtualWindow({ forceRender: true });
+    updateScrollUiOnFrame();
+  }
+
   function applySearchQueryChange(nextVal) {
     const val = String(nextVal || "").trim();
     if (val === state.stepQuery) return;
     const prevQuery = state.stepQuery;
     const isClearing = Boolean(prevQuery && val === "");
     const hadActiveSearch = Boolean(prevQuery);
-    const anchor = (isClearing || hadActiveSearch || state.userScrolledUp) ? captureSearchContextAnchor() : null;
+    const tocView = captureTocSearchView();
+    const anchor = !tocView && (isClearing || hadActiveSearch || state.userScrolledUp)
+      ? captureSearchContextAnchor()
+      : null;
 
     state.stepQuery = val;
     if (anchor) {
       state.userScrolledUp = true;
     }
-    renderFullFeed({ skipWindowSync: Boolean(anchor && anchor.stepIndex) });
+    const deferWindow = Boolean(tocView || (anchor && anchor.stepIndex));
+    renderFullFeed({ skipWindowSync: deferWindow });
+    if (tocView) {
+      restoreTocSearchView(tocView);
+      return;
+    }
     if (anchor && anchor.stepIndex) {
       let targetStep = String(anchor.stepIndex);
       if (!_vStepToItemMap.has(targetStep) && isClearing) {
@@ -8008,11 +8416,14 @@
     }
   }
 
+  const SEARCH_DEBOUNCE_MS = 380;
   let searchTimer = null;
   let searchHistorySettleTimer = null;
   els.stepSearch.addEventListener("input", (e) => {
     clearTimeout(searchTimer);
     clearTimeout(searchHistorySettleTimer);
+    _lastComposerTypeMs = Date.now();
+    cancelPrewarmLru();
     if (isSearchHistoryOpen()) closeSearchHistoryPopover();
     const val = e.target.value.trim();
     if (val === "") {
@@ -8021,7 +8432,7 @@
     }
     searchTimer = setTimeout(() => {
       applySearchQueryChange(val);
-    }, 200);
+    }, SEARCH_DEBOUNCE_MS);
     if (val.length >= 2) {
       searchHistorySettleTimer = setTimeout(() => {
         if (els.stepSearch.value.trim() === val) recordSearchHistory(val);
@@ -8140,10 +8551,13 @@
     } catch (_) {}
     syncSearchOptionInputs();
     if (state.stepQuery) {
-      const anchor = captureSearchContextAnchor();
+      const tocView = captureTocSearchView();
+      const anchor = !tocView ? captureSearchContextAnchor() : null;
       if (anchor) state.userScrolledUp = true;
-      renderFullFeed({ skipWindowSync: Boolean(anchor && anchor.stepIndex) });
-      if (anchor && anchor.stepIndex) {
+      renderFullFeed({ skipWindowSync: Boolean(tocView || (anchor && anchor.stepIndex)) });
+      if (tocView) {
+        restoreTocSearchView(tocView);
+      } else if (anchor && anchor.stepIndex) {
         if (_vStepToItemMap.has(String(anchor.stepIndex))) {
           jumpToStep(anchor.stepIndex, {
             topOffset: anchor.topInWrap,
@@ -8678,6 +9092,9 @@
     syncJumpBottomButtonState(showBottom);
 
     syncVirtualWindow();
+    if (_freshPendingKeys.size > 0 || _freshActiveUntilMap.size > 0) {
+      activateVisibleFreshPulses();
+    }
     updateActiveMinimapNotch(scrollTop, clientH, scrollH);
     if (_tocDirty && scrollTop < 500) {
       refreshTocNowIfNeeded();
@@ -9091,7 +9508,7 @@
       ".tool-head",
       ".tool-result-head",
       ".cmd-exec-head",
-      ".arg-row-inline:not(.arg-row-stacked)",
+      ".arg-row-inline",
       ".arg-row-cmd-head",
       ".tok-bar",
       ".read-hidden-note",
@@ -9139,9 +9556,11 @@
           if (s) pieces.push(s);
           return;
         }
-        if (node.nodeType !== 1) return;
-        if (node.matches && node.matches(SKIP_SEL)) return;
-        if (node.classList && node.classList.contains("hidden")) return;
+        if (node.nodeType !== 1 && node.nodeType !== 11) return;
+        if (node.nodeType === 1) {
+          if (node.matches && node.matches(SKIP_SEL)) return;
+          if (node.classList && node.classList.contains("hidden")) return;
+        }
         for (const ch of node.childNodes) walk(ch);
       };
       walk(root);
@@ -9174,6 +9593,12 @@
       if (node.classList && node.classList.contains("hidden")) return;
       if (node.tagName === "BR") {
         curBuf += "\n";
+        return;
+      }
+      if (node.classList && node.classList.contains("arg-row-stacked")) {
+        flushBuf();
+        const stackedTxt = collectInlineMetaText(node);
+        if (stackedTxt) segments.push({ kind: "block", text: stackedTxt });
         return;
       }
       if (isInlineMetaEl(node)) {
@@ -9281,6 +9706,24 @@
       !els.cmdMapModal.classList.contains("hidden") ||
       !els.fileOpenModal.classList.contains("hidden") ||
       !els.lightbox.classList.contains("hidden");
+    const isCtrlQuoteShortcut =
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey &&
+      !e.shiftKey &&
+      (e.code === "Quote" || e.key === "'" || e.key === "э" || e.key === "Э");
+    if (!modalOpen && isCtrlQuoteShortcut) {
+      e.preventDefault();
+      const willCollapse = !els.appRoot.classList.contains("composer-collapsed");
+      if (willCollapse && activeEl && els.composerForm && els.composerForm.contains(activeEl) && els.feedWrap) {
+        els.feedWrap.focus({ preventScroll: true });
+      }
+      applyComposerCollapsed(willCollapse);
+      if (!willCollapse) {
+        els.promptInput.focus();
+      }
+      return;
+    }
+
     const isSlashShortcut =
       e.key === "/" && !e.ctrlKey && !e.altKey && !e.metaKey && !inEditable;
     const isCtrlDotShortcut =
@@ -9412,13 +9855,14 @@
   function updateCmdMapButtonLabel() {
     const n = state.cmdMapKeys.size;
     els.openCmdMapBtn.textContent = n > 0 ? t("toolbar.cmdMapCount", { count: n }) : t("toolbar.cmdMap");
+    els.openCmdMapBtn.classList.toggle("active", Boolean(state.cmdMapFilterOnly && n > 0));
   }
 
   function buildCommandMapStats() {
-    const { attachedByPlanner } = pairToolOutputs(state.steps);
+    const { attachedByPlanner } = pairToolOutputs(state.steps, true);
     const typeCounts = new Map();
     const statusCounts = new Map();
-    const toolStats = new Map(); // name -> { total, ok, err, files: Set }
+    const toolStats = new Map(); // name -> { total, ok, err, other, files: Set }
     let subFinal = 0;
     let subThinking = 0;
     let subMedia = 0;
@@ -9428,7 +9872,8 @@
     for (const s of state.steps) {
       typeCounts.set(s.type || "UNKNOWN", (typeCounts.get(s.type || "UNKNOWN") || 0) + 1);
       if (s.status) statusCounts.set(s.status, (statusCounts.get(s.status) || 0) + 1);
-      if (isCommandErrorStep(s)) subErrors++;
+      const isStepErr = isCommandErrorStep(s);
+      if (isStepErr) subErrors++;
       if (s.thinking) subThinking++;
       if (Array.isArray(s.media) && s.media.length > 0) subMedia++;
       if (
@@ -9445,18 +9890,31 @@
           totalTools++;
           const name = tc.name || "tool";
           if (!toolStats.has(name)) {
-            toolStats.set(name, { total: 0, ok: 0, err: 0, files: new Set() });
+            toolStats.set(name, { total: 0, ok: 0, err: 0, other: 0, files: new Set() });
           }
           const st = toolStats.get(name);
           st.total++;
           const out = attached[idx];
-          if (out) {
-            if (isCommandErrorStep(out)) st.err++;
-            else if (out.status === "DONE") st.ok++;
-          }
+          const outcome = classifyToolCallOutcome(s, out);
+          if (outcome === "ok") st.ok++;
+          else if (outcome === "err") st.err++;
+          else st.other++;
           const args = tc.args || {};
-          const fpath = args.Path || args.TargetFile || args.DirectoryPath;
-          if (fpath) st.files.add(String(fpath).split(/[/\\]/).pop());
+          const fpath =
+            args.Path ||
+            args.TargetFile ||
+            args.AbsolutePath ||
+            args.FilePath ||
+            args.DirectoryPath ||
+            args.SearchPath ||
+            args.TargetDirectory ||
+            args.Directory ||
+            args.file ||
+            args.path;
+          if (fpath) {
+            const base = String(fpath).split(/[/\\]/).filter(Boolean).pop();
+            if (base) st.files.add(base);
+          }
         });
       }
     }
@@ -9466,7 +9924,27 @@
   function applyCmdMapSelectionChange() {
     updateCmdMapButtonLabel();
     if (state.cmdMapFilterOnly) {
-      renderFullFeed();
+      const tocView = captureTocSearchView();
+      const anchor = !tocView ? captureSearchContextAnchor() : null;
+      if (anchor) state.userScrolledUp = true;
+      renderFullFeed({ skipWindowSync: Boolean(tocView || (anchor && anchor.stepIndex)) });
+      if (tocView) {
+        restoreTocSearchView(tocView);
+      } else if (anchor && anchor.stepIndex) {
+        if (_vStepToItemMap.has(String(anchor.stepIndex))) {
+          jumpToStep(anchor.stepIndex, {
+            topOffset: anchor.topInWrap,
+            toolOutStep: anchor.toolOutStep,
+            toolIdx: anchor.toolIdx,
+            subAnchor: anchor.subAnchor,
+            resetFiltersOnMissing: false,
+          });
+          requestAnimationFrame(updateScrollUiOnFrame);
+        } else {
+          syncVirtualWindow({ forceRender: true });
+          updateScrollUiOnFrame();
+        }
+      }
     } else {
       scheduleMinimapRender();
     }
@@ -9479,6 +9957,7 @@
       allSelectableKeys.push(key);
       return state.cmdMapKeys.has(key) ? "checked" : "";
     };
+    const hasKey = (key) => state.cmdMapKeys.has(key);
 
     const totIn = state.totals.inTok + state.totals.cacheTok;
     const hitPct = totIn > 0 ? ((state.totals.cacheTok / totIn) * 100).toFixed(1) : "0.0";
@@ -9486,59 +9965,76 @@
     const toolsSorted = Array.from(stats.toolStats.entries()).sort((a, b) => b[1].total - a[1].total);
     const toolsHtml = toolsSorted
       .map(([name, info]) => {
-        const filesList = Array.from(info.files).slice(0, 6).join(", ");
+        const allFiles = Array.from(info.files);
+        const shownFiles = allFiles.slice(0, 6).join(", ");
+        const extraFiles = allFiles.length > 6 ? ` (+${allFiles.length - 6})` : "";
+        const filesDisplay = shownFiles ? `${shownFiles}${extraFiles}` : "";
+        const filesFull = allFiles.join(", ");
+        const kTool = `tool:${name}`;
+        const kOk = `tool:${name}:ok`;
+        const kErr = `tool:${name}:err`;
+        const kOther = `tool:${name}:other`;
+        const cardChecked = hasKey(kTool) || hasKey(kOk) || hasKey(kErr) || (info.other > 0 && hasKey(kOther));
         return `
-          <div class="cmd-group-card">
+          <div class="cmd-group-card${cardChecked ? " is-checked" : ""}">
             <div class="cmd-group-head">
               <label class="cmd-check-label">
-                <input type="checkbox" data-cmd-key="tool:${escHtml(name)}" ${chk(`tool:${name}`)}>
+                <input type="checkbox" data-cmd-key="${escHtml(kTool)}" ${chk(kTool)}>
                 <span>${escHtml(name)}</span>
               </label>
               <span class="meta-chip">${escHtml(t("cmdMap.callsChip", { count: info.total }))}</span>
             </div>
             <div class="cmd-sub-row">
-              <label class="cmd-sub-check is-ok">
-                <input type="checkbox" data-cmd-key="tool:${escHtml(name)}:ok" ${chk(`tool:${name}:ok`)}>
+              <label class="cmd-sub-check is-ok${hasKey(kOk) ? " is-checked" : ""}">
+                <input type="checkbox" data-cmd-key="${escHtml(kOk)}" ${chk(kOk)}>
                 <span>${escHtml(t("cmdMap.okCount", { count: info.ok }))}</span>
               </label>
-              <label class="cmd-sub-check is-err">
-                <input type="checkbox" data-cmd-key="tool:${escHtml(name)}:err" ${chk(`tool:${name}:err`)}>
+              <label class="cmd-sub-check is-err${hasKey(kErr) ? " is-checked" : ""}">
+                <input type="checkbox" data-cmd-key="${escHtml(kErr)}" ${chk(kErr)}>
                 <span>${escHtml(t("cmdMap.errCount", { count: info.err }))}</span>
               </label>
+              ${info.other > 0 ? `
+                <label class="cmd-sub-check is-other${hasKey(kOther) ? " is-checked" : ""}">
+                  <input type="checkbox" data-cmd-key="${escHtml(kOther)}" ${chk(kOther)}>
+                  <span>${escHtml(t("cmdMap.otherCount", { count: info.other }))}</span>
+                </label>
+              ` : ""}
             </div>
-            ${filesList ? `<div class="cmd-files-note" title="${escHtml(filesList)}">${escHtml(t("cmdMap.filesLabel", { files: filesList }))}</div>` : ""}
+            ${filesDisplay ? `<div class="cmd-files-note" title="${escHtml(t("cmdMap.filesTitle", { count: allFiles.length, files: filesFull }))}">${escHtml(t("cmdMap.filesLabel", { files: filesDisplay }))}</div>` : ""}
           </div>
         `;
       })
       .join("");
 
     const typesHtml = Array.from(stats.typeCounts.entries())
-      .map(
-        ([tName, cnt]) => `
-        <label class="cmd-sub-check">
-          <input type="checkbox" data-cmd-key="type:${escHtml(tName)}" ${chk(`type:${tName}`)}>
+      .map(([tName, cnt]) => {
+        const k = `type:${tName}`;
+        return `
+        <label class="cmd-sub-check${hasKey(k) ? " is-checked" : ""}">
+          <input type="checkbox" data-cmd-key="${escHtml(k)}" ${chk(k)}>
           <span>${escHtml(tName)}: ${cnt}</span>
         </label>
-      `
-      )
+      `;
+      })
       .join("");
 
     const statusesHtml = Array.from(stats.statusCounts.entries())
-      .map(
-        ([st, cnt]) => `
-        <label class="cmd-sub-check">
-          <input type="checkbox" data-cmd-key="status:${escHtml(st)}" ${chk(`status:${st}`)}>
+      .map(([st, cnt]) => {
+        const k = `status:${st}`;
+        return `
+        <label class="cmd-sub-check${hasKey(k) ? " is-checked" : ""}">
+          <input type="checkbox" data-cmd-key="${escHtml(k)}" ${chk(k)}>
           <span>status=${escHtml(st)}: ${cnt}</span>
         </label>
-      `
-      )
+      `;
+      })
       .join("");
 
     const subtypesHtml = `
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:final" ${chk("sub:final")}><span>${escHtml(t("cmdMap.subFinal", { count: stats.subFinal }))}</span></label>
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:thinking" ${chk("sub:thinking")}><span>${escHtml(t("cmdMap.subThinking", { count: stats.subThinking }))}</span></label>
-      <label class="cmd-sub-check"><input type="checkbox" data-cmd-key="sub:media" ${chk("sub:media")}><span>${escHtml(t("cmdMap.subMedia", { count: stats.subMedia }))}</span></label>
-      <label class="cmd-sub-check is-err"><input type="checkbox" data-cmd-key="sub:errors" ${chk("sub:errors")}><span>${escHtml(t("cmdMap.subErrors", { count: stats.subErrors }))}</span></label>
+      <label class="cmd-sub-check${hasKey("sub:final") ? " is-checked" : ""}"><input type="checkbox" data-cmd-key="sub:final" ${chk("sub:final")}><span>${escHtml(t("cmdMap.subFinal", { count: stats.subFinal }))}</span></label>
+      <label class="cmd-sub-check${hasKey("sub:thinking") ? " is-checked" : ""}"><input type="checkbox" data-cmd-key="sub:thinking" ${chk("sub:thinking")}><span>${escHtml(t("cmdMap.subThinking", { count: stats.subThinking }))}</span></label>
+      <label class="cmd-sub-check${hasKey("sub:media") ? " is-checked" : ""}"><input type="checkbox" data-cmd-key="sub:media" ${chk("sub:media")}><span>${escHtml(t("cmdMap.subMedia", { count: stats.subMedia }))}</span></label>
+      <label class="cmd-sub-check is-err${hasKey("sub:errors") ? " is-checked" : ""}"><input type="checkbox" data-cmd-key="sub:errors" ${chk("sub:errors")}><span>${escHtml(t("cmdMap.subErrors", { count: stats.subErrors }))}</span></label>
     `;
 
     els.cmdMapBody.dataset.allKeys = JSON.stringify(allSelectableKeys);
@@ -9568,6 +10064,7 @@
   els.openCmdMapBtn.addEventListener("click", () => {
     renderCommandMapModal();
     els.cmdMapFilterOnly.checked = state.cmdMapFilterOnly;
+    if (els.cmdMapFocusedOnly) els.cmdMapFocusedOnly.checked = state.cmdMapFocusedOnly;
     els.cmdMapModal.classList.remove("hidden");
   });
 
@@ -9582,13 +10079,32 @@
     const key = inp.dataset.cmdKey;
     if (inp.checked) state.cmdMapKeys.add(key);
     else state.cmdMapKeys.delete(key);
+    const pill = inp.closest(".cmd-sub-check");
+    if (pill) pill.classList.toggle("is-checked", inp.checked);
+    const groupCard = inp.closest(".cmd-group-card");
+    if (groupCard) {
+      const anyChecked = Array.from(groupCard.querySelectorAll("input[data-cmd-key]")).some((el) => el.checked);
+      groupCard.classList.toggle("is-checked", anyChecked);
+    }
     applyCmdMapSelectionChange();
   });
 
   els.cmdMapFilterOnly.addEventListener("change", (e) => {
     state.cmdMapFilterOnly = e.target.checked;
-    renderFullFeed();
+    applyCmdMapSelectionChange();
   });
+
+  if (els.cmdMapFocusedOnly) {
+    els.cmdMapFocusedOnly.addEventListener("change", (e) => {
+      state.cmdMapFocusedOnly = Boolean(e.target.checked);
+      try {
+        localStorage.setItem("tv_cmd_map_focused", state.cmdMapFocusedOnly ? "1" : "0");
+      } catch (_) {}
+      if (state.cmdMapFilterOnly && state.cmdMapKeys.size > 0) {
+        applyCmdMapSelectionChange();
+      }
+    });
+  }
 
   els.cmdMapSelectAll.addEventListener("click", () => {
     try {
@@ -9703,6 +10219,16 @@
       els.composerStatus.dataset.tipTitle = t("composer.agSendingTitle");
       els.composerStatus.dataset.tipDesc = t("composer.agSendingDesc");
       els.composerStatus.dataset.tipRaw = "sending...";
+    } else if (mode === "sent") {
+      els.composerStatus.textContent = t("composer.agSentLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.agSentTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agSentDesc");
+      els.composerStatus.dataset.tipRaw = windowTitle ? `status: sent | ${windowTitle}` : "status: sent";
+    } else if (mode === "appended") {
+      els.composerStatus.textContent = t("composer.agAppendedLabel");
+      els.composerStatus.dataset.tipTitle = t("composer.agAppendedTitle");
+      els.composerStatus.dataset.tipDesc = t("composer.agAppendedDesc");
+      els.composerStatus.dataset.tipRaw = windowTitle ? `status: appended | ${windowTitle}` : "status: appended";
     } else if (mode === "pasted") {
       els.composerStatus.textContent = t("composer.agPastedLabel");
       els.composerStatus.dataset.tipTitle = t("composer.agPastedTitle");
@@ -9762,7 +10288,8 @@
       const data = await res.json();
       if (data.ok) {
         els.promptInput.value = "";
-        setComposerStatus("pasted");
+        const stMode = data.status === "sent" ? "sent" : data.status === "appended" ? "appended" : "pasted";
+        setComposerStatus(stMode, data.info || "");
       } else {
         try { await navigator.clipboard.writeText(text); } catch (_) {}
         setComposerStatus("error", t("composer.copiedErrorSuffix", { msg: data.info || data.error || t("topbar.liveError") }));
@@ -9885,6 +10412,7 @@
     let savedSearchWholeTurn = false;
     let savedSearchWholeWord = false;
     let savedSearchCase = false;
+    let savedCmdMapFocused = true;
     try {
       const lsLang = localStorage.getItem("tv_lang");
       if (lsLang === "ru" || lsLang === "en") savedLang = lsLang;
@@ -9901,6 +10429,8 @@
       savedDisableAutoLinks = localStorage.getItem("tv_disable_auto_links") === "1";
       const lsFocused = localStorage.getItem("tv_search_focused");
       savedSearchFocused = lsFocused === null ? true : lsFocused === "1";
+      const lsCmdFocused = localStorage.getItem("tv_cmd_map_focused");
+      savedCmdMapFocused = lsCmdFocused === null ? true : lsCmdFocused === "1";
       savedSearchWholeTurn = localStorage.getItem("tv_search_whole_turn") === "1";
       savedSearchWholeWord = localStorage.getItem("tv_search_whole_word") === "1";
       savedSearchCase = localStorage.getItem("tv_search_case") === "1";
@@ -9918,6 +10448,8 @@
     state.linkifyProjectFiles = savedLinkifyShort;
     state.disableAutoLinks = savedDisableAutoLinks;
     state.searchFocusedOnly = savedSearchFocused;
+    state.cmdMapFocusedOnly = savedCmdMapFocused;
+    if (els.cmdMapFocusedOnly) els.cmdMapFocusedOnly.checked = savedCmdMapFocused;
     state.searchAcrossWholeTurn = savedSearchWholeTurn;
     state.searchWholeWord = savedSearchWholeWord;
     state.searchCaseSensitive = savedSearchCase;
@@ -9950,6 +10482,16 @@
       } else if (nav.targetStep) {
         state.userScrolledUp = true;
         jumpToStep(nav.targetStep, { topOffset: 4 });
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && (_freshPendingKeys.size > 0 || _freshActiveUntilMap.size > 0)) {
+        requestAnimationFrame(activateVisibleFreshPulses);
+      }
+    });
+    window.addEventListener("focus", () => {
+      if (_freshPendingKeys.size > 0 || _freshActiveUntilMap.size > 0) {
+        requestAnimationFrame(activateVisibleFreshPulses);
       }
     });
     // Periodically refresh sidebar list (Antigravity window polling timer is managed by applyCapabilitiesUI)

@@ -1145,6 +1145,44 @@ a.task-step-link:hover {
   transition: box-shadow 0.4s ease;
 }
 
+@keyframes stepNewPulse {
+  0%, 100% {
+    outline: 2px solid var(--accent);
+    box-shadow: 0 0 0 4px rgba(88, 166, 255, 0.34), 0 0 16px rgba(88, 166, 255, 0.22);
+  }
+  50% {
+    outline: 2px solid rgba(88, 166, 255, 0.28);
+    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.08);
+  }
+}
+
+:root[data-theme="day"] .step-new-pulse {
+  animation-name: stepNewPulseDay;
+}
+
+@keyframes stepNewPulseDay {
+  0%, 100% {
+    outline: 2px solid #0969da;
+    box-shadow: 0 0 0 4px rgba(9, 105, 218, 0.28), 0 0 14px rgba(9, 105, 218, 0.16);
+  }
+  50% {
+    outline: 2px solid rgba(9, 105, 218, 0.22);
+    box-shadow: 0 0 0 1px rgba(9, 105, 218, 0.06);
+  }
+}
+
+article.step.step-new-pulse {
+  outline: 2px solid var(--accent);
+  box-shadow: 0 0 0 4px rgba(88, 166, 255, 0.32);
+  animation: stepNewPulse 0.9s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  article.step.step-new-pulse {
+    animation: none;
+  }
+}
+
 mark.hl {
   background: #ffd43b;
   color: #111111;
@@ -1313,13 +1351,19 @@ details.block-unknown-tag > summary { color: #ffd43b; }
   border: 1px solid rgba(86, 212, 221, 0.35);
   padding: 2px 8px;
   border-radius: 5px;
+  user-select: text;
 }
 :root[data-theme="day"] .tool-name {
   background: #d7e6e8;
   border-color: #7eaab0;
   color: #08444d;
 }
-.tool-summary { color: var(--text); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-summary { color: var(--text); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+a.link-auto,
+.task-link-pill {
+  -webkit-user-drag: none;
+  user-select: text;
+}
 
 .inner-scroll.has-inner-scroll:focus,
 .inner-scroll.has-inner-scroll:focus-within {
@@ -2607,6 +2651,20 @@ a.link-auto:hover {
 }
 .cmd-sub-check.is-ok { color: var(--green); }
 .cmd-sub-check.is-err { color: var(--red); font-weight: 700; }
+.cmd-sub-check.is-other { color: var(--yellow); }
+.cmd-sub-check.is-checked {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.cmd-group-card.is-checked {
+  border-color: var(--accent);
+}
+#openCmdMapBtn.active {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+  font-weight: 700;
+}
 .cmd-files-note {
   font-size: 11px;
   color: var(--text-dim);

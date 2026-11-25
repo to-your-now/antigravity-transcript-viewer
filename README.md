@@ -14,7 +14,7 @@ Antigravity saves full conversation logs — prompts, hidden thinking blocks, to
 **Antigravity Transcript Viewer** turns those logs into a clean, interactive workspace in your browser:
 
 ### Live Reading & Navigation
-- **Real-Time Live Feed:** New messages and tool results stream in automatically as the agent works, without interrupting or locking Antigravity. When you scroll up to read earlier steps, a flashing **`↓ К новому сообщению`** button takes you straight to the first unread message.
+- **Real-Time Live Feed & New Turn Blink:** New messages and tool results stream in automatically as the agent works, without interrupting or locking Antigravity. Newly arrived cards flash with a pulsing highlight frame for several seconds once actually visible on screen (staying ready to blink if your browser tab was in the background during auto-scroll). When you scroll up to read earlier steps, a flashing **`↓ К новому сообщению`** button takes you straight to the first unread message.
 - **Fast on Huge Sessions:** Smoothly browse sessions with tens of thousands of steps without browser freezes.
 - **Table of Contents & Scrollbar Minimap:** Jump to any step from the top Table of Contents, or use the color-coded notches along the right scrollbar (`💬` prompts, `📦` compactions, `⚠` command errors, `★` Command Map selections) — hover any notch to preview text and click to jump.
 - **Dialog-Only Mode:** Switch to **Диалог** to read just your messages and the AI's final answers, with one-click buttons between turns to peek at hidden thinking and tool calls whenever needed.
@@ -35,10 +35,10 @@ Antigravity saves full conversation logs — prompts, hidden thinking blocks, to
 ### Token & Prompt Cache Analytics
 - **Spot Cache Expiration at a Glance:** Each model turn shows `input`, `cache_read`, and `output` tokens plus a colorblind-safe grayscale cache hit indicator.
 - **Pause & Cache Strip:** The top Cache Map visualizes pauses (`Δt`) between turns so you can immediately see when a break caused the prompt cache to go cold.
-- **📊 Command Map:** Open full session statistics grouped by step types, statuses, and tools (`✓` vs `⚠` + touched files). Highlight selected tools on the right minimap with `★` markers or filter the entire feed down to just those commands.
+- **📊 Command Map:** Open full session statistics grouped by step types, statuses, and tools (`✓ OK`, `⚠ Errors`, `⋯ Running / other` + touched files). Highlight selected tools on the right minimap with `★` markers, filter the feed to matching events, and keep **Selected commands only in steps** enabled by default so sibling tools and surrounding thinking stay cleanly hidden (with a local button on each card to expand the full turn when needed).
 
 ### Workspace Comfort & Prompt Composer
-- **Resizable Prompt Composer (Windows):** Draft prompts right in the viewer (`Shift+Enter` for newline). Press **`Enter`** to copy the text, focus your matching `Antigravity.exe` window, and paste it cleanly into Antigravity **without sending**. On Linux/macOS, pressing `Enter` copies the prompt to your clipboard.
+- **Resizable Prompt Composer (Windows) (`Ctrl+'`):** Toggle the composer panel anytime from any keyboard layout with **`Ctrl+'`** (`Shift+Enter` for newline). Pressing **`Enter`** safely checks Antigravity's active input: if it is empty, pastes, verifies the pasted text, presses `Enter` to send, and returns focus back to your browser after ~1.8s; if a non-code draft already exists, appends cleanly at the end without pressing `Enter`; if focus is inside a code file buffer, aborts safely and keeps your message in the clipboard. On Linux/macOS, pressing `Enter` copies the prompt to your clipboard.
 - **Collapsible UI & Themes:** Independently collapse the sidebar (`«`), top toolbar (`▲`), and composer (`▼`) for maximum reading space, and switch between high-contrast **Dark** and warm low-blue-light **Day** themes.
 
 ---
@@ -74,7 +74,8 @@ python3 server.py     # Linux / macOS
 - **`PgDn` / `PgUp` / `Home` / `End`** — Scroll the session feed regardless of where button focus sits.
 - **`{ }` button** or **`Shift + Right-Click`** — View original raw JSON for a step or tool output.
 - **`Hover 1.2s`** on badges or argument names — View a helpful explanation tooltip.
-- **`Enter` / `Shift+Enter`** in the composer — Paste into Antigravity (or copy to clipboard) / insert newline.
+- **`Enter` / `Shift+Enter`** in the composer — Smart verified send/append into Antigravity (or copy to clipboard) / insert newline.
+- **`Ctrl+'`** (any layout) — Open or collapse the composer input panel.
 - **`Esc`** — Close open modals, image preview, tooltips, or deactivate inner box scroll.
 
 ---

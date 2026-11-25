@@ -39,6 +39,9 @@ const helpersCode = [
   `let stepSearchBlobCache = new WeakMap();`,
   `let stepSearchUnitsCache = new WeakMap();`,
   `let stepToolMetaMap = new WeakMap();`,
+  `let stepPairedOutputsMap = new WeakMap();`,
+  `const cardAttachedMap = new WeakMap();`,
+  `const stepErrCache = new WeakMap();`,
   `let taskIndexMap = new Map();`,
   `let stepTaskMetaMap = new WeakMap();`,
   `let _lastDetectedModel = "";`,
@@ -47,12 +50,17 @@ const helpersCode = [
   `const fmtStepTime = (ts) => ts ? "12:00:00" : "";`,
   `const fmtFullDateTime = (ts) => ts || "";`,
   `const SEARCH_HISTORY_MAX = 25;`,
-  `const isCommandErrorStep = () => false;`,
-  `const getStepMatchingCmdKeys = () => [];`,
   `let _cachedSearchAstRaw = null;`,
   `let _cachedSearchAst = null;`,
-  `const state = { activeId: "00000000-0000-0000-0000-000000000001", activeMeta: { project: "sample-project" }, activeLogPath: "/logs/transcript_full.jsonl", attachToolOutputs: true, filter: "all", onlyCmdErrors: false, cmdMapFilterOnly: false, cmdMapKeys: new Set(), stepQuery: "", searchFocusedOnly: true, searchAcrossWholeTurn: false, searchWholeWord: false, searchCaseSensitive: false };`,
+  `const state = { activeId: "00000000-0000-0000-0000-000000000001", activeMeta: { project: "sample-project" }, activeLogPath: "/logs/transcript_full.jsonl", steps: [], attachToolOutputs: true, filter: "all", onlyCmdErrors: false, cmdMapFilterOnly: false, cmdMapFocusedOnly: true, cmdMapKeys: new Set(), stepQuery: "", searchFocusedOnly: true, searchAcrossWholeTurn: false, searchWholeWord: false, searchCaseSensitive: false };`,
   `const window = { location: { origin: "http://127.0.0.1:8765", hash: "" } };`,
+  sliceFunc(appJs, "isCommandErrorStep"),
+  sliceFunc(appJs, "pairToolOutputs"),
+  sliceFunc(appJs, "getBgTaskResultOutcome"),
+  sliceFunc(appJs, "classifyToolCallOutcome"),
+  sliceFunc(appJs, "doesToolCallMatchCmdKeys"),
+  sliceFunc(appJs, "getStepMatchingCmdKeys"),
+  sliceFunc(appJs, "buildCommandMapStats"),
   sliceFunc(appJs, "formatSpecialBracketTagsInHtml"),
   sliceFunc(appJs, "formatPairedSystemTagsInHtml"),
   sliceFunc(appJs, "renderSystemMessageBody"),
@@ -83,7 +91,7 @@ const helpersCode = [
   sliceFunc(appJs, "extractMatchSnippet"),
   sliceFunc(appJs, "serializeFeedSelectionRange"),
   sliceFunc(appJs, "addSearchHistoryEntry"),
-  `return { state, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; } };`,
+  `return { state, isCommandErrorStep, pairToolOutputs, getBgTaskResultOutcome, classifyToolCallOutcome, doesToolCallMatchCmdKeys, getStepMatchingCmdKeys, buildCommandMapStats, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; }, get stepPairedOutputsMap() { return stepPairedOutputsMap; } };`,
 ].join("\n\n");
 
 const api = new Function(helpersCode)();
@@ -474,6 +482,7 @@ assert.ok(
 function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bottom: 0, height: 0 }, scrollH = 0, clientH = 0 } = {}) {
   const clsSet = new Set(cls);
   const children = [];
+  const listeners = {};
   const node = {
     tagName: tag.toUpperCase(),
     dataset: { ...dataset },
@@ -481,9 +490,50 @@ function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bo
     children,
     scrollHeight: scrollH,
     clientHeight: clientH,
+    textContent: "",
+    type: "",
+    open: true,
+    _listeners: listeners,
+    get className() {
+      return Array.from(clsSet).join(" ");
+    },
+    set className(v) {
+      clsSet.clear();
+      for (const c of String(v || "").trim().split(/\s+/)) {
+        if (c) clsSet.add(c);
+      }
+    },
+    addEventListener: (ev, fn) => {
+      if (!listeners[ev]) listeners[ev] = [];
+      listeners[ev].push(fn);
+    },
+    click: () => {
+      for (const fn of listeners.click || []) fn({ target: node });
+    },
+    remove: () => {
+      if (!node.parentElement) return;
+      const arr = node.parentElement.children;
+      const idx = arr.indexOf(node);
+      if (idx !== -1) arr.splice(idx, 1);
+      node.parentElement = null;
+    },
     classList: {
       contains: (c) => clsSet.has(c),
       add: (c) => clsSet.add(c),
+      remove: (c) => clsSet.delete(c),
+      toggle: (c, force) => {
+        if (force === undefined) {
+          if (clsSet.has(c)) {
+            clsSet.delete(c);
+            return false;
+          }
+          clsSet.add(c);
+          return true;
+        }
+        if (force) clsSet.add(c);
+        else clsSet.delete(c);
+        return Boolean(force);
+      },
     },
     getBoundingClientRect: () => ({ ...rect, left: 0, right: 800, width: 800 }),
     append: (...kids) => {
@@ -492,6 +542,11 @@ function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bo
         children.push(k);
       }
       return node;
+    },
+    appendChild: (k) => {
+      k.parentElement = node;
+      children.push(k);
+      return k;
     },
     contains: (other) => {
       let cur = other;
@@ -821,6 +876,380 @@ const makeAnchorRunner = (cards, items) => {
       appJs.includes("openSearchHistoryPopover("),
     "app.js must persist tv_search_history and handle Alt+ArrowDown/Alt+ArrowUp history popup"
   );
+}
+
+// 14. Search debounce (380ms + typing pause guard) and TOC visibility preservation on search
+{
+  assert.ok(
+    appJs.includes("SEARCH_DEBOUNCE_MS = 380") &&
+      appJs.includes("cancelPrewarmLru();") &&
+      appJs.includes("captureTocSearchView(") &&
+      appJs.includes("restoreTocSearchView("),
+    "app.js must debounce search input at 380ms, pause LRU prewarm while typing, and preserve TOC view during search"
+  );
+
+  const runTocHarness = ({ scrollTop, mapRect, mainRect, postMainRect, scrollHeight = 2400, clientHeight = 800 }) => {
+    const fw = makeMockNode({ tag: "DIV", cls: ["feed-wrap"], rect: { top: 50, bottom: 50 + clientHeight, height: clientHeight } });
+    fw.scrollTop = scrollTop;
+    fw.scrollHeight = scrollHeight;
+    fw.clientHeight = clientHeight;
+
+    let activeMap = makeMockNode({ tag: "SECTION", cls: ["cache-map-card"], rect: mapRect });
+    const det = makeMockNode({ tag: "DETAILS", cls: ["cache-map-details"], rect: mapRect });
+    det.open = true;
+    let activeMain = makeMockNode({ tag: "DIV", cls: ["toc-wrap"], rect: mainRect });
+    activeMain.offsetHeight = mainRect.height;
+    activeMap.append(det.append(activeMain));
+
+    const testState = { userScrolledUp: false };
+    const docStub = { getElementById: (id) => (id === "cacheMapCard" ? activeMap : null) };
+    let synced = false;
+    let uiUpdated = false;
+    const fns = new Function(
+      "document",
+      "els",
+      "state",
+      "_suppressScrollTsUntil",
+      "_lastScrollFrameTop",
+      "syncVirtualWindow",
+      "updateScrollUiOnFrame",
+      `${sliceFunc(appJs, "captureTocSearchView")}\n${sliceFunc(appJs, "restoreTocSearchView")}\nreturn { captureTocSearchView, restoreTocSearchView };`
+    )(
+      docStub,
+      { feedWrap: fw },
+      testState,
+      0,
+      scrollTop,
+      () => {
+        synced = true;
+      },
+      () => {
+        uiUpdated = true;
+      }
+    );
+
+    const view = fns.captureTocSearchView();
+    if (view && postMainRect) {
+      activeMain = makeMockNode({ tag: "DIV", cls: ["toc-wrap"], rect: postMainRect });
+      activeMain.offsetHeight = postMainRect.height;
+      activeMap = makeMockNode({ tag: "SECTION", cls: ["cache-map-card"], rect: postMainRect });
+      const postDet = makeMockNode({ tag: "DETAILS", cls: ["cache-map-details"], rect: postMainRect });
+      postDet.open = true;
+      activeMap.append(postDet.append(activeMain));
+      fw.scrollTop = 0;
+      fns.restoreTocSearchView(view);
+    }
+    return { view, finalScrollTop: fw.scrollTop, userScrolledUp: testState.userScrolledUp, synced, uiUpdated };
+  };
+
+  // Case A: At top looking at TOC -> search shrinks TOC & feed grows tall -> must stay at scrollTop 0, NOT jump to bottom
+  const resA = runTocHarness({
+    scrollTop: 0,
+    mapRect: { top: 62, bottom: 520, height: 458 },
+    mainRect: { top: 150, bottom: 450, height: 300 },
+    postMainRect: { top: 150, bottom: 225, height: 75 },
+    scrollHeight: 3200,
+    clientHeight: 800,
+  });
+  assert.ok(resA.view && resA.view.inView && resA.view.headVisible, "Top TOC must be detected as in view");
+  assert.equal(resA.finalScrollTop, 0, "Searching while at top TOC must keep scrollTop at 0");
+  assert.equal(resA.userScrolledUp, true, "Must lock userScrolledUp so follow mode does not jump away from TOC");
+  assert.ok(resA.synced && resA.uiUpdated);
+
+  // Case B: Scrolled partway into TOC rows (scrollTop=260), search shrinks .toc-wrap from bottom 450 to 185 -> must clamp scrollTop cleanly to keep TOC visible
+  const resB = runTocHarness({
+    scrollTop: 260,
+    mapRect: { top: -198, bottom: 260, height: 458 },
+    mainRect: { top: 50, bottom: 210, height: 160 },
+    postMainRect: { top: 160, bottom: 235, height: 75 },
+    scrollHeight: 2400,
+    clientHeight: 800,
+  });
+  assert.ok(resB.view && resB.view.inView && !resB.view.headVisible, "Partially scrolled TOC with >=48px .toc-wrap visible must count as in view");
+  assert.equal(resB.finalScrollTop, 110, "Shrunken TOC must pull scrollTop up from 260 to 110 so filtered TOC stays visible");
+
+  // Case C: Scrolled past TOC to read cards (only checkboxes strip barely above/at top) -> must NOT hijack card anchoring
+  const resC = runTocHarness({
+    scrollTop: 900,
+    mapRect: { top: -400, bottom: 78, height: 478 },
+    mainRect: { top: -320, bottom: 30, height: 350 },
+    postMainRect: null,
+  });
+  assert.equal(resC.view, null, "When .toc-wrap is above viewport and only bottom options strip peeks, TOC must NOT override card anchor");
+}
+
+// 15. Command Map: accurate outcome stats (ok/err/other + background completion + attach=false parity), file collection, focused turn trimming & reveal button
+{
+  const bgTidOk = "b1111111-1111-1111-1111-111111111111/task-1";
+  const bgTidErr = "b1111111-1111-1111-1111-111111111111/task-2";
+  const bgTidRun = "b1111111-1111-1111-1111-111111111111/task-3";
+  const cmSteps = [
+    {
+      step_index: 10,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      thinking: "Check files and run checks",
+      tool_calls: [
+        { name: "read_file", args: { AbsolutePath: "C:\\proj\\server.py" } },
+        { name: "run_command", args: { CommandLine: "python server.py --check" } },
+        { name: "run_command", args: { CommandLine: "pytest -q" } },
+        { name: "run_command", args: { CommandLine: "long_task" } },
+      ],
+      content: "Summary after tools.",
+    },
+    { step_index: 11, type: "GENERIC", status: "DONE", content: "1: print('ok')" },
+    { step_index: 12, type: "GENERIC", status: "RUNNING", content: `Tool is running as a background task with task id: ${bgTidOk}\nCommand output:\nstarted` },
+    { step_index: 13, type: "GENERIC", status: "RUNNING", content: `Tool is running as a background task with task id: ${bgTidErr}\nCommand output:\nstarted` },
+    { step_index: 14, type: "GENERIC", status: "RUNNING", content: `Tool is running as a background task with task id: ${bgTidRun}\nCommand output:\nstill going` },
+    { step_index: 15, type: "SYSTEM_MESSAGE", content: `<SYSTEM_MESSAGE>\n[Message] sender=${bgTidOk} content=Task id "${bgTidOk}" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>` },
+    { step_index: 16, type: "SYSTEM_MESSAGE", content: `<SYSTEM_MESSAGE>\n[Message] sender=${bgTidErr} content=Task id "${bgTidErr}" finished with result:\nCommand exited with code 1.\n</SYSTEM_MESSAGE>` },
+    {
+      step_index: 20,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      tool_calls: [{ name: "edit_file", args: { TargetFile: "C:\\proj\\app.js" } }],
+    },
+    { step_index: 21, type: "GENERIC", status: "ERROR", content: "Encountered error in step execution: TargetContent not found" },
+  ];
+
+  api.state.steps = cmSteps;
+  api.buildStepMetadataAndTaskIndex(cmSteps);
+
+  // Statistics must be accurate even when attachToolOutputs === false
+  api.state.attachToolOutputs = false;
+  const stats = api.buildCommandMapStats();
+  const rcStat = stats.toolStats.get("run_command");
+  const rfStat = stats.toolStats.get("read_file");
+  const efStat = stats.toolStats.get("edit_file");
+  assert.deepEqual(
+    { total: rcStat.total, ok: rcStat.ok, err: rcStat.err, other: rcStat.other },
+    { total: 3, ok: 1, err: 1, other: 1 },
+    "run_command stats must resolve background exit 0 (ok), exit 1 (err), and unfinished task (other) even when attachToolOutputs=false"
+  );
+  assert.equal(rcStat.ok + rcStat.err + rcStat.other, rcStat.total, "ok + err + other must strictly equal total");
+  assert.ok(rfStat.files.has("server.py"), "read_file AbsolutePath basename must be collected in Command Map files");
+  assert.equal(efStat.ok, 0);
+  assert.equal(efStat.err, 1);
+  assert.ok(efStat.files.has("app.js"), "edit_file TargetFile basename must be collected");
+
+  // Standalone GENERIC output matching when detached
+  api.state.cmdMapKeys = new Set(["tool:edit_file:err"]);
+  api.state.cmdMapFilterOnly = true;
+  assert.ok(api.getStepMatchingCmdKeys(cmSteps[8], null).includes("edit_file ⚠"), "Detached GENERIC error step must match tool:edit_file:err");
+  assert.equal(api.stepMatchesFilter(cmSteps[7], null), true, "Caller step #20 must match tool:edit_file:err via stepPairedOutputsMap");
+  assert.equal(api.stepMatchesFilter(cmSteps[0], null), false, "Step #10 without edit_file error must be filtered out");
+
+  // Subtype sub:errors must also catch background exit 1
+  api.state.cmdMapKeys = new Set(["sub:errors"]);
+  assert.ok(api.getStepMatchingCmdKeys(cmSteps[0], null).includes("sub:errors"), "sub:errors must match turn containing background exit 1");
+
+  // Reset attachToolOutputs for DOM trimming test
+  api.state.attachToolOutputs = true;
+
+  // Functional simulation of applyCmdMapFocusTrim()
+  const trimCardDoc = {
+    createElement: (tag) => makeMockNode({ tag }),
+  };
+  const cmdCard = makeMockNode({ tag: "ARTICLE", cls: ["step", "type-PLANNER_RESPONSE"], dataset: { stepIndex: "10" } });
+  const cmdBody = makeMockNode({ tag: "DIV", cls: ["step-body"] });
+  const thinkDet = makeMockNode({ tag: "DETAILS", cls: ["block", "block-thinking"] });
+  const toolsDet = makeMockNode({ tag: "DETAILS", cls: ["block", "block-tools"] });
+  const toolsBody = makeMockNode({ tag: "DIV", cls: ["block-body"] });
+  const tc0 = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "0" } }); // read_file
+  const tc1 = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "1" } }); // run_command (ok)
+  const tc2 = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "2" } }); // run_command (err)
+  const tc3 = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "3" } }); // run_command (other)
+  const mdFinal = makeMockNode({ tag: "DIV", cls: ["md"] });
+  cmdCard.append(cmdBody.append(thinkDet, toolsDet.append(toolsBody.append(tc0, tc1, tc2, tc3)), mdFinal));
+
+  const trimState = {
+    cmdMapFilterOnly: true,
+    cmdMapFocusedOnly: true,
+    cmdMapKeys: new Set(["tool:run_command:err"]),
+    stepQuery: "",
+    searchFocusedOnly: true,
+  };
+  const runTrim = new Function(
+    "document",
+    "state",
+    "t",
+    "preserveScrollAnchor",
+    "scheduleCardOverflowCheck",
+    "requestAnimationFrame",
+    "scheduleMinimapSync",
+    "cardAttachedMap",
+    "stepPairedOutputsMap",
+    "stepTaskMetaMap",
+    "taskIndexMap",
+    "stepErrCache",
+    "unescapeNewlines",
+    `${sliceFunc(appJs, "isCommandErrorStep")}\n${sliceFunc(appJs, "getBgTaskResultOutcome")}\n${sliceFunc(appJs, "classifyToolCallOutcome")}\n${sliceFunc(appJs, "doesToolCallMatchCmdKeys")}\n${sliceFunc(appJs, "attachSearchRevealBar")}\n${sliceFunc(appJs, "applyCmdMapFocusTrim")}\nreturn applyCmdMapFocusTrim;`
+  )(
+    trimCardDoc,
+    trimState,
+    (k, vars) => (k === "card.searchRevealTurn" ? `Show full (${vars.count})` : `Collapse (${vars.count})`),
+    (fn) => fn(),
+    () => {},
+    () => {},
+    () => {},
+    new WeakMap(),
+    api.stepPairedOutputsMap,
+    api.stepTaskMetaMap,
+    api.taskIndexMap,
+    new WeakMap(),
+    (s) => String(s || "").replace(/\r\n/g, "\n")
+  );
+
+  runTrim(cmdCard, cmSteps[0], [cmSteps[1], cmSteps[2], cmSteps[3], cmSteps[4]]);
+  assert.ok(thinkDet.classList.contains("search-omitted"), "Thinking block must be omitted when filtering by tool:run_command:err");
+  assert.ok(mdFinal.classList.contains("search-omitted"), "Prose .md block must be omitted when filtering by tool:run_command:err");
+  assert.ok(tc0.classList.contains("search-omitted"), "Sibling read_file must be omitted");
+  assert.ok(tc1.classList.contains("search-omitted"), "Passing run_command must be omitted when filtering strictly by :err");
+  assert.ok(!tc2.classList.contains("search-omitted") && tc2.classList.contains("search-hit-target"), "Failing run_command must remain visible & highlighted");
+  assert.ok(tc3.classList.contains("search-omitted"), "Pending run_command must be omitted when filtering strictly by :err");
+  assert.ok(cmdCard.classList.contains("has-search-omitted"), "Card must get .has-search-omitted");
+
+  const revealBtn = cmdCard.querySelector(".search-reveal-btn");
+  assert.ok(revealBtn, "Card must render local reveal button for omitted blocks & sibling tools");
+  assert.equal(revealBtn.textContent, "Show full (5)", "Omitted count must equal 1 thinking + 3 sibling tools + 1 .md = 5");
+  revealBtn.click();
+  assert.ok(cmdCard.classList.contains("is-search-untrimmed"), "Clicking reveal button must expand omitted blocks locally");
+  assert.equal(revealBtn.textContent, "Collapse (5)", "Clicking reveal button must toggle label to collapse");
+  revealBtn.click();
+  assert.ok(!cmdCard.classList.contains("is-search-untrimmed"), "Clicking again must collapse back to selected command only");
+
+  // Whole-turn guard: type:PLANNER_RESPONSE alone must never hide all children
+  const guardCard = makeMockNode({ tag: "ARTICLE", cls: ["step", "type-PLANNER_RESPONSE"] });
+  const guardBody = makeMockNode({ tag: "DIV", cls: ["step-body"] });
+  const guardThink = makeMockNode({ tag: "DETAILS", cls: ["block-thinking"] });
+  guardCard.append(guardBody.append(guardThink));
+  trimState.cmdMapKeys = new Set(["type:PLANNER_RESPONSE"]);
+  runTrim(guardCard, cmSteps[0], null);
+  assert.ok(!guardThink.classList.contains("search-omitted"), "Filtering by type:PLANNER_RESPONSE alone must never empty card body");
+
+  // UI/HTML/CSS defaults check
+  const styleCss = fs.readFileSync(path.resolve(__dirname, "..", "static", "style.css"), "utf8");
+  assert.ok(indexHtml.includes('id="cmdMapFocusedOnly" checked'), "index.html must enable #cmdMapFocusedOnly by default");
+  assert.ok(appJs.includes('localStorage.getItem("tv_cmd_map_focused")') && appJs.includes("cmdMapFocusedOnly: true"), "app.js must default cmdMapFocusedOnly=true and persist tv_cmd_map_focused");
+  assert.ok(styleCss.includes(".cmd-sub-check.is-checked") && styleCss.includes(".cmd-sub-check.is-other") && !styleCss.includes(":has("), "style.css must style checked/other cmd-map pills without CSS :has()");
+}
+
+// 16. Fresh Turn Blinking Frame: deferred countdown while hidden/offscreen, starts pulse once visible, clears on expiry
+{
+  let fakeNow = 10_000;
+  const origDateNow = Date.now;
+  Date.now = () => fakeNow;
+  try {
+    const fwNode = makeMockNode({ tag: "DIV", cls: ["feed-wrap"], rect: { top: 0, bottom: 600, height: 600 }, clientH: 600 });
+    const cVis = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "201" }, rect: { top: 420, bottom: 560, height: 140 } });
+    const cOff = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "202" }, rect: { top: 750, bottom: 900, height: 150 } });
+    const vWin = makeMockNode({ tag: "DIV", cls: ["v-window"] });
+    vWin.append(cVis, cOff);
+    fwNode.append(vWin);
+
+    const mockDoc = { visibilityState: "hidden" };
+    const freshApi = new Function(
+      "document",
+      "els",
+      "_vWindow",
+      `
+      ${sliceFunc(appJs, "clearFreshPulses")}
+      ${sliceFunc(appJs, "markFreshSteps")}
+      ${sliceFunc(appJs, "isStepFreshNow")}
+      ${sliceFunc(appJs, "syncCardFreshPulse")}
+      ${sliceFunc(appJs, "scheduleFreshPulseCleanup")}
+      ${sliceFunc(appJs, "activateVisibleFreshPulses")}
+      const FRESH_PULSE_DURATION_MS = 4500;
+      const FRESH_PENDING_MAX = 120;
+      const _freshPendingKeys = new Set();
+      const _freshActiveUntilMap = new Map();
+      let _freshCleanupTimer = 0;
+      return { clearFreshPulses, markFreshSteps, isStepFreshNow, syncCardFreshPulse, activateVisibleFreshPulses, _freshPendingKeys, _freshActiveUntilMap };
+      `
+    )(mockDoc, { feedWrap: fwNode }, vWin);
+
+    freshApi.markFreshSteps(["201", "202"]);
+    freshApi.activateVisibleFreshPulses();
+    assert.ok(cVis.classList.contains("step-new-pulse") && cOff.classList.contains("step-new-pulse"), "Fresh cards must display highlight frame right on arrival");
+    assert.equal(freshApi._freshPendingKeys.size, 2, "Countdown must NOT start while tab is hidden in background");
+
+    // Advance 20 seconds in background, then switch back to visible tab
+    fakeNow += 20_000;
+    mockDoc.visibilityState = "visible";
+    freshApi.activateVisibleFreshPulses();
+    assert.ok(!freshApi._freshPendingKeys.has("201") && freshApi._freshActiveUntilMap.get("201") === fakeNow + 4500, "Visible card countdown must start when user switches back to tab");
+    assert.ok(freshApi._freshPendingKeys.has("202"), "Off-viewport card must remain pending until scrolled into view");
+
+    // Advance past 4500ms -> card 201 stops blinking, off-screen 202 still waits until scrolled into view
+    fakeNow += 4600;
+    freshApi.activateVisibleFreshPulses();
+    assert.ok(!cVis.classList.contains("step-new-pulse"), "Card 201 pulse must stop cleanly after ~4.5s");
+    assert.ok(cOff.classList.contains("step-new-pulse"), "Off-screen card 202 must stay queued until user scrolls to it");
+
+    // Scroll card 202 into view
+    cOff.getBoundingClientRect = () => ({ top: 150, bottom: 300, height: 150, left: 0, right: 800, width: 800 });
+    freshApi.activateVisibleFreshPulses();
+    assert.ok(!freshApi._freshPendingKeys.has("202") && cOff.classList.contains("step-new-pulse"), "Card 202 starts 4.5s countdown once scrolled into viewport");
+
+    fakeNow += 4600;
+    freshApi.activateVisibleFreshPulses();
+    assert.ok(!cOff.classList.contains("step-new-pulse"), "Card 202 pulse expires cleanly after being seen");
+  } finally {
+    Date.now = origDateNow;
+  }
+}
+
+// 17. Hotkey Ctrl+' / Ctrl+э, non-draggable auto-links, search scroll to .diff-line, & StartLine spacing
+{
+  const styleCss = fs.readFileSync(path.resolve(__dirname, "..", "static", "style.css"), "utf8");
+  assert.ok(appJs.includes('e.code === "Quote"') && appJs.includes('applyComposerCollapsed(willCollapse)'), "app.js must bind Ctrl+' / Ctrl+э via e.code === 'Quote' to toggle composer");
+  assert.ok(styleCss.includes("@keyframes stepNewPulse") && styleCss.includes("prefers-reduced-motion"), "style.css must define @keyframes stepNewPulse and reduced-motion override");
+  assert.ok(styleCss.includes("-webkit-user-drag: none") && appJs.includes("a.draggable = false"), "Auto-links must disable native link dragging so edit_file/tool paths stay text-selectable");
+  assert.ok(appJs.includes('.diff-line, .arg-row-inline') && !appJs.includes('firstMark.closest(".code-gutter-row, .md-gutter-row, .arg-row,'), "applyInitialSearchScrolls must target .diff-line instead of jumping back to outer .arg-row header");
+  assert.ok(appJs.includes('node.classList.contains("arg-row-stacked")'), "serializeFeedSelectionRange must preserve space between .arg-key and .arg-val-inline in stacked rows like StartLine 4415");
+  assert.ok(appJs.includes("node.nodeType !== 1 && node.nodeType !== 11"), "collectInlineMetaText must descend into DocumentFragment (nodeType 11) when copying inside .tool-head / pills like edit_file");
+
+  // Single-pill / inline header copy test with nodeType=11 DocumentFragment (selecting just `edit_file`)
+  const serializeFn = new Function(`return (${sliceFunc(appJs, "serializeFeedSelectionRange")});`)();
+  const makeCopyNode = (nodeType, { tag = "SPAN", cls = [], text = "", kids = [] } = {}) => {
+    const clsSet = new Set(cls);
+    const n = {
+      nodeType,
+      tagName: tag,
+      nodeValue: nodeType === 3 ? text : null,
+      parentElement: null,
+      childNodes: kids,
+      classList: { contains: (c) => clsSet.has(c) },
+      matches: (sel) =>
+        sel.split(",").some((s) => {
+          const t = s.trim();
+          if (t.startsWith(".")) return clsSet.has(t.slice(1).split(":")[0]);
+          return tag.toLowerCase() === t.toLowerCase();
+        }),
+      closest: (sel) => {
+        let cur = n;
+        while (cur) {
+          if (cur.nodeType === 1 && cur.matches(sel)) return cur;
+          cur = cur.parentElement;
+        }
+        return null;
+      },
+      querySelector: () => null,
+    };
+    for (const k of kids) k.parentElement = n;
+    return n;
+  };
+  const pillText = makeCopyNode(3, { text: "edit_file" });
+  const pillSpan = makeCopyNode(1, { tag: "SPAN", cls: ["tool-name"], kids: [pillText] });
+  const headDiv = makeCopyNode(1, { tag: "DIV", cls: ["tool-head"], kids: [pillSpan] });
+  const fragText = makeCopyNode(3, { text: "edit_file" });
+  const fragPill = makeCopyNode(1, { tag: "SPAN", cls: ["tool-name"], kids: [fragText] });
+  const fragRoot = makeCopyNode(11, { tag: "", kids: [fragPill] });
+  const singlePillCopy = serializeFn({
+    commonAncestorContainer: pillText,
+    cloneContents: () => fragRoot,
+  });
+  assert.equal(singlePillCopy, "edit_file", "Selecting just the edit_file pill inside .tool-head must copy 'edit_file' instead of empty string");
 }
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");

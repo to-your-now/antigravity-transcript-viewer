@@ -827,7 +827,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": _srv_t(lang, "emptyText")}, status=400)
                 return
             ok, info, status_code = send_text_to_antigravity_window(text, prefer_project, prefer_title, lang=lang)
-            self._send_json({"ok": ok, "info": info, "status": status_code}, status=200 if ok else 404)
+            http_status = 200 if ok else (404 if status_code == "not_found" else 409)
+            self._send_json({"ok": ok, "info": info, "status": status_code}, status=http_status)
             return
 
         if parsed.path == "/api/open-folder":
@@ -1822,10 +1823,48 @@ def _clear_clipboard() -> None:
             user32.CloseClipboard()
 
 
+_EXTENDED_VKS = frozenset({
+    0x21, 0x22, 0x23, 0x24,  # PRIOR, NEXT, END, HOME
+    0x25, 0x26, 0x27, 0x28,  # LEFT, UP, RIGHT, DOWN
+    0x2D, 0x2E,              # INSERT, DELETE
+})
+
+_CODE_LINE_START_RE = re.compile(
+    r"^\s*(?:"
+    r"import\s+[A-Za-z_*{\[]|"
+    r"from\s+\S+\s+import\s+|"
+    r"(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(|"
+    r"class\s+[A-Za-z_]\w*[\s(:{]|"
+    r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+[A-Za-z_$]|"
+    r"(?:export\s+)?(?:const|let|var)\s+[A-Za-z_${\[]\w*\s*=|"
+    r"return\s+[^\s]|"
+    r"#include\s*[<\"']|"
+    r"using\s+[A-Za-z_][\w.]*\s*;|"
+    r"package\s+[A-Za-z_][\w.]*;?|"
+    r"(?:public|private|protected)\s+(?:static\s+)?[A-Za-z_]|"
+    r"</?[a-zA-Z][a-zA-Z0-9-]*(?:\s|>|$)|"
+    r"[}\])];?\s*$"
+    r")"
+)
+_FILE_HEADER_PREFIXES = (
+    "#!",
+    '"""',
+    "'''",
+    "<!doctype",
+    "<html",
+    "<?php",
+    "from __future__",
+    "/*",
+)
+
+
 def _send_key(vk: int) -> None:
     user32 = ctypes.windll.user32
     INPUT_KEYBOARD = 1
+    KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
+    ext_flag = KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
+    scan = user32.MapVirtualKeyW(vk, 0) & 0xFFFF
 
     class MOUSEINPUT(ctypes.Structure):
         _fields_ = [
@@ -1855,7 +1894,7 @@ def _send_key(vk: int) -> None:
     def _mk(flags: int = 0) -> INPUT:
         inp = INPUT()
         inp.type = INPUT_KEYBOARD
-        inp.union.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)
+        inp.union.ki = KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=flags | ext_flag, time=0, dwExtraInfo=0)
         return inp
 
     seq = (INPUT * 2)(_mk(0), _mk(KEYEVENTF_KEYUP))
@@ -1865,8 +1904,12 @@ def _send_key(vk: int) -> None:
 def _send_ctrl_combo(vk: int) -> None:
     user32 = ctypes.windll.user32
     INPUT_KEYBOARD = 1
+    KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
     VK_CONTROL = 0x11
+    ctrl_scan = user32.MapVirtualKeyW(VK_CONTROL, 0) & 0xFFFF
+    key_scan = user32.MapVirtualKeyW(vk, 0) & 0xFFFF
+    key_ext = KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
 
     class MOUSEINPUT(ctypes.Structure):
         _fields_ = [
@@ -1893,47 +1936,32 @@ def _send_ctrl_combo(vk: int) -> None:
     class INPUT(ctypes.Structure):
         _fields_ = [("type", ctypes.wintypes.DWORD), ("union", _INPUT_UNION)]
 
-    def _make_key(vk_code: int, flags: int = 0) -> INPUT:
+    def _make_key(vk_code: int, scan_code: int, flags: int = 0) -> INPUT:
         inp = INPUT()
         inp.type = INPUT_KEYBOARD
-        inp.union.ki = KEYBDINPUT(wVk=vk_code, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)
+        inp.union.ki = KEYBDINPUT(wVk=vk_code, wScan=scan_code, dwFlags=flags, time=0, dwExtraInfo=0)
         return inp
 
     seq = (INPUT * 4)(
-        _make_key(VK_CONTROL, 0),
-        _make_key(vk, 0),
-        _make_key(vk, KEYEVENTF_KEYUP),
-        _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+        _make_key(VK_CONTROL, ctrl_scan, 0),
+        _make_key(vk, key_scan, key_ext),
+        _make_key(vk, key_scan, KEYEVENTF_KEYUP | key_ext),
+        _make_key(VK_CONTROL, ctrl_scan, KEYEVENTF_KEYUP),
     )
     user32.SendInput(4, seq, ctypes.sizeof(INPUT))
 
 
-def send_text_to_antigravity_window(
-    text: str, prefer_project: str = "", prefer_title: str = "", lang: str = "en"
-) -> Tuple[bool, str, str]:
-    """Copy text, focus Antigravity.exe (with EN layout for Ctrl+I), paste (Ctrl+V), and restore layout. Never presses Enter."""
-    lang = _norm_lang(lang)
-    if sys.platform != "win32":
-        return False, _srv_t(lang, "agWinOnly"), "error"
-
-    hwnd, title = find_antigravity_window(prefer_project, prefer_title)
-    if not hwnd:
-        return False, _srv_t(lang, "agNotFound"), "not_found"
-
-    if not _set_clipboard_unicode(text):
-        return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
-
+def _activate_hwnd(hwnd: int, settle_s: float = 0.14) -> bool:
+    if sys.platform != "win32" or not hwnd:
+        return False
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     SW_RESTORE = 9
-    WM_INPUTLANGCHANGEREQUEST = 0x0050
-    VK_I = 0x49
-    VK_V = 0x56
-
+    if not user32.IsWindow(hwnd):
+        return False
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
 
-    # Allow foreground switch even from a background HTTP worker thread
     user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
     fg_hwnd = user32.GetForegroundWindow()
     fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
@@ -1951,33 +1979,203 @@ def send_text_to_antigravity_window(
     finally:
         if attached:
             user32.AttachThreadInput(cur_tid, fg_tid, False)
+    if settle_s > 0:
+        time.sleep(settle_s)
+    return user32.GetForegroundWindow() == hwnd
 
-    time.sleep(0.14)
-    if user32.GetForegroundWindow() != hwnd:
-        return False, _srv_t(lang, "agFocusErr"), "focus_error"
 
-    # Temporarily switch target window's keyboard layout to English (0x0409) so Ctrl+I works under Russian layout
-    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
-    orig_hkl = user32.GetKeyboardLayout(target_tid)
-    switched_layout = False
-    if (orig_hkl & 0xFFFF) != 0x0409:
-        en_hkl = user32.LoadKeyboardLayoutW("00000409", 0)
-        if en_hkl:
-            user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, en_hkl)
-            switched_layout = True
-            time.sleep(0.06)
+def _norm_clipboard_cmp(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ").strip()
 
-    try:
-        # Focus Agent Chat input in Antigravity IDE (Ctrl+I) and paste (Ctrl+V) without Enter
-        _send_ctrl_combo(VK_I)
-        time.sleep(0.15)
-        _send_ctrl_combo(VK_V)
-        time.sleep(0.06)
-    finally:
-        if switched_layout and orig_hkl:
+
+def _looks_like_code_or_file_buffer(text: str) -> Tuple[bool, int]:
+    """Detect whether copied Ctrl+A text looks like an active source file / editor buffer rather than a chat draft."""
+    if not text or not text.strip():
+        return False, 0
+    norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = norm.splitlines()
+    line_count = len(lines)
+    if len(norm) > 2800 or line_count >= 30:
+        return True, line_count
+
+    first_non_empty = next((ln.strip().lower() for ln in lines if ln.strip()), "")
+    if any(first_non_empty.startswith(p) for p in _FILE_HEADER_PREFIXES):
+        return True, line_count
+
+    # Intentional conversational prompt with an embedded ``` code snippet should still append safely
+    if "```" in norm and line_count < 20:
+        return False, line_count
+
+    non_empty = [ln for ln in lines if ln.strip()]
+    if len(non_empty) >= 4:
+        code_hits = 0
+        for ln in non_empty:
+            stripped = ln.rstrip()
+            if _CODE_LINE_START_RE.match(ln) or (
+                (ln.startswith("    ") or ln.startswith("\t"))
+                and (stripped.endswith((";", "{", "}", "):", "=>", ",")))
+            ):
+                code_hits += 1
+        if code_hits >= 3 and (code_hits / len(non_empty)) >= 0.45:
+            return True, line_count
+
+    if line_count >= 2 and first_non_empty.startswith("{") and any('":' in ln for ln in non_empty):
+        return True, line_count
+
+    return False, line_count
+
+
+def _default_win_paste_ops() -> Dict[str, Any]:
+    user32 = ctypes.windll.user32
+    WM_INPUTLANGCHANGEREQUEST = 0x0050
+
+    def _schedule_restore(delay_s: float, target_hwnd: int, expected_current_hwnd: int) -> None:
+        if not target_hwnd or target_hwnd == expected_current_hwnd:
+            return
+
+        def _restore() -> None:
+            try:
+                if not user32.IsWindow(target_hwnd):
+                    return
+                if expected_current_hwnd and user32.GetForegroundWindow() != expected_current_hwnd:
+                    return
+                _activate_hwnd(target_hwnd, settle_s=0.05)
+            except Exception:
+                pass
+
+        t = threading.Timer(delay_s, _restore)
+        t.daemon = True
+        t.start()
+
+    def _switch_to_en(hwnd: int) -> Tuple[bool, int]:
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        orig_hkl = user32.GetKeyboardLayout(target_tid)
+        if (orig_hkl & 0xFFFF) != 0x0409:
+            en_hkl = user32.LoadKeyboardLayoutW("00000409", 0)
+            if en_hkl:
+                user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, en_hkl)
+                time.sleep(0.06)
+                return True, orig_hkl
+        return False, orig_hkl
+
+    def _restore_hkl(hwnd: int, orig_hkl: int) -> None:
+        if orig_hkl:
             user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, orig_hkl)
 
-    return True, title, "pasted"
+    return {
+        "find_window": find_antigravity_window,
+        "get_foreground": lambda: int(user32.GetForegroundWindow() or 0),
+        "focus_window": lambda h: _activate_hwnd(h, settle_s=0.14),
+        "switch_en": _switch_to_en,
+        "restore_hkl": _restore_hkl,
+        "set_clip": _set_clipboard_unicode,
+        "get_clip": _get_clipboard_unicode,
+        "clear_clip": _clear_clipboard,
+        "clip_seq": lambda: int(user32.GetClipboardSequenceNumber()),
+        "send_key": _send_key,
+        "send_ctrl": _send_ctrl_combo,
+        "sleep": time.sleep,
+        "schedule_restore": _schedule_restore,
+    }
+
+
+def send_text_to_antigravity_window(
+    text: str,
+    prefer_project: str = "",
+    prefer_title: str = "",
+    lang: str = "en",
+    *,
+    _win_ops: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str, str]:
+    """Safely inspect Antigravity's input, verify empty vs draft, paste, and auto-send only on verified empty fields."""
+    lang = _norm_lang(lang)
+    if _win_ops is None and sys.platform != "win32":
+        return False, _srv_t(lang, "agWinOnly"), "error"
+
+    ops = _win_ops if _win_ops is not None else _default_win_paste_ops()
+
+    VK_RETURN = 0x0D
+    VK_RIGHT = 0x27
+    VK_A = 0x41
+    VK_C = 0x43
+    VK_I = 0x49
+    VK_V = 0x56
+
+    hwnd, title = ops["find_window"](prefer_project, prefer_title)
+    if not hwnd:
+        return False, _srv_t(lang, "agNotFound"), "not_found"
+
+    caller_hwnd = int(ops["get_foreground"]() or 0)
+    if not ops["focus_window"](hwnd):
+        ops["set_clip"](text)
+        return False, _srv_t(lang, "agFocusErr"), "focus_error"
+
+    def _copy_focused(timeout_s: float = 0.22) -> Tuple[bool, str]:
+        ops["clear_clip"]()
+        seq0 = ops["clip_seq"]()
+        ops["send_ctrl"](VK_A)
+        ops["sleep"](0.045)
+        ops["send_ctrl"](VK_C)
+        elapsed = 0.0
+        while elapsed < timeout_s:
+            if ops["clip_seq"]() != seq0:
+                ops["sleep"](0.015)
+                return True, ops["get_clip"]()
+            ops["sleep"](0.015)
+            elapsed += 0.015
+        return False, ops["get_clip"]()
+
+    switched_layout, orig_hkl = ops["switch_en"](hwnd)
+    try:
+        # 1. Focus Agent Chat input in Antigravity IDE (Ctrl+I)
+        ops["send_ctrl"](VK_I)
+        ops["sleep"](0.18)
+
+        # 2. Check existing input content via Ctrl+A -> Ctrl+C
+        _, pre_text = _copy_focused(0.20)
+        is_code, line_count = _looks_like_code_or_file_buffer(pre_text)
+        if is_code:
+            # Collapse Ctrl+A selection safely inside code editor; never paste into source code
+            ops["send_key"](VK_RIGHT)
+            ops["set_clip"](text)
+            return False, _srv_t(lang, "agCodeEditorAborted", lines=line_count), "aborted_code_editor"
+
+        if pre_text.strip() == "":
+            # 3a. Empty box: paste -> re-select & verify -> press Enter -> return focus to browser after delay
+            if not ops["set_clip"](text):
+                return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
+            ops["sleep"](0.03)
+            ops["send_ctrl"](VK_V)
+            ops["sleep"](0.11)
+
+            _, after_text = _copy_focused(0.25)
+            norm_after = _norm_clipboard_cmp(after_text)
+            norm_expected = _norm_clipboard_cmp(text)
+            if not norm_after or norm_after != norm_expected:
+                ops["send_key"](VK_RIGHT)
+                ops["set_clip"](text)
+                return False, _srv_t(lang, "agVerifyFailed", title=title), "verify_failed"
+
+            ops["send_key"](VK_RIGHT)
+            ops["sleep"](0.04)
+            ops["send_key"](VK_RETURN)
+            if caller_hwnd and caller_hwnd != hwnd:
+                ops["schedule_restore"](1.8, caller_hwnd, hwnd)
+            return True, title, "sent"
+
+        # 3b. Safe non-empty draft: deselect to end, append cleanly, NEVER press Enter, stay in Antigravity
+        ops["send_key"](VK_RIGHT)
+        ops["sleep"](0.05)
+        append_text = text if pre_text[-1] in ("\n", "\r", " ", "\t") else f"\n{text}"
+        if not ops["set_clip"](append_text):
+            return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
+        ops["sleep"](0.03)
+        ops["send_ctrl"](VK_V)
+        ops["sleep"](0.06)
+        return True, title, "appended"
+    finally:
+        if switched_layout and orig_hkl:
+            ops["restore_hkl"](hwnd, orig_hkl)
 
 
 def run_self_check() -> int:
