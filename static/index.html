@@ -86,9 +86,10 @@
         </label>
 
         <div class="search-box-wrap" id="searchBoxWrap">
-          <input type="search" id="stepSearch" class="input search-steps" placeholder="Search: words AND, &quot;exact phrase&quot;, OR, NOT/!…" data-i18n-placeholder="toolbar.searchPlaceholder" autocomplete="off">
+          <input type="search" id="stepSearch" class="input search-steps" placeholder="Search: words AND, &quot;exact phrase&quot;, OR, NOT/!…" title="Search in session (Alt+↓ / Alt+↑ for search history)" data-i18n-placeholder="toolbar.searchPlaceholder" data-i18n-title="toolbar.searchInputTitle" autocomplete="off">
           <button type="button" id="searchOptsBtn" class="search-opts-btn" title="Search options &amp; query syntax" data-i18n-title="searchPopover.toggleTitle" aria-expanded="false">⚙</button>
           <div id="searchPopover" class="search-popover hidden" role="dialog" aria-label="Search options"></div>
+          <div id="searchHistoryPopover" class="search-history-popover hidden" role="listbox" aria-label="Search history"></div>
         </div>
 
         <div class="toolbar-actions">

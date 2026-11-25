@@ -14,6 +14,7 @@
     searchAcrossWholeTurn: false,
     searchWholeWord: false,
     searchCaseSensitive: false,
+    searchHistory: [],
     sidebarQuery: "",
     projectFilter: "",
     userScrolledUp: false,
@@ -74,6 +75,7 @@
     stepSearch: document.getElementById("stepSearch"),
     searchOptsBtn: document.getElementById("searchOptsBtn"),
     searchPopover: document.getElementById("searchPopover"),
+    searchHistoryPopover: document.getElementById("searchHistoryPopover"),
     onlyCmdErrorsToggle: document.getElementById("onlyCmdErrorsToggle"),
     expandAllBtn: document.getElementById("expandAllBtn"),
     collapseAllBtn: document.getElementById("collapseAllBtn"),
@@ -7857,9 +7859,161 @@
     }
   }
 
+  const SEARCH_HISTORY_MAX = 25;
+  const SEARCH_HISTORY_STORAGE_KEY = "tv_search_history";
+
+  function addSearchHistoryEntry(list, rawQuery, maxLen = SEARCH_HISTORY_MAX) {
+    const q = String(rawQuery || "").trim();
+    if (!q) return Array.isArray(list) ? list.slice(0, maxLen) : [];
+    const base = Array.isArray(list) ? list : [];
+    const out = [q];
+    for (const item of base) {
+      const s = String(item || "").trim();
+      if (s && s !== q) {
+        out.push(s);
+        if (out.length >= maxLen) break;
+      }
+    }
+    return out;
+  }
+
+  function saveSearchHistory(list) {
+    try {
+      localStorage.setItem(SEARCH_HISTORY_STORAGE_KEY, JSON.stringify(list));
+    } catch (_) {}
+  }
+
+  function recordSearchHistory(rawQuery) {
+    const q = String(rawQuery || "").trim();
+    if (!q) return;
+    state.searchHistory = addSearchHistoryEntry(state.searchHistory, q, SEARCH_HISTORY_MAX);
+    saveSearchHistory(state.searchHistory);
+    if (isSearchHistoryOpen()) renderSearchHistoryPopover();
+  }
+
+  let _searchHistoryActiveIdx = -1;
+  function isSearchHistoryOpen() {
+    return Boolean(els.searchHistoryPopover && !els.searchHistoryPopover.classList.contains("hidden"));
+  }
+
+  function closeSearchHistoryPopover() {
+    if (!els.searchHistoryPopover) return;
+    els.searchHistoryPopover.classList.add("hidden");
+    _searchHistoryActiveIdx = -1;
+  }
+
+  function setSearchHistoryActiveIndex(nextIdx) {
+    const items = state.searchHistory || [];
+    if (!items.length) {
+      _searchHistoryActiveIdx = -1;
+      return;
+    }
+    const clamped = ((nextIdx % items.length) + items.length) % items.length;
+    _searchHistoryActiveIdx = clamped;
+    if (!els.searchHistoryPopover) return;
+    const rows = els.searchHistoryPopover.querySelectorAll(".search-history-item");
+    rows.forEach((row, idx) => {
+      const active = idx === clamped;
+      row.classList.toggle("active", active);
+      row.setAttribute("aria-selected", active ? "true" : "false");
+      if (active) row.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function selectSearchHistoryItem(idx) {
+    const items = state.searchHistory || [];
+    if (idx < 0 || idx >= items.length) return;
+    const chosen = items[idx];
+    closeSearchHistoryPopover();
+    clearTimeout(searchTimer);
+    clearTimeout(searchHistorySettleTimer);
+    els.stepSearch.value = chosen;
+    applySearchQueryChange(chosen);
+    recordSearchHistory(chosen);
+    els.stepSearch.focus();
+  }
+
+  function renderSearchHistoryPopover() {
+    if (!els.searchHistoryPopover) return;
+    const items = state.searchHistory || [];
+    const headerHtml = `<div class="search-history-head"><span>${escHtml(t("searchHistory.header"))}</span>${
+      items.length
+        ? `<button type="button" class="search-history-clear" tabindex="-1" title="${escHtml(t("searchHistory.clearTitle"))}">${escHtml(t("searchHistory.clear"))}</button>`
+        : ""
+    }</div>`;
+    if (!items.length) {
+      els.searchHistoryPopover.innerHTML = `${headerHtml}<div class="search-history-empty">${escHtml(t("searchHistory.empty"))}</div>`;
+      return;
+    }
+    const listHtml = items
+      .map((item, i) => {
+        const activeCls = i === _searchHistoryActiveIdx ? " active" : "";
+        return (
+          `<div class="search-history-item${activeCls}" role="option" aria-selected="${i === _searchHistoryActiveIdx ? "true" : "false"}" data-hist-idx="${i}">` +
+          `<span class="search-history-text" title="${escHtml(item)}">${escHtml(item)}</span>` +
+          `<button type="button" class="search-history-del" tabindex="-1" data-hist-del="${i}" title="${escHtml(t("searchHistory.removeTitle"))}">×</button>` +
+          `</div>`
+        );
+      })
+      .join("");
+    els.searchHistoryPopover.innerHTML = `${headerHtml}<div class="search-history-list">${listHtml}</div>`;
+
+    const clearBtn = els.searchHistoryPopover.querySelector(".search-history-clear");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        state.searchHistory = [];
+        saveSearchHistory([]);
+        _searchHistoryActiveIdx = -1;
+        renderSearchHistoryPopover();
+        els.stepSearch.focus();
+      });
+    }
+    els.searchHistoryPopover.querySelectorAll(".search-history-item").forEach((row) => {
+      row.addEventListener("mousedown", (ev) => {
+        if (ev.target.closest(".search-history-del")) return;
+        ev.preventDefault();
+        const idx = Number(row.dataset.histIdx);
+        selectSearchHistoryItem(idx);
+      });
+    });
+    els.searchHistoryPopover.querySelectorAll(".search-history-del").forEach((delBtn) => {
+      delBtn.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const idx = Number(delBtn.dataset.histDel);
+        if (idx >= 0 && idx < state.searchHistory.length) {
+          state.searchHistory.splice(idx, 1);
+          saveSearchHistory(state.searchHistory);
+          if (_searchHistoryActiveIdx >= state.searchHistory.length) {
+            _searchHistoryActiveIdx = state.searchHistory.length - 1;
+          }
+          renderSearchHistoryPopover();
+        }
+        els.stepSearch.focus();
+      });
+    });
+  }
+
+  function openSearchHistoryPopover(initialIdx = 0) {
+    if (!els.searchHistoryPopover) return;
+    closeSearchPopover();
+    const items = state.searchHistory || [];
+    _searchHistoryActiveIdx = items.length ? Math.max(0, Math.min(initialIdx, items.length - 1)) : -1;
+    renderSearchHistoryPopover();
+    els.searchHistoryPopover.classList.remove("hidden");
+    if (_searchHistoryActiveIdx >= 0) {
+      setSearchHistoryActiveIndex(_searchHistoryActiveIdx);
+    }
+  }
+
   let searchTimer = null;
+  let searchHistorySettleTimer = null;
   els.stepSearch.addEventListener("input", (e) => {
     clearTimeout(searchTimer);
+    clearTimeout(searchHistorySettleTimer);
+    if (isSearchHistoryOpen()) closeSearchHistoryPopover();
     const val = e.target.value.trim();
     if (val === "") {
       applySearchQueryChange("");
@@ -7868,11 +8022,70 @@
     searchTimer = setTimeout(() => {
       applySearchQueryChange(val);
     }, 200);
+    if (val.length >= 2) {
+      searchHistorySettleTimer = setTimeout(() => {
+        if (els.stepSearch.value.trim() === val) recordSearchHistory(val);
+      }, 1200);
+    }
   });
 
   els.stepSearch.addEventListener("search", (e) => {
     clearTimeout(searchTimer);
-    applySearchQueryChange(e.target.value.trim());
+    clearTimeout(searchHistorySettleTimer);
+    const val = e.target.value.trim();
+    applySearchQueryChange(val);
+    if (val) recordSearchHistory(val);
+  });
+
+  els.stepSearch.addEventListener("blur", () => {
+    const val = els.stepSearch.value.trim();
+    if (val && val === state.stepQuery) recordSearchHistory(val);
+  });
+
+  els.stepSearch.addEventListener("keydown", (e) => {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      e.stopPropagation();
+      const items = state.searchHistory || [];
+      if (!isSearchHistoryOpen()) {
+        const initIdx = e.key === "ArrowUp" && items.length ? items.length - 1 : 0;
+        openSearchHistoryPopover(initIdx);
+      } else {
+        setSearchHistoryActiveIndex(_searchHistoryActiveIdx + (e.key === "ArrowDown" ? 1 : -1));
+      }
+      return;
+    }
+    if (isSearchHistoryOpen()) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setSearchHistoryActiveIndex(_searchHistoryActiveIdx + (e.key === "ArrowDown" ? 1 : -1));
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (_searchHistoryActiveIdx >= 0 && _searchHistoryActiveIdx < (state.searchHistory || []).length) {
+          selectSearchHistoryItem(_searchHistoryActiveIdx);
+        } else {
+          closeSearchHistoryPopover();
+          const val = els.stepSearch.value.trim();
+          applySearchQueryChange(val);
+          if (val) recordSearchHistory(val);
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeSearchHistoryPopover();
+        return;
+      }
+    } else if (e.key === "Enter") {
+      clearTimeout(searchTimer);
+      clearTimeout(searchHistorySettleTimer);
+      const val = els.stepSearch.value.trim();
+      applySearchQueryChange(val);
+      if (val) recordSearchHistory(val);
+    }
   });
 
   function isSearchPopoverOpen() {
@@ -7881,6 +8094,7 @@
 
   function openSearchPopover() {
     if (!els.searchPopover) return;
+    closeSearchHistoryPopover();
     if (!els.searchPopover.dataset.rendered) renderSearchPopover();
     els.searchPopover.classList.remove("hidden");
     if (els.searchOptsBtn) {
@@ -8011,6 +8225,7 @@
         const ex = chip.dataset.searchEx || "";
         els.stepSearch.value = ex;
         applySearchQueryChange(ex);
+        recordSearchHistory(ex);
         els.stepSearch.focus();
       });
     });
@@ -8025,9 +8240,9 @@
     });
   }
   document.addEventListener("mousedown", (e) => {
-    if (!isSearchPopoverOpen()) return;
     if (els.searchBoxWrap && !els.searchBoxWrap.contains(e.target)) {
-      closeSearchPopover();
+      if (isSearchPopoverOpen()) closeSearchPopover();
+      if (isSearchHistoryOpen()) closeSearchHistoryPopover();
     }
   });
 
@@ -9044,13 +9259,15 @@
         !els.lightbox.classList.contains("hidden") ||
         !els.cmdMapModal.classList.contains("hidden") ||
         !els.fileOpenModal.classList.contains("hidden") ||
-        isSearchPopoverOpen();
+        isSearchPopoverOpen() ||
+        isSearchHistoryOpen();
       els.lightbox.classList.add("hidden");
       isTooltipVisible = false;
       els.tooltip.classList.add("hidden");
       els.cmdMapModal.classList.add("hidden");
       els.fileOpenModal.classList.add("hidden");
       closeSearchPopover();
+      closeSearchHistoryPopover();
       if (!modalWasOpen && document.activeElement && document.activeElement.closest(INNER_SCROLL_SEL)) {
         if (els.feedWrap) els.feedWrap.focus({ preventScroll: true });
       }
@@ -9610,6 +9827,7 @@
       setComposerStatus(_lastComposerStatusMode, _lastComposerWindowTitle);
     }
     renderSearchPopover();
+    if (isSearchHistoryOpen()) renderSearchHistoryPopover();
     updateCmdMapButtonLabel();
     _tocBaseCache = null;
     stepSearchBlobCache = new WeakMap();
@@ -9686,6 +9904,13 @@
       savedSearchWholeTurn = localStorage.getItem("tv_search_whole_turn") === "1";
       savedSearchWholeWord = localStorage.getItem("tv_search_whole_word") === "1";
       savedSearchCase = localStorage.getItem("tv_search_case") === "1";
+      const rawHist = localStorage.getItem(SEARCH_HISTORY_STORAGE_KEY);
+      if (rawHist) {
+        const parsedHist = JSON.parse(rawHist);
+        if (Array.isArray(parsedHist)) {
+          state.searchHistory = parsedHist.map((x) => String(x || "").trim()).filter(Boolean).slice(0, SEARCH_HISTORY_MAX);
+        }
+      }
     } catch (_) {}
     state.folderOpenMode = savedFolderMode;
     state.fileOpenMode = savedFileMode;
@@ -9699,6 +9924,7 @@
     await loadLocale(savedLang);
     applyStaticTranslations();
     renderSearchPopover();
+    if (isSearchHistoryOpen()) renderSearchHistoryPopover();
     updateCmdMapButtonLabel();
     applyTheme(savedTheme);
     applySidebarCollapsed(savedCollapsed);

@@ -54,6 +54,7 @@
     "cmdErrors": "⚠ Cmd Errors",
     "cmdErrorsTitle": "Show only steps and commands that ended with an error (non-zero exit code or ERROR)",
     "searchPlaceholder": "Search: words AND, \"exact phrase\", OR, NOT/!…",
+    "searchInputTitle": "Search in session (Alt+↓ / Alt+↑ for search history)",
     "expandAll": "Expand all",
     "expandAllTitle": "Expand all thinking and tool_calls blocks",
     "collapseAll": "Collapse all",
@@ -82,6 +83,13 @@
     "synNot": "Exclude steps matching term or \"phrase\" (! or NOT — never hyphen -)",
     "synGroup": "Grouping with parentheses",
     "examplesTitle": "Examples (click to test)"
+  },
+  "searchHistory": {
+    "header": "Search History (↑/↓ · Enter)",
+    "clear": "Clear",
+    "clearTitle": "Clear all search history",
+    "empty": "No saved searches yet. Run a search or press Enter.",
+    "removeTitle": "Remove from history"
   },
   "minimap": {
     "trackTitle": "User prompts & markers — hover to preview, click to jump",

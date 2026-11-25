@@ -18,7 +18,7 @@ Antigravity saves full conversation logs — prompts, hidden thinking blocks, to
 - **Fast on Huge Sessions:** Smoothly browse sessions with tens of thousands of steps without browser freezes.
 - **Table of Contents & Scrollbar Minimap:** Jump to any step from the top Table of Contents, or use the color-coded notches along the right scrollbar (`💬` prompts, `📦` compactions, `⚠` command errors, `★` Command Map selections) — hover any notch to preview text and click to jump.
 - **Dialog-Only Mode:** Switch to **Диалог** to read just your messages and the AI's final answers, with one-click buttons between turns to peek at hidden thinking and tool calls whenever needed.
-- **Universal Instant Search (`/` or `Ctrl+.`):** Search across messages, thinking blocks, tool names, parameters, command outputs (e.g., `EXIT: 1`), step numbers, and timestamps, with matching quotes highlighted both in the feed and in the Table of Contents.
+- **Universal Instant Search (`/` or `Ctrl+.`):** Search across messages, thinking blocks, tool names, parameters, command outputs (e.g., `EXIT: 1`), step numbers, and timestamps, with matching quotes highlighted both in the feed and in the Table of Contents. Press **`Alt+↓` / `Alt+↑`** inside the search box to open and pick from your recent search history (`Enter` runs, `Esc` closes).
 
 ### Tools, Code, Diffs & Files
 - **Paired Tool Calls & Clear Errors:** Every tool result appears right below the command that ran it. Failed commands and errors stand out immediately with a blue-yellow striped border, clear `✓` / `⚠` icons, and `exit: 0` / `EXIT: N` badges.
@@ -27,7 +27,7 @@ Antigravity saves full conversation logs — prompts, hidden thinking blocks, to
   - `read_file` renders `.md` files as formatted Markdown and code files in monospace with clean 1-by-1 line numbers (easy to copy code without selecting line numbers).
   - Global display setting under the Table of Contents (**In scrollbox**, **Full**, or **Hidden**), plus smart **Show full / Collapse** buttons that appear only when content actually overflows.
   - Scroll the top Table of Contents directly with your mouse wheel on hover; inner code/parameter boxes scroll cleanly once clicked so they never snag normal feed scrolling.
-- **One-Click Copy for Terminals:** Code copy buttons strip trailing newlines so commands don't auto-execute on paste. Multi-line shell commands also include **`Copy &&`** (single-line chained) and **`Copy { ; }`** (PowerShell block) buttons. Common prefixes (`pwsh -c`, `cmd /c`) are dimmed so the actual command stands out.
+- **One-Click Copy, Live `▶ Run` & Project Consoles:** Code copy buttons strip trailing newlines so commands don't auto-execute on paste, and copying any card or command header keeps metadata neatly on a single line (omitting `{ }` and action buttons). Every logged `CommandLine` includes **`Copy`**, **`▶ Run`** (executes inline in the active project folder with an independently scrollable output box), and **`>_ Terminal`** (opens a standalone persistent terminal window pre-filled with that command), while the compact console icon in the top bar launches a shell directly inside the current project directory. Multi-line shell commands also include **`Copy &&`** (single-line chained) and **`Copy { ; }`** (PowerShell block) buttons. Common prefixes (`pwsh -c`, `cmd /c`) are dimmed so the actual command stands out.
 - **Images Fitted to Window:** Attached and inline screenshots scale cleanly to fit your window width without horizontal scrollbars, and open full-size on click.
 - **Clickable Links & File Viewer:** URLs, local paths, and project filenames become clickable links. Clicking a local file lets you choose **Formatted in Browser**, **Raw Text**, or **System Default App** (with a "Remember choice" option and folder opener modes for **Browser**, **Explorer**, or **Total Commander**).
 - **Accurate Local Time & Original JSON (`{ }`):** Automatically calibrates timestamps to your local session time (showing raw UTC on hover). Click `{ }` or **`Shift + Right-Click`** on any card to inspect the exact underlying JSON without losing your standard browser context menu.
@@ -53,7 +53,7 @@ python server.py      # Windows
 python3 server.py     # Linux / macOS
 ```
 
-3. Open `http://127.0.0.1:8765/` (opens automatically by default) to browse all sessions sorted by most recently updated.
+3. Open `http://127.0.0.1:8765/` (opens automatically by default) to browse all sessions sorted by most recently updated. Close the console window anytime (`Ctrl+C` or window `[X]`) for a clean shutdown without hanging prompts.
 
 ### CLI Options
 
@@ -70,6 +70,7 @@ python3 server.py     # Linux / macOS
 ## Shortcuts
 
 - **`/`** or **`Ctrl+.`** (any layout) — Focus the in-log search filter.
+- **`Alt+↓` / `Alt+↑`** inside search — Open and browse recent search history (`Enter` runs, `Esc` closes).
 - **`PgDn` / `PgUp` / `Home` / `End`** — Scroll the session feed regardless of where button focus sits.
 - **`{ }` button** or **`Shift + Right-Click`** — View original raw JSON for a step or tool output.
 - **`Hover 1.2s`** on badges or argument names — View a helpful explanation tooltip.

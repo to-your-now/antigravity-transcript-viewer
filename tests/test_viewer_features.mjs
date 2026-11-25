@@ -46,6 +46,7 @@ const helpersCode = [
   `const WORD_CHAR_RE = /[\\p{L}\\p{N}_]/u;`,
   `const fmtStepTime = (ts) => ts ? "12:00:00" : "";`,
   `const fmtFullDateTime = (ts) => ts || "";`,
+  `const SEARCH_HISTORY_MAX = 25;`,
   `const isCommandErrorStep = () => false;`,
   `const getStepMatchingCmdKeys = () => [];`,
   `let _cachedSearchAstRaw = null;`,
@@ -81,7 +82,8 @@ const helpersCode = [
   sliceFunc(appJs, "formatToolArgsForSnippet"),
   sliceFunc(appJs, "extractMatchSnippet"),
   sliceFunc(appJs, "serializeFeedSelectionRange"),
-  `return { state, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; } };`,
+  sliceFunc(appJs, "addSearchHistoryEntry"),
+  `return { state, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; } };`,
 ].join("\n\n");
 
 const api = new Function(helpersCode)();
@@ -791,6 +793,34 @@ const makeAnchorRunner = (cards, items) => {
   // Selection inside <input> must stay native (return null)
   const inpEl = makeMockNode({ tag: "INPUT" });
   assert.equal(api.serializeFeedSelectionRange({ commonAncestorContainer: inpEl, cloneContents: () => inpEl }), null);
+}
+
+// 13. Search query history (dedupe, max length, Alt+ArrowDown/Up popover hooks)
+{
+  let hist = [];
+  hist = api.addSearchHistoryEntry(hist, "  git diff  ", 3);
+  hist = api.addSearchHistoryEntry(hist, "", 3);
+  hist = api.addSearchHistoryEntry(hist, "EXIT: 1", 3);
+  hist = api.addSearchHistoryEntry(hist, "server.py", 3);
+  assert.deepEqual(hist, ["server.py", "EXIT: 1", "git diff"], "History should trim, ignore empty strings, and keep most-recent-first");
+
+  // Re-adding an existing entry moves it to index 0 without duplicating
+  hist = api.addSearchHistoryEntry(hist, "git diff", 3);
+  assert.deepEqual(hist, ["git diff", "server.py", "EXIT: 1"], "Duplicate query must move to top without growing beyond maxLen");
+
+  // Adding a fourth distinct query drops oldest
+  hist = api.addSearchHistoryEntry(hist, "msedge.exe", 3);
+  assert.deepEqual(hist, ["msedge.exe", "git diff", "server.py"], "History must cap cleanly at maxLen");
+
+  const styleCss = fs.readFileSync(path.resolve(__dirname, "..", "static", "style.css"), "utf8");
+  assert.ok(indexHtml.includes('id="searchHistoryPopover"'), "index.html must include #searchHistoryPopover");
+  assert.ok(styleCss.includes(".search-history-popover") && styleCss.includes(".search-history-item.active"), "style.css must style #searchHistoryPopover and active rows");
+  assert.ok(
+    appJs.includes('"tv_search_history"') &&
+      appJs.includes('e.key === "ArrowDown" || e.key === "ArrowUp"') &&
+      appJs.includes("openSearchHistoryPopover("),
+    "app.js must persist tv_search_history and handle Alt+ArrowDown/Alt+ArrowUp history popup"
+  );
 }
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");
