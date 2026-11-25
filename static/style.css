@@ -190,6 +190,31 @@ a:hover { color: var(--link-hover); }
   font-size: 14px;
 }
 .icon-btn:hover { border-color: var(--accent); }
+.top-term-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 27px;
+  padding: 0;
+  color: var(--cyan);
+  user-select: none;
+}
+.top-term-btn:hover:not(:disabled) {
+  border-color: var(--cyan);
+  background: rgba(86, 212, 221, 0.14);
+}
+.top-term-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+:root[data-theme="day"] .top-term-btn {
+  color: #0b5a66;
+}
+:root[data-theme="day"] .top-term-btn:hover:not(:disabled) {
+  border-color: #0b5a66;
+  background: rgba(11, 90, 102, 0.12);
+}
 
 .sidebar-controls {
   padding: 10px 12px;
@@ -1065,6 +1090,7 @@ a.task-step-link:hover {
   color: var(--text-dim);
   cursor: pointer;
   opacity: 0.65;
+  user-select: none;
   transition: opacity 0.12s, border-color 0.12s, background 0.12s;
 }
 .raw-btn:hover { opacity: 1; border-color: var(--accent); color: var(--text); }
@@ -1351,6 +1377,12 @@ details.block-unknown-tag > summary { color: #ffd43b; }
   max-height: 340px;
   overflow-y: auto;
 }
+.tool-args.has-cmd-exec,
+.tool-args.is-scroll.has-cmd-exec,
+.feed.is-read-full .tool-args.has-cmd-exec {
+  max-height: none;
+  overflow-y: visible;
+}
 /* Guarantee a single vertical scrollbox inside .tool-args and .read-scroll-box (zero nested double scrollbars) */
 .tool-args .arg-val-md,
 .tool-args .arg-val,
@@ -1515,6 +1547,7 @@ details.block-unknown-tag > summary { color: #ffd43b; }
   border: 1px solid var(--border);
   color: var(--text-dim);
   cursor: pointer;
+  user-select: none;
   transition: border-color 0.12s, color 0.12s, background 0.12s;
 }
 .head-raw-btn:hover {
@@ -1831,6 +1864,162 @@ a.link-auto:hover {
 :root[data-theme="day"] .cmd-main {
   background: rgba(235, 185, 25, 0.25);
   color: #111111;
+}
+
+/* CommandLine Copy + Bright Run Action Bar & Inline Live Console Runner */
+.arg-row-cmd-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.cmd-actions-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  user-select: none;
+}
+.copy-cmd-btn,
+.run-cmd-btn,
+.term-cmd-btn,
+.cmd-exec-btn {
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.08s, filter 0.12s, border-color 0.12s, background 0.12s;
+}
+.copy-cmd-btn {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.copy-cmd-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.copy-cmd-btn.is-copied {
+  border-color: #2ea043;
+  color: #3fb950;
+}
+.run-cmd-btn {
+  background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+  border: 1px solid #4ade80;
+  color: #052e16;
+  font-weight: 800;
+  box-shadow: 0 1px 6px rgba(34, 197, 94, 0.35);
+}
+.run-cmd-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 2px 10px rgba(34, 197, 94, 0.5);
+}
+.run-cmd-btn:disabled,
+.term-cmd-btn:disabled {
+  opacity: 0.72;
+  cursor: wait;
+}
+:root[data-theme="day"] .run-cmd-btn {
+  background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+  border-color: #166534;
+  color: #ffffff;
+  box-shadow: 0 1px 5px rgba(21, 128, 61, 0.32);
+}
+.term-cmd-btn {
+  background: rgba(56, 189, 248, 0.15);
+  border: 1px solid rgba(56, 189, 248, 0.55);
+  color: var(--cyan);
+}
+.term-cmd-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.26);
+  border-color: var(--cyan);
+}
+:root[data-theme="day"] .term-cmd-btn {
+  background: #e0f2fe;
+  border-color: #0284c7;
+  color: #0369a1;
+}
+:root[data-theme="day"] .term-cmd-btn:hover:not(:disabled) {
+  background: #bae6fd;
+  border-color: #0369a1;
+}
+.cmd-exec-panel {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-left: 3px solid #22c55e;
+  border-radius: 6px;
+  background: var(--bg-generic);
+  padding: 7px 9px;
+}
+.cmd-exec-panel.is-error {
+  border-left-color: var(--red);
+  background: rgba(248, 81, 73, 0.07);
+}
+.cmd-exec-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 11.5px;
+}
+.cmd-exec-shell {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--cyan);
+}
+.cmd-exec-cwd {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+.cmd-exec-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  user-select: none;
+}
+.cmd-exec-btn {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 1px 7px;
+  font-size: 11px;
+}
+.cmd-exec-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.cmd-exec-out {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--code-text);
+  max-height: 280px;
+  overflow-y: auto;
+}
+.copy-bar,
+.search-reveal-bar,
+.show-more-btn,
+.arg-md-toggle {
+  user-select: none;
 }
 
 .select-sm {

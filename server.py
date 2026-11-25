@@ -7,13 +7,16 @@ and safe read-only media serving from ~/.gemini/antigravity/brain.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import html as _html
 import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -46,6 +49,8 @@ FAVICON_TAG = (
 _META_CACHE: Dict[str, Tuple[int, int, dict]] = {}
 _META_LOCK = threading.Lock()
 _I18N_SERVER_CACHE: Dict[str, Dict[str, str]] = {}
+_SHUTDOWN_EVENT = threading.Event()
+_WIN_CONSOLE_HANDLER: Any = None
 
 
 def _norm_lang(raw_lang: Any) -> str:
@@ -414,12 +419,305 @@ def _find_posix_opener() -> Optional[str]:
     return None
 
 
+def _get_default_shell_name() -> str:
+    if IS_WINDOWS:
+        if shutil.which("pwsh"):
+            return "pwsh"
+        if shutil.which("powershell"):
+            return "powershell"
+        return "cmd"
+    if shutil.which("bash"):
+        return "bash"
+    if shutil.which("pwsh"):
+        return "pwsh"
+    return "sh"
+
+
+def _find_shell_for_command(cmd_text: str) -> Tuple[Optional[List[str]], str]:
+    """Select the exact shell binary + flags matching Antigravity run_command execution."""
+    stripped = cmd_text.lstrip()
+    if IS_WINDOWS:
+        pwsh_exe = shutil.which("pwsh")
+        if pwsh_exe:
+            return [pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd_text], "pwsh"
+        ps_exe = shutil.which("powershell")
+        if ps_exe:
+            return [ps_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd_text], "powershell"
+        comspec = os.environ.get("ComSpec") or shutil.which("cmd")
+        if comspec:
+            return [comspec, "/c", cmd_text], "cmd"
+        return None, ""
+
+    if re.match(r"^(?:pwsh|powershell)\b", stripped, re.IGNORECASE):
+        pwsh_exe = shutil.which("pwsh")
+        if pwsh_exe:
+            return [pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd_text], "pwsh"
+    bash_exe = shutil.which("bash")
+    if bash_exe:
+        return [bash_exe, "-lc", cmd_text], "bash"
+    sh_exe = shutil.which("sh") or "/bin/sh"
+    if Path(sh_exe).exists() or shutil.which(sh_exe):
+        return [sh_exe, "-c", cmd_text], "sh"
+    return None, ""
+
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[P^_][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-])"
+)
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _decode_console_bytes(raw: bytes) -> str:
+    if not raw:
+        return ""
+    encodings = ["utf-8"]
+    if IS_WINDOWS:
+        encodings.extend(["cp866", "cp1251"])
+    decoded = ""
+    for enc in encodings:
+        try:
+            decoded = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not decoded:
+        decoded = raw.decode("utf-8", errors="replace")
+    return _strip_ansi(decoded)
+
+
+def _resolve_project_cwd(raw_cwd: str = "", conv_id: str = "", lang: str = "en") -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    cwd_path: Optional[Path] = None
+    if raw_cwd:
+        cand = _resolve_user_path(raw_cwd, conv_id, raw_cwd)
+        if cand is not None:
+            if cand.is_dir():
+                cwd_path = cand
+            elif cand.is_file():
+                cwd_path = cand.parent
+
+    if cwd_path is None and conv_id:
+        t_path = _resolve_transcript(conv_id)
+        if t_path is not None:
+            records, _, _ = read_jsonl_range(t_path, 0)
+            st = t_path.stat()
+            meta = _extract_meta(conv_id, t_path, st)
+            proj_root, _ = _detect_project_context(records, meta.get("project", ""))
+            if proj_root:
+                pr = Path(proj_root)
+                if pr.is_dir():
+                    cwd_path = pr
+
+    if cwd_path is None:
+        if raw_cwd:
+            return None, {"ok": False, "error": _srv_t(lang, "cmdInvalidCwd", cwd=raw_cwd)}
+        cwd_path = Path(__file__).resolve().parent
+    return cwd_path, None
+
+
+def _ps_single_quote(text: str) -> str:
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def _build_windows_interactive_ps_script(cwd_path: Path, cmd_clean: str = "") -> str:
+    q_cwd = _ps_single_quote(str(cwd_path))
+    lines = [
+        f"Set-Location -LiteralPath {q_cwd}",
+    ]
+    if cmd_clean:
+        q_cmd = _ps_single_quote(cmd_clean)
+        lines.extend(
+            [
+                f"try {{ Import-Module PSReadLine -ErrorAction SilentlyContinue; if (Get-Command Get-PSReadLineOption -ErrorAction SilentlyContinue) {{ [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory({q_cmd}) }} }} catch {{}}",
+                f"Write-Host ('[cwd] ' + {q_cwd}) -ForegroundColor DarkCyan",
+                f"Write-Host ('PS> ' + {q_cmd}) -ForegroundColor Yellow",
+                f"$__tvCmd = {q_cmd}",
+                "try {",
+                "  Invoke-Expression $__tvCmd",
+                "} catch {",
+                "  Write-Host $_ -ForegroundColor Red",
+                "}",
+            ]
+        )
+    else:
+        lines.append(f"Write-Host ('[cwd] ' + {q_cwd}) -ForegroundColor DarkCyan")
+    return "\n".join(lines)
+
+
+def open_interactive_terminal(
+    cmd_text: str = "",
+    raw_cwd: str = "",
+    conv_id: str = "",
+    lang: str = "en",
+) -> Tuple[int, Dict[str, Any]]:
+    lang = _norm_lang(lang)
+    cwd_path, cwd_err = _resolve_project_cwd(raw_cwd, conv_id, lang)
+    if cwd_path is None:
+        return 400, cwd_err or {"ok": False, "error": _srv_t(lang, "cmdInvalidCwd", cwd=raw_cwd)}
+
+    cmd_clean = str(cmd_text or "").rstrip("\r\n")
+
+    if IS_WINDOWS:
+        shell_exe = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell_exe:
+            return 500, {"ok": False, "error": _srv_t(lang, "cmdShellNotFound")}
+        shell_label = Path(shell_exe).stem.lower()
+        script = _build_windows_interactive_ps_script(cwd_path, cmd_clean)
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        try:
+            subprocess.Popen(
+                [shell_exe, "-NoLogo", "-NoExit", "-EncodedCommand", encoded],
+                cwd=str(cwd_path),
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
+            )
+            return 200, {"ok": True, "cwd": str(cwd_path), "shell": shell_label}
+        except OSError as exc:
+            return 500, {"ok": False, "error": f"{_srv_t(lang, 'termOpenError')}: {exc}"}
+
+    # POSIX (macOS / Linux)
+    posix_shell = shutil.which("bash") or shutil.which("zsh") or shutil.which("sh") or "/bin/sh"
+    q_cwd = shlex.quote(str(cwd_path))
+    if cmd_clean:
+        q_cmd_print = shlex.quote(cmd_clean)
+        shell_script = f"cd {q_cwd} && printf '\\033[36m[cwd] %s\\033[0m\\n\\033[33m$ %s\\033[0m\\n' {q_cwd} {q_cmd_print}; {cmd_clean}; exec {shlex.quote(posix_shell)} -i"
+    else:
+        shell_script = f"cd {q_cwd} && printf '\\033[36m[cwd] %s\\033[0m\\n' {q_cwd}; exec {shlex.quote(posix_shell)} -i"
+
+    if IS_MACOS and shutil.which("osascript"):
+        try:
+            osa_esc = shell_script.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(
+                ["osascript", "-e", f'tell application "Terminal" to do script "{osa_esc}"', "-e", 'tell application "Terminal" to activate'],
+                start_new_session=True,
+            )
+            return 200, {"ok": True, "cwd": str(cwd_path), "shell": Path(posix_shell).name}
+        except OSError as exc:
+            return 500, {"ok": False, "error": f"{_srv_t(lang, 'termOpenError')}: {exc}"}
+
+    term_candidates = [
+        ("x-terminal-emulator", ["-e", posix_shell, "-ic", shell_script]),
+        ("gnome-terminal", ["--", posix_shell, "-ic", shell_script]),
+        ("konsole", ["-e", posix_shell, "-ic", shell_script]),
+        ("xfce4-terminal", ["-x", posix_shell, "-ic", shell_script]),
+        ("alacritty", ["-e", posix_shell, "-ic", shell_script]),
+        ("kitty", [posix_shell, "-ic", shell_script]),
+        ("xterm", ["-e", posix_shell, "-ic", shell_script]),
+    ]
+    for bin_name, extra_args in term_candidates:
+        found = shutil.which(bin_name)
+        if found:
+            try:
+                subprocess.Popen([found, *extra_args], cwd=str(cwd_path), start_new_session=True)
+                return 200, {"ok": True, "cwd": str(cwd_path), "shell": Path(posix_shell).name}
+            except OSError:
+                continue
+    return 501, {"ok": False, "error": _srv_t(lang, "termUnsupported")}
+
+
+def execute_console_command(
+    cmd_text: str,
+    raw_cwd: str = "",
+    conv_id: str = "",
+    lang: str = "en",
+    timeout_sec: float = 30.0,
+) -> Tuple[int, Dict[str, Any]]:
+    lang = _norm_lang(lang)
+    cmd_clean = str(cmd_text or "").rstrip("\r\n")
+    if not cmd_clean.strip():
+        return 400, {"ok": False, "error": _srv_t(lang, "cmdEmpty")}
+
+    cwd_path, cwd_err = _resolve_project_cwd(raw_cwd, conv_id, lang)
+    if cwd_path is None:
+        return 400, cwd_err or {"ok": False, "error": _srv_t(lang, "cmdInvalidCwd", cwd=raw_cwd)}
+
+    argv, shell_label = _find_shell_for_command(cmd_clean)
+    if not argv:
+        return 500, {"ok": False, "error": _srv_t(lang, "cmdShellNotFound")}
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env["NO_COLOR"] = "1"
+    env["CLICOLOR"] = "0"
+    env["FORCE_COLOR"] = "0"
+    env["TERM"] = "dumb"
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(cwd_path),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    t0 = time.monotonic()
+    max_bytes = 200_000
+    timed_out = False
+    try:
+        proc = subprocess.Popen(argv, **popen_kwargs)
+    except OSError as exc:
+        return 500, {"ok": False, "error": str(exc)}
+
+    try:
+        out_b, err_b = proc.communicate(timeout=timeout_sec)
+        exit_code = int(proc.returncode or 0)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if IS_WINDOWS:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                )
+            except Exception:
+                proc.kill()
+        else:
+            proc.kill()
+        try:
+            out_b, err_b = proc.communicate(timeout=3)
+        except Exception:
+            out_b, err_b = b"", b""
+        exit_code = -1
+
+    duration_ms = max(1, int(round((time.monotonic() - t0) * 1000)))
+    stdout_str = _decode_console_bytes((out_b or b"")[:max_bytes])
+    stderr_str = _decode_console_bytes((err_b or b"")[:max_bytes])
+    if len(out_b or b"") > max_bytes:
+        stdout_str += "\n… [truncated]"
+    if len(err_b or b"") > max_bytes:
+        stderr_str += "\n… [truncated]"
+    if timed_out:
+        timeout_note = _srv_t(lang, "cmdTimeoutMsg", sec=int(timeout_sec))
+        stderr_str = f"{stderr_str}\n{timeout_note}".strip()
+
+    return 200, {
+        "ok": True,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "cwd": str(cwd_path),
+        "shell": shell_label,
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "timed_out": timed_out,
+    }
+
+
 def get_platform_capabilities() -> Dict[str, Any]:
     has_posix_opener = _find_posix_opener() is not None
     return {
         "os": sys.platform,
         "is_windows": IS_WINDOWS,
         "is_macos": IS_MACOS,
+        "default_shell": _get_default_shell_name(),
         "antigravity_paste": IS_WINDOWS,
         "open_explorer": IS_WINDOWS,
         "open_totalcmd": IS_WINDOWS and (_find_totalcmd_exe() is not None),
@@ -664,6 +962,56 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "path": str(resolved), "mode": "system"})
             except OSError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+
+        if parsed.path == "/api/run-command":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw_body = self.rfile.read(min(length, 500_000)) if length > 0 else b""
+            try:
+                data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except Exception:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            lang = _norm_lang(data.get("lang"))
+            origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+            if origin:
+                orig_host = (urllib.parse.urlparse(origin).hostname or "").lower()
+                if orig_host not in {"127.0.0.1", "localhost", "::1"}:
+                    self._send_json({"ok": False, "error": _srv_t(lang, "cmdForbiddenOrigin")}, status=403)
+                    return
+            cmd_text = str(data.get("cmd") or "")
+            raw_cwd = str(data.get("cwd") or "")
+            conv_id = str(data.get("conv") or "")
+            status_code, payload = execute_console_command(cmd_text, raw_cwd=raw_cwd, conv_id=conv_id, lang=lang)
+            self._send_json(payload, status=status_code)
+            return
+
+        if parsed.path == "/api/open-terminal":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw_body = self.rfile.read(min(length, 500_000)) if length > 0 else b""
+            try:
+                data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except Exception:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            lang = _norm_lang(data.get("lang"))
+            origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+            if origin:
+                orig_host = (urllib.parse.urlparse(origin).hostname or "").lower()
+                if orig_host not in {"127.0.0.1", "localhost", "::1"}:
+                    self._send_json({"ok": False, "error": _srv_t(lang, "cmdForbiddenOrigin")}, status=403)
+                    return
+            cmd_text = str(data.get("cmd") or "")
+            raw_cwd = str(data.get("cwd") or "")
+            conv_id = str(data.get("conv") or "")
+            status_code, payload = open_interactive_terminal(cmd_text=cmd_text, raw_cwd=raw_cwd, conv_id=conv_id, lang=lang)
+            self._send_json(payload, status=status_code)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -1290,11 +1638,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         last_ping = time.monotonic()
 
         try:
-            while True:
+            while not _SHUTDOWN_EVENT.is_set():
                 try:
                     st = t_path.stat()
                 except OSError:
-                    time.sleep(1.0)
+                    if _SHUTDOWN_EVENT.wait(timeout=1.0):
+                        break
                     continue
 
                 if st.st_size != last_size or st.st_mtime_ns != last_mtime_ns:
@@ -1318,7 +1667,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last_ping = now
 
-                time.sleep(0.5)
+                if _SHUTDOWN_EVENT.wait(timeout=0.5):
+                    break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
 
@@ -1649,6 +1999,75 @@ def run_self_check() -> int:
     return 0
 
 
+def _install_shutdown_handlers(on_shutdown: Any) -> Any:
+    """Install OS shutdown handlers (Win32 console close/logoff/shutdown & POSIX SIGTERM/SIGHUP)."""
+    global _WIN_CONSOLE_HANDLER
+    cleanups: List[Any] = []
+
+    if IS_WINDOWS:
+        CTRL_BREAK_EVENT = 1
+        CTRL_CLOSE_EVENT = 2
+        CTRL_LOGOFF_EVENT = 5
+        CTRL_SHUTDOWN_EVENT = 6
+        ctrl_names = {
+            CTRL_BREAK_EVENT: "CTRL_BREAK_EVENT",
+            CTRL_CLOSE_EVENT: "CTRL_CLOSE_EVENT",
+            CTRL_LOGOFF_EVENT: "CTRL_LOGOFF_EVENT",
+            CTRL_SHUTDOWN_EVENT: "CTRL_SHUTDOWN_EVENT",
+        }
+        try:
+            handler_proto = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+
+            def _win_ctrl(dw_ctrl_type: int) -> int:
+                label = ctrl_names.get(int(dw_ctrl_type))
+                if label:
+                    on_shutdown(label, wait=True, stop_loop=True)
+                    return 1
+                return 0
+
+            cb = handler_proto(_win_ctrl)
+            if ctypes.windll.kernel32.SetConsoleCtrlHandler(cb, True):
+                _WIN_CONSOLE_HANDLER = cb
+
+                def _remove_win() -> None:
+                    global _WIN_CONSOLE_HANDLER
+                    try:
+                        ctypes.windll.kernel32.SetConsoleCtrlHandler(cb, False)
+                    except Exception:
+                        pass
+                    if _WIN_CONSOLE_HANDLER is cb:
+                        _WIN_CONSOLE_HANDLER = None
+
+                cleanups.append(_remove_win)
+        except Exception:
+            pass
+
+    if threading.current_thread() is threading.main_thread():
+        for sig_name in ("SIGTERM", "SIGHUP"):
+            sig_num = getattr(signal, sig_name, None)
+            if sig_num is None:
+                continue
+            try:
+                prev = signal.getsignal(sig_num)
+
+                def _sig_handler(_signum: int, _frame: Any, name: str = sig_name) -> None:
+                    on_shutdown(name, wait=False, stop_loop=True)
+
+                signal.signal(sig_num, _sig_handler)
+                cleanups.append(lambda s=sig_num, p=prev: signal.signal(s, p))
+            except (ValueError, OSError):
+                pass
+
+    def _cleanup() -> None:
+        for fn in reversed(cleanups):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    return _cleanup
+
+
 def main() -> int:
     global BRAIN_DIR
     parser = argparse.ArgumentParser(description="Antigravity JSONL Transcript Web Viewer")
@@ -1670,21 +2089,49 @@ def main() -> int:
     if args.check:
         return run_self_check()
 
+    _SHUTDOWN_EVENT.clear()
     server = ReusableThreadingHTTPServer((args.host, args.port), TranscriptHandler)
+    shutdown_done = threading.Event()
+    shutdown_lock = threading.Lock()
+    shutdown_started = False
+
+    def _request_shutdown(reason: str = "", wait: bool = False, stop_loop: bool = True) -> None:
+        nonlocal shutdown_started
+        with shutdown_lock:
+            first = not shutdown_started
+            shutdown_started = True
+        if first:
+            try:
+                msg = f"\nShutting down ({reason})..." if reason else "\nShutting down..."
+                print(msg, flush=True)
+            except Exception:
+                pass
+            _SHUTDOWN_EVENT.set()
+            if stop_loop:
+                threading.Thread(target=server.shutdown, daemon=True, name="tv-shutdown").start()
+        if wait:
+            shutdown_done.wait(timeout=3.5)
+
+    cleanup_handlers = _install_shutdown_handlers(_request_shutdown)
     url = f"http://{args.host}:{args.port}/"
     print(f"Antigravity Transcript Viewer running at {url}")
     print(f"Watching: {BRAIN_DIR}")
-    print("Press Ctrl+C to stop.")
+    print("Press Ctrl+C or close this window to stop.")
 
     if not args.no_open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
     try:
-        server.serve_forever()
+        server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
-        print("\nShutting down...")
-        server.shutdown()
-        server.server_close()
+        _request_shutdown("Ctrl+C", wait=False, stop_loop=False)
+    finally:
+        _SHUTDOWN_EVENT.set()
+        cleanup_handlers()
+        try:
+            server.server_close()
+        finally:
+            shutdown_done.set()
     return 0
 
 

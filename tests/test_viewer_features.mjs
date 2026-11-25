@@ -78,7 +78,10 @@ const helpersCode = [
   sliceFunc(appJs, "stepMatchesFilter"),
   sliceFunc(appJs, "buildStepMetadataAndTaskIndex"),
   sliceFunc(appJs, "resolveTaskLinkDestination"),
-  `return { state, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; } };`,
+  sliceFunc(appJs, "formatToolArgsForSnippet"),
+  sliceFunc(appJs, "extractMatchSnippet"),
+  sliceFunc(appJs, "serializeFeedSelectionRange"),
+  `return { state, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; } };`,
 ].join("\n\n");
 
 const api = new Function(helpersCode)();
@@ -507,7 +510,13 @@ function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bo
         rest = rest.slice(tagM[0].length);
       }
       while (rest.length) {
-        if (rest.startsWith(".")) {
+        if (rest.startsWith(":not(")) {
+          const closeIdx = rest.indexOf(")");
+          if (closeIdx === -1) return false;
+          const inner = rest.slice(5, closeIdx);
+          if (node.matchesSimple(inner)) return false;
+          rest = rest.slice(closeIdx + 1);
+        } else if (rest.startsWith(".")) {
           const cm = rest.slice(1).match(/^[a-zA-Z0-9_-]+/);
           if (!cm || !clsSet.has(cm[0])) return false;
           rest = rest.slice(1 + cm[0].length);
@@ -571,12 +580,19 @@ function makeMockNode({ tag = "DIV", cls = [], dataset = {}, rect = { top: 0, bo
       const out = [];
       const walk = (n) => {
         for (const ch of n.children) {
-          if (ch.matches(sel, node)) out.push(ch);
-          walk(ch);
+          if (ch.nodeType === 1 && ch.matches(sel, node)) out.push(ch);
+          if (ch.nodeType === 1) walk(ch);
         }
       };
       walk(node);
       return out;
+    },
+    querySelector(sel) {
+      return node.querySelectorAll(sel)[0] || null;
+    },
+    nodeType: 1,
+    get childNodes() {
+      return children;
     },
   };
   return node;
@@ -605,11 +621,12 @@ const makeAnchorRunner = (cards, items) => {
 };
 
 {
-  // Case A: Peeking top card A (mark offscreen at -100, only .search-hit-target tail at 60) + Card B with visible mark in .step-body > .md > p
+  // Case A: Peeking top sliver card A + Card B whose .step-head is visible (with omitted thinking above mdB) -> must lock Card B's .step-head
   const cardA = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1260" }, rect: { top: -200, bottom: 68, height: 268 } });
-  const tcA = makeMockNode({ tag: "DIV", cls: ["tool-card", "search-hit-target"], dataset: { toolIdx: "0" }, rect: { top: -180, bottom: 65, height: 245 } });
+  const headA = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: -200, bottom: -164, height: 36 } });
+  const tcA = makeMockNode({ tag: "DIV", cls: ["tool-card", "search-hit-target"], dataset: { toolIdx: "0" }, rect: { top: -160, bottom: 65, height: 225 } });
   const markA = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: -120, bottom: -102, height: 18 } });
-  cardA.append(tcA.append(markA));
+  cardA.append(headA, tcA.append(markA));
 
   const cardB = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1267" }, rect: { top: 80, bottom: 320, height: 240 } });
   const headB = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: 80, bottom: 116, height: 36 } });
@@ -621,15 +638,15 @@ const makeAnchorRunner = (cards, items) => {
   cardB.append(headB, bodyB.append(omittedThink, mdB.append(pB.append(markB))));
 
   const anchorB = makeAnchorRunner([cardA, cardB], [{ step: {}, stepKey: "1260" }, { step: {}, stepKey: "1267" }]);
-  assert.equal(anchorB.stepIndex, "1267", "Visible mark.hl in card B must beat peeking .search-hit-target tail of card A");
+  assert.equal(anchorB.stepIndex, "1267", "Card B's visible .step-head must beat peeking sliver of card A");
   assert.deepEqual(
     anchorB.subAnchor,
-    { scope: "card", sel: ":scope > .step-body > .md p", idx: 0 },
-    "Match inside .md must capture :scope > .step-body > .md p subAnchor instead of collapsing to article.step"
+    { scope: "card", sel: ":scope > .step-head", idx: 0 },
+    "When .step-head is visible inside viewport, captureSearchContextAnchor must lock :scope > .step-head so omitted blocks expanding above content never shift the step header"
   );
-  assert.equal(anchorB.topInWrap, 140 - 50, "topInWrap must anchor the .md <p> offset relative to #feedWrap");
+  assert.equal(anchorB.topInWrap, 80 - 50, "topInWrap must lock the .step-head exact offset relative to #feedWrap");
 
-  // Case B: Match inside .tool-card > .tool-head with omitted sibling tool-card above it
+  // Case B: Card C has visible .step-head AND omitted sibling tool-card tc0 above matched tc1 -> must lock .step-head
   const cardC = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1270" }, rect: { top: 60, bottom: 260, height: 200 } });
   const headC = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: 60, bottom: 96, height: 36 } });
   const bodyC = makeMockNode({ tag: "DIV", cls: ["step-body"], rect: { top: 96, bottom: 260, height: 164 } });
@@ -642,24 +659,138 @@ const makeAnchorRunner = (cards, items) => {
   cardC.append(headC, bodyC.append(toolsDet.append(toolsBody.append(tc0, tc1.append(tc1Head.append(markTc1))))));
 
   const anchorC = makeAnchorRunner([cardC], [{ step: {}, stepKey: "1270" }]);
-  assert.equal(anchorC.toolIdx, "1");
-  assert.deepEqual(anchorC.subAnchor, { scope: "tc", sel: ":scope > .tool-head", idx: 0 });
-  assert.equal(anchorC.topInWrap, 120 - 50);
+  assert.equal(anchorC.toolIdx, null);
+  assert.deepEqual(anchorC.subAnchor, { scope: "card", sel: ":scope > .step-head", idx: 0 });
+  assert.equal(anchorC.topInWrap, 60 - 50);
 
-  // Case C: Match inside expanded (non-overflowing) .read-scroll-box code line anchors exact .code-gutter-row
+  // Case C: Match inside expanded .read-scroll-box when .step-head is scrolled off-screen above viewport -> anchors exact .code-gutter-row
   const cardD = makeMockNode({ tag: "ARTICLE", cls: ["step"], dataset: { stepIndex: "1280" }, rect: { top: -200, bottom: 700, height: 900 } });
+  const headD = makeMockNode({ tag: "DIV", cls: ["step-head"], rect: { top: -200, bottom: -164, height: 36 } });
   const tcD = makeMockNode({ tag: "DIV", cls: ["tool-card"], dataset: { toolIdx: "0" }, rect: { top: -150, bottom: 680, height: 830 } });
   const resD = makeMockNode({ tag: "DIV", cls: ["tool-result"], dataset: { stepIndex: "1281" }, rect: { top: -120, bottom: 680, height: 800 } });
   const boxD = makeMockNode({ tag: "DIV", cls: ["read-scroll-box", "is-full"], rect: { top: -90, bottom: 680, height: 770 }, scrollH: 770, clientH: 770 });
   const row0 = makeMockNode({ tag: "DIV", cls: ["code-gutter-row"], rect: { top: -90, bottom: -70, height: 20 } });
   const row1 = makeMockNode({ tag: "DIV", cls: ["code-gutter-row", "search-hit-sub"], rect: { top: 210, bottom: 230, height: 20 } });
   const markD = makeMockNode({ tag: "MARK", cls: ["hl"], rect: { top: 211, bottom: 229, height: 18 } });
-  cardD.append(tcD.append(resD.append(boxD.append(row0, row1.append(markD)))));
+  cardD.append(headD, tcD.append(resD.append(boxD.append(row0, row1.append(markD)))));
 
   const anchorD = makeAnchorRunner([cardD], [{ step: {}, stepKey: "1280" }]);
   assert.equal(anchorD.toolOutStep, "1281");
   assert.deepEqual(anchorD.subAnchor, { scope: "res", sel: ".code-gutter-row", idx: 1 });
   assert.equal(anchorD.topInWrap, 210 - 50);
+}
+
+// 12. TOC snippet single-backslash Windows paths, CommandLine Copy/Run backend+UI hooks, and single-line Wait/OUTPUT copy
+{
+  const cmdStep = {
+    step_index: 925,
+    type: "PLANNER_RESPONSE",
+    status: "DONE",
+    source: "MODEL",
+    tool_calls: [
+      {
+        name: "run_command",
+        args: {
+          CommandLine: "pwsh -c Test-Path 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'",
+          WaitMsBeforeAsync: 5000,
+        },
+      },
+    ],
+  };
+  const snip1 = api.extractMatchSnippet(cmdStep, "msedge.exe", null);
+  assert.ok(snip1.includes("Application\\<mark class=\"hl\">msedge.exe</mark>"), "TOC snippet must show single backslashes instead of JSON-escaped \\\\");
+  assert.ok(!snip1.includes("Application\\\\"), "TOC snippet must not double backslashes in Windows paths");
+  assert.ok(snip1.includes("WaitMsBefore"), "TOC snippet must keep surrounding single-line tool arg context");
+
+  const snip2 = api.extractMatchSnippet(cmdStep, "cation\\msedge.exe", null);
+  assert.ok(
+    snip2.startsWith("[run_command]") && snip2.includes('<mark class="hl">cation\\msedge.exe</mark>'),
+    "Searching cation\\msedge.exe must find and highlight the match inside [run_command] TOC snippet"
+  );
+
+  const serverPy = fs.readFileSync(path.resolve(__dirname, "..", "server.py"), "utf8");
+  assert.ok(serverPy.includes("def execute_console_command(") && serverPy.includes('"/api/run-command"'), "server.py must expose /api/run-command");
+  assert.ok(serverPy.includes("def open_interactive_terminal(") && serverPy.includes('"/api/open-terminal"'), "server.py must expose /api/open-terminal");
+  assert.ok(serverPy.includes("def _strip_ansi(") && serverPy.includes('"NO_COLOR"'), "server.py must strip ANSI sequences and set NO_COLOR=1");
+  assert.ok(indexHtml.includes('id="openProjTermBtn"') && indexHtml.includes('data-i18n-title="topbar.openTerminalTitle"'), "index.html must include topbar project terminal icon button with tooltip");
+  assert.ok(appJs.includes("function attachCommandActionsToHead(") && appJs.includes(".term-cmd-btn") && appJs.includes('"/api/open-terminal"'), "app.js must attach Copy, Run, and Terminal buttons beside CommandLine");
+  assert.ok(appJs.includes('document.addEventListener("copy",'), "app.js must normalize copied headers across the whole document, not only inside #feed");
+  assert.ok(styleCss.includes(".run-cmd-btn") && styleCss.includes(".term-cmd-btn") && styleCss.includes(".top-term-btn") && styleCss.includes("user-select: none"), "style.css must style .run-cmd-btn, .term-cmd-btn, and .top-term-btn cleanly");
+  assert.ok(styleCss.includes(".tool-args.has-cmd-exec") && !styleCss.includes(".tool-args .cmd-exec-out"), "Only .cmd-exec-out may scroll when inline Run output is open; .tool-args must uncap via .has-cmd-exec");
+  assert.ok(appJs.includes("has-cmd-exec"), "app.js must toggle .has-cmd-exec on .tool-args when inline .cmd-exec-panel opens/closes");
+
+  const mkText = (s) => ({ nodeType: 3, nodeValue: s });
+  const rootFrag = makeMockNode({ tag: "DIV" });
+  const stepHead = makeMockNode({ tag: "DIV", cls: ["step-head"] }).append(
+    makeMockNode({ tag: "SPAN", cls: ["badge"] }).append(mkText("PLANNER")),
+    makeMockNode({ tag: "SPAN", cls: ["step-num-chip"] }).append(mkText("#925")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("19:51:19")),
+    makeMockNode({ tag: "BUTTON", cls: ["raw-btn"] }).append(mkText("{ }"))
+  );
+  const rowCmd = makeMockNode({ tag: "DIV", cls: ["arg-row", "arg-row-command"] });
+  const rowCmdHead = makeMockNode({ tag: "DIV", cls: ["arg-row-cmd-head"] });
+  rowCmdHead.append(
+    makeMockNode({ tag: "SPAN", cls: ["arg-key"] }).append(mkText("CommandLine")),
+    makeMockNode({ tag: "DIV", cls: ["cmd-actions-bar"] }).append(
+      makeMockNode({ tag: "BUTTON", cls: ["copy-cmd-btn"] }).append(mkText("Copy")),
+      makeMockNode({ tag: "BUTTON", cls: ["run-cmd-btn"] }).append(mkText("Run")),
+      makeMockNode({ tag: "BUTTON", cls: ["term-cmd-btn"] }).append(mkText(">_ Terminal"))
+    )
+  );
+  const preCmd = makeMockNode({ tag: "PRE", cls: ["arg-val"] }).append(mkText("pwsh -c Test-Path 'C:\\App\\x.exe'"));
+  const execHead = makeMockNode({ tag: "DIV", cls: ["cmd-exec-head"] }).append(
+    makeMockNode({ tag: "SPAN", cls: ["cmd-exec-shell"] }).append(mkText("pwsh")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip", "exit-nonzero"] }).append(mkText("EXIT: 1")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("⏱ 2.2s")),
+    makeMockNode({ tag: "SPAN", cls: ["cmd-exec-cwd"] }).append(mkText("cwd: C:\\workspace\\sample")),
+    makeMockNode({ tag: "SPAN", cls: ["cmd-exec-actions"] }).append(
+      makeMockNode({ tag: "BUTTON", cls: ["cmd-exec-btn"] }).append(mkText("↻ Re-run")),
+      makeMockNode({ tag: "BUTTON", cls: ["cmd-exec-btn"] }).append(mkText("✕"))
+    )
+  );
+  const execOut = makeMockNode({ tag: "PRE", cls: ["cmd-exec-out"] }).append(mkText("line 1\nline 2"));
+  rowCmd.append(rowCmdHead, preCmd, makeMockNode({ tag: "DIV", cls: ["cmd-exec-panel"] }).append(execHead, execOut));
+
+  const rowWait = makeMockNode({ tag: "DIV", cls: ["arg-row", "arg-row-inline"] }).append(
+    makeMockNode({ tag: "SPAN", cls: ["arg-key"] }).append(mkText("WaitMsBeforeAsync")),
+    makeMockNode({ tag: "SPAN", cls: ["arg-val-inline"] }).append(mkText("5000"))
+  );
+  const resHead = makeMockNode({ tag: "DIV", cls: ["tool-result-head"] }).append(
+    makeMockNode({ tag: "SPAN", cls: ["badge"] }).append(mkText("OUTPUT\n")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("MODEL")),
+    makeMockNode({ tag: "SPAN", cls: ["status-pill"] }).append(mkText("DONE")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("⚠ EXIT: 1")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("19:51:23 · ⏱ 3.0s")),
+    makeMockNode({ tag: "BUTTON", cls: ["raw-btn"] }).append(mkText("{ }"))
+  );
+  const outPre = makeMockNode({ tag: "PRE", cls: ["generic-pre"] }).append(mkText("x86: error line 1\nline 2"));
+  rootFrag.append(stepHead, rowCmd, rowWait, resHead, outPre);
+
+  const copied = api.serializeFeedSelectionRange({
+    commonAncestorContainer: rootFrag,
+    cloneContents: () => rootFrag,
+  });
+  assert.equal(
+    copied,
+    "PLANNER #925 19:51:19\nCommandLine\npwsh -c Test-Path 'C:\\App\\x.exe'\npwsh EXIT: 1 ⏱ 2.2s cwd: C:\\workspace\\sample\nline 1\nline 2\nWaitMsBeforeAsync 5000 OUTPUT MODEL DONE ⚠ EXIT: 1 19:51:23 · ⏱ 3.0s\nx86: error line 1\nline 2",
+    "Copy handler must join all headers (.step-head, .arg-row-cmd-head, .cmd-exec-head, WaitMsBeforeAsync..OUTPUT) onto single lines without buttons while preserving multiline output"
+  );
+
+  // Direct selection strictly inside .cmd-exec-head must also serialize onto one single line
+  const execFrag = makeMockNode({ tag: "DIV" }).append(
+    makeMockNode({ tag: "SPAN", cls: ["cmd-exec-shell"] }).append(mkText("pwsh\n")),
+    makeMockNode({ tag: "SPAN", cls: ["meta-chip"] }).append(mkText("EXIT: 1\n")),
+    makeMockNode({ tag: "SPAN", cls: ["cmd-exec-cwd"] }).append(mkText("cwd: C:\\workspace\\sample"))
+  );
+  const execHeadCopied = api.serializeFeedSelectionRange({
+    commonAncestorContainer: execHead,
+    cloneContents: () => execFrag,
+  });
+  assert.equal(execHeadCopied, "pwsh EXIT: 1 cwd: C:\\workspace\\sample");
+
+  // Selection inside <input> must stay native (return null)
+  const inpEl = makeMockNode({ tag: "INPUT" });
+  assert.equal(api.serializeFeedSelectionRange({ commonAncestorContainer: inpEl, cloneContents: () => inpEl }), null);
 }
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");

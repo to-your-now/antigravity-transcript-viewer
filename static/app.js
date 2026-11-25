@@ -65,6 +65,7 @@
     projectFilter: document.getElementById("projectFilter"),
     convTitle: document.getElementById("convTitle"),
     convMeta: document.getElementById("convMeta"),
+    openProjTermBtn: document.getElementById("openProjTermBtn"),
     langSelect: document.getElementById("langSelect"),
     livePill: document.getElementById("livePill"),
     liveText: document.getElementById("liveText"),
@@ -749,15 +750,21 @@
       keySpan.dataset.tipRaw = `${k}: ${valStr.slice(0, 120)}`;
 
       if (isMultiline) {
-        row.className = k === replaceKey ? "arg-row arg-row-replacement" : "arg-row";
-        row.appendChild(keySpan);
+        row.className = k === replaceKey ? "arg-row arg-row-replacement" : (k === "CommandLine" ? "arg-row arg-row-command" : "arg-row");
 
         if (k === "CommandLine") {
+          const cmdHead = document.createElement("div");
+          cmdHead.className = "arg-row-cmd-head";
+          cmdHead.appendChild(keySpan);
+          attachCommandActionsToHead(cmdHead, row, valStr);
+          row.appendChild(cmdHead);
+
           const pre = document.createElement("pre");
           pre.className = "arg-val";
           renderCommandLineWithHighlight(pre, valStr);
           row.appendChild(pre);
         } else {
+          row.appendChild(keySpan);
           const argTargetPath = String(args.Path || args.TargetFile || "");
           const isArgMdFile = /\.(?:md|markdown)$/i.test(argTargetPath);
           const hasOtherExt = Boolean(argTargetPath) && !isArgMdFile && /\.[A-Za-z0-9]{1,10}$/i.test(argTargetPath);
@@ -1071,6 +1078,224 @@
     el.appendChild(preSpan);
     el.appendChild(sep);
     el.appendChild(mainSpan);
+  }
+
+  function attachCommandActionsToHead(headEl, rowEl, cmdRaw) {
+    const cleanCmd = String(cmdRaw || "").replace(/[\r\n\s]+$/g, "");
+    const bar = document.createElement("div");
+    bar.className = "cmd-actions-bar";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "copy-cmd-btn";
+    copyBtn.textContent = t("card.cmdCopyBtn");
+    copyBtn.title = t("card.cmdCopyTitle");
+    let copyTimer = 0;
+    copyBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const onDone = () => {
+        copyBtn.textContent = t("card.cmdCopiedBtn");
+        copyBtn.classList.add("is-copied");
+        clearTimeout(copyTimer);
+        copyTimer = setTimeout(() => {
+          copyBtn.textContent = t("card.cmdCopyBtn");
+          copyBtn.classList.remove("is-copied");
+        }, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cleanCmd).then(onDone).catch(() => {});
+      } else {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = cleanCmd;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+          onDone();
+        } catch (_) {}
+      }
+    });
+
+    const shellName = state.capabilities?.default_shell || "shell";
+    const runBtn = document.createElement("button");
+    runBtn.type = "button";
+    runBtn.className = "run-cmd-btn";
+    runBtn.textContent = t("card.cmdRunBtn");
+    runBtn.title = t("card.cmdRunTitle", { shell: shellName });
+
+    let execPanel = null;
+    const syncToolArgsExecClass = () => {
+      const toolArgsEl = rowEl.closest(".tool-args");
+      if (!toolArgsEl) return;
+      const hasOpenPanel = Boolean(toolArgsEl.querySelector(".cmd-exec-panel"));
+      toolArgsEl.classList.toggle("has-cmd-exec", hasOpenPanel);
+      scheduleCardOverflowCheck(toolArgsEl);
+    };
+    const executeCmd = async (triggerBtn) => {
+      if (runBtn.disabled) return;
+      runBtn.disabled = true;
+      runBtn.textContent = t("card.cmdRunning");
+      try {
+        const res = await fetch("/api/run-command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cmd: cleanCmd,
+            cwd: state.projectRoot || "",
+            conv: state.activeId || "",
+            lang: state.lang || "en",
+          }),
+        });
+        const data = await res.json();
+        preserveScrollAnchor(() => {
+          if (!execPanel) {
+            execPanel = document.createElement("div");
+            execPanel.className = "cmd-exec-panel";
+            rowEl.appendChild(execPanel);
+          }
+          syncToolArgsExecClass();
+          execPanel.innerHTML = "";
+          const hasErr = !data.ok || Boolean(data.timed_out) || Number(data.exit_code) !== 0;
+          execPanel.classList.toggle("is-error", hasErr);
+
+          const pHead = document.createElement("div");
+          pHead.className = "cmd-exec-head";
+
+          if (data.shell) {
+            const shEl = document.createElement("span");
+            shEl.className = "cmd-exec-shell";
+            shEl.textContent = data.shell;
+            pHead.appendChild(shEl);
+          }
+          if (data.ok) {
+            const exitEl = document.createElement("span");
+            const code = Number(data.exit_code ?? 0);
+            exitEl.className = `meta-chip ${code === 0 && !data.timed_out ? "exit-ok" : "exit-nonzero"}`;
+            exitEl.textContent = data.timed_out ? t("card.cmdTimeoutTag") : `EXIT: ${code}`;
+            pHead.appendChild(exitEl);
+
+            if (data.duration_ms !== undefined) {
+              const durEl = document.createElement("span");
+              durEl.className = "meta-chip";
+              const sec = (Number(data.duration_ms) / 1000).toFixed(data.duration_ms < 1000 ? 2 : 1);
+              durEl.textContent = `⏱ ${sec}${t("card.durationUnit")}`;
+              pHead.appendChild(durEl);
+            }
+          }
+          if (data.cwd) {
+            const cwdEl = document.createElement("span");
+            cwdEl.className = "cmd-exec-cwd";
+            cwdEl.textContent = t("card.cmdCwdLabel", { cwd: data.cwd });
+            pHead.appendChild(cwdEl);
+          }
+
+          const acts = document.createElement("span");
+          acts.className = "cmd-exec-actions";
+          const rerunBtn = document.createElement("button");
+          rerunBtn.type = "button";
+          rerunBtn.className = "cmd-exec-btn";
+          rerunBtn.textContent = t("card.cmdReRun");
+          rerunBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            executeCmd(rerunBtn);
+          });
+          const closeBtn = document.createElement("button");
+          closeBtn.type = "button";
+          closeBtn.className = "cmd-exec-btn";
+          closeBtn.textContent = t("card.cmdCloseOut");
+          closeBtn.title = t("card.cmdCloseOutTitle");
+          closeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            preserveScrollAnchor(() => {
+              if (execPanel) {
+                execPanel.remove();
+                execPanel = null;
+              }
+              syncToolArgsExecClass();
+            }, runBtn);
+          });
+          acts.appendChild(rerunBtn);
+          acts.appendChild(closeBtn);
+          pHead.appendChild(acts);
+          execPanel.appendChild(pHead);
+
+          const outPre = document.createElement("pre");
+          outPre.className = "cmd-exec-out inner-scroll";
+          attachInnerScrollGuard(outPre);
+          if (!data.ok) {
+            outPre.textContent = data.error || t("card.cmdExecError");
+          } else {
+            const parts = [];
+            if (data.stdout) parts.push(data.stdout);
+            if (data.stderr) parts.push(data.stderr);
+            const combined = parts.join(parts.length > 1 && !parts[0].endsWith("\n") ? "\n" : "");
+            outPre.textContent = combined || t("card.cmdEmptyOutput");
+            linkifyElement(outPre);
+          }
+          execPanel.appendChild(outPre);
+        }, triggerBtn || runBtn);
+      } catch (err) {
+        preserveScrollAnchor(() => {
+          if (!execPanel) {
+            execPanel = document.createElement("div");
+            execPanel.className = "cmd-exec-panel is-error";
+            rowEl.appendChild(execPanel);
+          }
+          syncToolArgsExecClass();
+          execPanel.classList.add("is-error");
+          execPanel.textContent = `${t("card.cmdExecError")}: ${err.message}`;
+        }, triggerBtn || runBtn);
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = t("card.cmdRunBtn");
+      }
+    };
+
+    const termBtn = document.createElement("button");
+    termBtn.type = "button";
+    termBtn.className = "term-cmd-btn";
+    termBtn.textContent = t("card.cmdTermBtn");
+    termBtn.title = t("card.cmdTermTitle", { shell: shellName });
+    termBtn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (termBtn.disabled) return;
+      termBtn.disabled = true;
+      termBtn.textContent = t("card.cmdTermOpening");
+      try {
+        const res = await fetch("/api/open-terminal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cmd: cleanCmd,
+            cwd: state.projectRoot || "",
+            conv: state.activeId || "",
+            lang: state.lang || "en",
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.error || t("card.cmdExecError"));
+        }
+      } catch (err) {
+        alert(`${t("card.cmdExecError")}: ${err.message}`);
+      } finally {
+        termBtn.disabled = false;
+        termBtn.textContent = t("card.cmdTermBtn");
+      }
+    });
+
+    runBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      executeCmd(runBtn);
+    });
+
+    bar.appendChild(copyBtn);
+    bar.appendChild(runBtn);
+    bar.appendChild(termBtn);
+    headEl.appendChild(bar);
   }
 
   function makeTipAttrs(title, desc, rawExample) {
@@ -5371,7 +5596,7 @@
 
     _pinBottomLockUntil = 0;
     _activeAnchorLock = null;
-    const jumpLock = { item, desiredTop, expiresAt: performance.now() + 1200, alignFn: alignToTarget };
+    const jumpLock = { item, desiredTop, expiresAt: performance.now() + 1500, alignFn: alignToTarget };
     _activeJumpLock = jumpLock;
     _suppressScrollTsUntil = performance.now() + 320;
     _suppressRoScrollCompUntil = performance.now() + 360;
@@ -5399,25 +5624,42 @@
       alignToTarget();
     }
 
-    requestAnimationFrame(() => {
-      if (_activeJumpLock !== jumpLock) return;
-      syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
-      measureMountedVWindowNow();
-      target = resolveTarget();
-      alignToTarget();
-    });
-    setTimeout(() => {
+    const syncAndAlignPass = () => {
       if (_activeJumpLock !== jumpLock || performance.now() >= jumpLock.expiresAt) return;
       syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
       measureMountedVWindowNow();
       target = resolveTarget();
       alignToTarget();
-    }, 90);
+    };
+    requestAnimationFrame(() => {
+      syncAndAlignPass();
+      // Second frame catches layout changes flushed by scheduleCardOverflowCheck on frame 1
+      requestAnimationFrame(syncAndAlignPass);
+    });
+    setTimeout(syncAndAlignPass, 90);
 
     target.classList.remove("step-flash");
     void target.offsetWidth;
     target.classList.add("step-flash");
     setTimeout(() => target.classList.remove("step-flash"), 1800);
+  }
+
+  function formatToolArgsForSnippet(args) {
+    if (!args || typeof args !== "object") return unescapeNewlines(args ?? "");
+    const parts = [];
+    for (const [k, v] of Object.entries(args)) {
+      if (v === undefined) continue;
+      let valPart;
+      if (typeof v === "string") {
+        valPart = `"${unescapeNewlines(v)}"`;
+      } else if (v === null || typeof v === "number" || typeof v === "boolean") {
+        valPart = String(v);
+      } else {
+        valPart = unescapeNewlines(JSON.stringify(v));
+      }
+      parts.push(`"${k}": ${valPart}`);
+    }
+    return `{ ${parts.join(", ")} }`;
   }
 
   function extractMatchSnippet(step, query, attachedOutputs = null) {
@@ -5451,7 +5693,7 @@
       step.tool_calls.forEach((tc, tcIdx) => {
         const out = Array.isArray(attachedOutputs) ? attachedOutputs[tcIdx] : null;
         const outPart = out ? ` #${out.step_index} ${out.status || ""} ${out.error || ""} ${out.content || ""}` : "";
-        sources.push([tc.name || "tool", `${tc.name || ""} ${JSON.stringify(tc.args || {})}${outPart}`]);
+        sources.push([tc.name || "tool", `${tc.name || ""} ${formatToolArgsForSnippet(tc.args || {})}${outPart}`]);
       });
     } else if (attachedText) {
       sources.push(["output", attachedText]);
@@ -7509,7 +7751,33 @@
       };
 
       if (visibleCards.length > 0) {
-        // Prefer the most specific visible matched element across ALL visible cards before falling back to outer hit boxes
+        // Lock visible step header FIRST so clearing search never pushes the currently viewed card's header out of viewport
+        const isHeadVisible = (card) => {
+          const headEl = card.querySelector(":scope > .step-head");
+          if (!headEl) return null;
+          const hr = headEl.getBoundingClientRect();
+          if (hr.height <= 0 || hr.top < wrapRect.top - 10 || hr.bottom <= wrapRect.top + 6 || hr.top >= wrapRect.bottom - 10) {
+            return null;
+          }
+          return { card, el: headEl, rect: hr };
+        };
+
+        const head0 = isHeadVisible(visibleCards[0].card);
+        if (head0) return buildAnchorFromEl(head0.card, head0.el);
+
+        // If top card is just a trailing sliver without visible marks and card #1's header is visible, lock card #1's header
+        if (visibleCards.length > 1 && visibleCards[0].rect.bottom <= wrapRect.top + 96) {
+          const hasMarkIn0 = Array.from(visibleCards[0].card.querySelectorAll("mark.hl")).some((m) => {
+            const mr = m.getBoundingClientRect();
+            return mr.height > 0 && mr.bottom > wrapRect.top + 6 && mr.top < wrapRect.bottom - 6;
+          });
+          if (!hasMarkIn0) {
+            const head1 = isHeadVisible(visibleCards[1].card);
+            if (head1) return buildAnchorFromEl(head1.card, head1.el);
+          }
+        }
+
+        // Only when scrolled past the card header into a long body/output, anchor the inner matched line/element
         const hitPick = pickAcrossCards([
           "mark.hl",
           ".search-hit-sub",
@@ -8529,6 +8797,33 @@
     } catch (_) {}
   }
 
+  if (els.openProjTermBtn) {
+    els.openProjTermBtn.addEventListener("click", async () => {
+      if (els.openProjTermBtn.disabled) return;
+      els.openProjTermBtn.disabled = true;
+      try {
+        const res = await fetch("/api/open-terminal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cmd: "",
+            cwd: state.projectRoot || "",
+            conv: state.activeId || "",
+            lang: state.lang || "en",
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.error || t("card.cmdExecError"));
+        }
+      } catch (err) {
+        alert(`${t("card.cmdExecError")}: ${err.message}`);
+      } finally {
+        els.openProjTermBtn.disabled = false;
+      }
+    });
+  }
+
   els.themeToggle.addEventListener("click", () => {
     const isDay = document.documentElement.getAttribute("data-theme") === "day";
     applyTheme(isDay ? "night" : "day");
@@ -8564,6 +8859,166 @@
     if (!step) return;
     e.preventDefault();
     toggleInlineRaw(card, step, card.querySelector(".raw-btn"));
+  });
+
+  function serializeFeedSelectionRange(range) {
+    if (!range) return null;
+    const ancEl =
+      range.commonAncestorContainer?.nodeType === 1
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer?.parentElement;
+    if (ancEl && ancEl.closest && ancEl.closest("input, textarea, select, [contenteditable='true']")) {
+      return null;
+    }
+
+    const INLINE_META_SEL = [
+      ".step-head",
+      ".tool-head",
+      ".tool-result-head",
+      ".cmd-exec-head",
+      ".arg-row-inline:not(.arg-row-stacked)",
+      ".arg-row-cmd-head",
+      ".tok-bar",
+      ".read-hidden-note",
+      "details.block > summary",
+      ".cache-map-details > summary",
+      ".cache-legend",
+      ".toc-options",
+      ".topbar-right",
+      ".conv-meta",
+      ".sidebar-header",
+      ".t-item-top",
+      ".t-sub",
+      ".modal-head",
+      ".cmd-group-head",
+      ".cmd-map-summary",
+      ".search-popover-head",
+      ".session-stats",
+    ].join(", ");
+
+    const insideMetaHeader = Boolean(ancEl && ancEl.closest && ancEl.closest(INLINE_META_SEL));
+    const frag = range.cloneContents();
+    const hasMetaBlock =
+      insideMetaHeader || Boolean(frag.querySelector && frag.querySelector(INLINE_META_SEL));
+    if (!hasMetaBlock) return null;
+
+    const SKIP_SEL =
+      ".raw-btn, .head-raw-btn, .copy-cmd-btn, .run-cmd-btn, .term-cmd-btn, .cmd-actions-bar, .copy-bar, .search-reveal-bar, .show-more-btn, .arg-md-toggle, .cmd-exec-actions, .code-gutter-num, .md-gutter-num, button";
+    const isInlineMetaEl = (el) => {
+      if (!el || !el.classList) return false;
+      if (el.classList.contains("arg-row-stacked")) return false;
+      if (el.matches && el.matches(INLINE_META_SEL)) return true;
+      return false;
+    };
+    const isBlockEl = (tag) =>
+      ["DIV", "P", "PRE", "ARTICLE", "SECTION", "BLOCKQUOTE", "UL", "OL", "LI", "TR", "TABLE", "H1", "H2", "H3", "H4", "SUMMARY", "DETAILS"].includes(
+        tag
+      );
+
+    const collectInlineMetaText = (root) => {
+      const pieces = [];
+      const walk = (node) => {
+        if (!node) return;
+        if (node.nodeType === 3) {
+          const s = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
+          if (s) pieces.push(s);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        if (node.matches && node.matches(SKIP_SEL)) return;
+        if (node.classList && node.classList.contains("hidden")) return;
+        for (const ch of node.childNodes) walk(ch);
+      };
+      walk(root);
+      return pieces.join(" ").replace(/\s+/g, " ").trim();
+    };
+
+    if (insideMetaHeader) {
+      const txt = collectInlineMetaText(frag);
+      return txt || "";
+    }
+
+    const segments = [];
+    let curBuf = "";
+    const flushBuf = () => {
+      const s = curBuf.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+      curBuf = "";
+      if (s) segments.push({ kind: "block", text: s });
+    };
+
+    const walk = (node) => {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        const val = String(node.nodeValue || "");
+        if (!curBuf && !val.trim()) return;
+        curBuf += val;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node.matches && node.matches(SKIP_SEL)) return;
+      if (node.classList && node.classList.contains("hidden")) return;
+      if (node.tagName === "BR") {
+        curBuf += "\n";
+        return;
+      }
+      if (isInlineMetaEl(node)) {
+        flushBuf();
+        const metaTxt = collectInlineMetaText(node);
+        const mKind = node.classList.contains("tool-result-head")
+          ? "res-head"
+          : (node.classList.contains("arg-row-inline") ? "arg-inline" : "head");
+        if (metaTxt) segments.push({ kind: mKind, text: metaTxt });
+        return;
+      }
+      const blk = isBlockEl(node.tagName);
+      if (blk) flushBuf();
+      for (const ch of node.childNodes) walk(ch);
+      if (blk) flushBuf();
+    };
+
+    for (const ch of frag.childNodes) walk(ch);
+    flushBuf();
+    if (!segments.length) return null;
+
+    let out = "";
+    let prevKind = null;
+    for (const seg of segments) {
+      const joinSameLine =
+        (prevKind === "arg-inline" || prevKind === "res-head") &&
+        (seg.kind === "arg-inline" || seg.kind === "res-head");
+      if (!out) {
+        out = seg.text;
+      } else if (joinSameLine) {
+        out += " " + seg.text;
+      } else {
+        out += "\n" + seg.text;
+      }
+      prevKind = seg.kind;
+    }
+    return out;
+  }
+
+  document.addEventListener("copy", (e) => {
+    const act = document.activeElement;
+    if (act && (act.tagName === "INPUT" || act.tagName === "TEXTAREA" || act.isContentEditable)) return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !e.clipboardData) return;
+    const parts = [];
+    let customized = false;
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const r = sel.getRangeAt(i);
+      const custom = serializeFeedSelectionRange(r);
+      if (custom !== null) {
+        customized = true;
+        if (custom) parts.push(custom);
+      } else {
+        const plain = r.toString();
+        if (plain) parts.push(plain);
+      }
+    }
+    if (!customized) return;
+    e.clipboardData.setData("text/plain", parts.join("\n"));
+    e.preventDefault();
   });
 
   // Localized focus-gated mouse wheel scrolling: inner boxes attach attachInnerScrollGuard() individually
