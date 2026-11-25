@@ -2214,25 +2214,6 @@ def send_text_to_antigravity_window(
         ops["send_ctrl"](VK_END)
         ops["sleep"](0.04)
 
-    def _log_paste_trace(
-        status_label: str,
-        *,
-        pre_ok: bool = False,
-        pre_len: int = 0,
-        after_ok: bool = False,
-        exp_len: int = 0,
-        got_len: int = 0,
-    ) -> None:
-        if _win_ops is not None:
-            return
-        fg_now = int(ops["get_foreground"]() or 0)
-        print(
-            f"[ag-paste] status={status_label} caller={caller_hwnd} ag={hwnd} fg={fg_now} "
-            f"pre=({pre_ok},{pre_len}) after=({after_ok},{got_len}/{exp_len})",
-            file=sys.stderr,
-            flush=True,
-        )
-
     switched_layout, orig_hkl = ops["switch_en"](hwnd)
     _trace(f"switch_en: switched={switched_layout} orig_hkl=0x{int(orig_hkl or 0):x}")
     try:
@@ -2248,7 +2229,6 @@ def send_text_to_antigravity_window(
             _deselect_to_end()
             ops["set_clip"](text)
             _trace(f"ABORT: code editor heuristic triggered (lines={line_count})")
-            _log_paste_trace("aborted_code_editor", pre_ok=pre_copy_ok, pre_len=len(pre_text))
             return False, _srv_t(lang, "agCodeEditorAborted", lines=line_count), "aborted_code_editor"
 
         if pre_text.strip() == "":
@@ -2257,7 +2237,6 @@ def send_text_to_antigravity_window(
             _deselect_to_end()
             if not ops["set_clip"](text):
                 _trace("ABORT: set_clip(text) failed")
-                _log_paste_trace("clipboard_error", pre_ok=pre_copy_ok, pre_len=len(pre_text))
                 return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
             ops["sleep"](0.035)
             ops["send_ctrl"](VK_V)
@@ -2286,14 +2265,6 @@ def send_text_to_antigravity_window(
                 )
                 _deselect_to_end()
                 ops["set_clip"](text)
-                _log_paste_trace(
-                    "verify_failed",
-                    pre_ok=pre_copy_ok,
-                    pre_len=len(pre_text),
-                    after_ok=after_ok,
-                    exp_len=len(norm_expected),
-                    got_len=len(norm_after),
-                )
                 msg = _srv_t(lang, "agVerifyFailed", title=title)
                 if not after_ok or len(norm_after) != len(norm_expected):
                     msg = f"{msg} [post={after_ok}:{len(norm_after)}/{len(norm_expected)}]"
@@ -2304,14 +2275,6 @@ def send_text_to_antigravity_window(
             ops["sleep"](0.04)
             ops["send_key"](VK_RETURN)
             _trace("ENTER sent")
-            _log_paste_trace(
-                "sent",
-                pre_ok=pre_copy_ok,
-                pre_len=len(pre_text),
-                after_ok=after_ok,
-                exp_len=len(norm_expected),
-                got_len=len(norm_after),
-            )
             if caller_hwnd and caller_hwnd != hwnd:
                 ops["schedule_restore"](1.8, caller_hwnd, hwnd)
                 _trace(f"schedule_restore(1.8s -> hwnd={caller_hwnd})")
@@ -2334,13 +2297,11 @@ def send_text_to_antigravity_window(
                 append_text = f"\n{text}"
         if not ops["set_clip"](append_text):
             _trace("ABORT: set_clip(append_text) failed")
-            _log_paste_trace("clipboard_error", pre_ok=pre_copy_ok, pre_len=len(pre_text))
             return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
         ops["sleep"](0.035)
         ops["send_ctrl"](VK_V)
         ops["sleep"](0.08)
         _trace("Ctrl+V (append) sent -> done")
-        _log_paste_trace("appended", pre_ok=pre_copy_ok, pre_len=len(pre_text))
         return True, title, "appended"
     finally:
         if switched_layout and orig_hkl:
