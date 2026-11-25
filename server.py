@@ -1764,10 +1764,34 @@ def _open_clipboard_retry(attempts: int = 10, delay_s: float = 0.012) -> bool:
     return False
 
 
-def _set_clipboard_unicode(text: str) -> bool:
+_CLIP_FORMAT_IDS: Dict[str, int] = {}
+_CLIP_EXCLUDE_NAMES = (
+    ("ExcludeClipboardContentFromMonitorProcessing", b"\x01\x00\x00\x00"),
+    ("CanIncludeInClipboardHistory", b"\x00\x00\x00\x00"),
+    ("CanUploadToCloudClipboard", b"\x00\x00\x00\x00"),
+    ("Clipboard Viewer Ignore", b"\x01\x00\x00\x00"),
+)
+_CLIP_PROBE_FORMAT_NAME = "AntigravityTranscriptViewerProbe"
+
+
+def _get_registered_clip_format(name: str) -> int:
+    fmt = _CLIP_FORMAT_IDS.get(name)
+    if fmt:
+        return fmt
+    user32 = ctypes.windll.user32
+    user32.RegisterClipboardFormatW.argtypes = [ctypes.wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = ctypes.wintypes.UINT
+    fmt = int(user32.RegisterClipboardFormatW(name) or 0)
+    if fmt:
+        _CLIP_FORMAT_IDS[name] = fmt
+    return fmt
+
+
+def _set_clipboard_bytes(fmt_id: int, raw_bytes: bytes) -> bool:
+    if not fmt_id or not raw_bytes:
+        return False
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
-    CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
 
     user32.SetClipboardData.argtypes = [ctypes.wintypes.UINT, ctypes.wintypes.HANDLE]
@@ -1777,27 +1801,73 @@ def _set_clipboard_unicode(text: str) -> bool:
     kernel32.GlobalLock.argtypes = [ctypes.wintypes.HGLOBAL]
     kernel32.GlobalLock.restype = ctypes.c_void_p
     kernel32.GlobalUnlock.argtypes = [ctypes.wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [ctypes.wintypes.HGLOBAL]
+
+    hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(raw_bytes))
+    if not hmem:
+        return False
+    ptr = kernel32.GlobalLock(hmem)
+    if not ptr:
+        kernel32.GlobalFree(hmem)
+        return False
+    try:
+        ctypes.memmove(ptr, raw_bytes, len(raw_bytes))
+    finally:
+        kernel32.GlobalUnlock(hmem)
+    if not user32.SetClipboardData(fmt_id, hmem):
+        kernel32.GlobalFree(hmem)
+        return False
+    return True
+
+
+def _attach_clipboard_ignore_flags() -> None:
+    """Attach Windows Clipboard History & third-party clipboard-monitor ignore formats (caller must hold OpenClipboard)."""
+    for fmt_name, payload in _CLIP_EXCLUDE_NAMES:
+        fmt_id = _get_registered_clip_format(fmt_name)
+        if fmt_id:
+            _set_clipboard_bytes(fmt_id, payload)
+
+
+def _set_clipboard_unicode(text: str, *, transient: bool = False) -> bool:
+    user32 = ctypes.windll.user32
+    CF_UNICODETEXT = 13
 
     data = text.encode("utf-16-le") + b"\x00\x00"
     if not _open_clipboard_retry():
         return False
     try:
         user32.EmptyClipboard()
-        hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-        if not hmem:
-            return False
-        ptr = kernel32.GlobalLock(hmem)
-        if not ptr:
-            return False
-        try:
-            ctypes.memmove(ptr, data, len(data))
-        finally:
-            kernel32.GlobalUnlock(hmem)
-        if not user32.SetClipboardData(CF_UNICODETEXT, hmem):
-            return False
-        return True
+        if transient:
+            _attach_clipboard_ignore_flags()
+        return _set_clipboard_bytes(CF_UNICODETEXT, data)
     finally:
         user32.CloseClipboard()
+
+
+def _set_clipboard_probe() -> bool:
+    """Set a text-free custom clipboard marker with history-ignore flags so clipboard managers never record probes."""
+    user32 = ctypes.windll.user32
+    probe_fmt = _get_registered_clip_format(_CLIP_PROBE_FORMAT_NAME)
+    if not probe_fmt:
+        return False
+    if not _open_clipboard_retry():
+        return False
+    try:
+        user32.EmptyClipboard()
+        _attach_clipboard_ignore_flags()
+        return _set_clipboard_bytes(probe_fmt, b"\x01\x00\x00\x00")
+    finally:
+        user32.CloseClipboard()
+
+
+def _has_clipboard_probe() -> bool:
+    user32 = ctypes.windll.user32
+    user32.IsClipboardFormatAvailable.argtypes = [ctypes.wintypes.UINT]
+    user32.IsClipboardFormatAvailable.restype = ctypes.wintypes.BOOL
+    probe_fmt = _get_registered_clip_format(_CLIP_PROBE_FORMAT_NAME)
+    if not probe_fmt:
+        return False
+    return bool(user32.IsClipboardFormatAvailable(probe_fmt))
 
 
 def _get_clipboard_unicode() -> str:
@@ -2109,6 +2179,8 @@ def _default_win_paste_ops() -> Dict[str, Any]:
         "set_clip": _set_clipboard_unicode,
         "get_clip": _get_clipboard_unicode,
         "clear_clip": _clear_clipboard,
+        "set_probe": _set_clipboard_probe,
+        "has_probe": _has_clipboard_probe,
         "clip_seq": lambda: int(user32.GetClipboardSequenceNumber()),
         "send_key": _send_key,
         "send_ctrl": _send_ctrl_combo,
@@ -2150,6 +2222,27 @@ def send_text_to_antigravity_window(
     VK_I = 0x49
     VK_V = 0x56
 
+    def _call_set_clip(val: str, *, transient: bool = False) -> bool:
+        fn = ops["set_clip"]
+        try:
+            return bool(fn(val, transient=transient))
+        except TypeError:
+            return bool(fn(val))
+
+    orig_clip_text = ""
+    try:
+        orig_clip_text = str(ops["get_clip"]() or "")
+    except Exception:
+        orig_clip_text = ""
+
+    def _restore_or_clear_clipboard() -> None:
+        if orig_clip_text:
+            _call_set_clip(orig_clip_text, transient=True)
+            _trace(f"clipboard restored (len={len(orig_clip_text)}, transient=True)")
+        else:
+            ops["clear_clip"]()
+            _trace("clipboard cleared (was empty)")
+
     hwnd, title = ops["find_window"](prefer_project, prefer_title)
     _trace(f"find_window -> hwnd={hwnd} title={title!r}")
     if not hwnd:
@@ -2160,14 +2253,20 @@ def send_text_to_antigravity_window(
     fg_after_focus = int(ops["get_foreground"]() or 0)
     _trace(f"focus_window: caller={caller_hwnd} -> target={hwnd} ok={focused_ok} fg_now={fg_after_focus}")
     if not focused_ok:
-        ops["set_clip"](text)
+        _call_set_clip(text, transient=False)
         _trace("ABORT: focus_window failed -> text copied to clipboard")
         return False, _srv_t(lang, "agFocusErr"), "focus_error"
 
     def _copy_focused(label: str, timeout_s: float = 0.35, select_delay_s: float = 0.08) -> Tuple[bool, str]:
-        probe = f"__AGY_CLIP_PROBE_{ops['clip_seq']()}__"
-        probe_ok = bool(ops["set_clip"](probe))
-        if not probe_ok:
+        set_probe = ops.get("set_probe")
+        has_probe = ops.get("has_probe")
+        use_probe = callable(set_probe) and callable(has_probe)
+        if use_probe:
+            probe_ok = bool(set_probe())
+            if not probe_ok:
+                ops["clear_clip"]()
+                use_probe = False
+        else:
             ops["clear_clip"]()
         seq0 = ops["clip_seq"]()
         ops["sleep"](0.02)
@@ -2180,28 +2279,31 @@ def send_text_to_antigravity_window(
             cur_seq = ops["clip_seq"]()
             if cur_seq != seq0:
                 seq_bumps += 1
-                ops["sleep"](0.025)
-                val = ops["get_clip"]()
-                if val == "":
+                if use_probe and has_probe():
+                    seq0 = cur_seq
+                else:
                     ops["sleep"](0.025)
                     val = ops["get_clip"]()
-                if val != probe:
+                    if val == "":
+                        ops["sleep"](0.025)
+                        val = ops["get_clip"]()
                     _trace(
                         f"{label}: OK (Ctrl+A -> Ctrl+C, seq {seq0}->{cur_seq}, bumps={seq_bumps}, "
                         f"len={len(val)}, preview={val[:35]!r})"
                     )
                     return True, val
-                seq0 = cur_seq
             ops["sleep"](0.015)
             elapsed += 0.015
-        val = ops["get_clip"]()
-        if val == probe:
+        if use_probe and has_probe():
             ops["clear_clip"]()
             _trace(
                 f"{label}: NO_CHANGE / TIMEOUT (probe unchanged after {int(timeout_s * 1000)}ms, "
                 f"seq0={seq0}, fg={ops['get_foreground']()})"
             )
             return False, ""
+        val = ops["get_clip"]()
+        if not val:
+            ops["clear_clip"]()
         _trace(
             f"{label}: FALLBACK (ok={bool(val)}, len={len(val)}, fg={ops['get_foreground']()}, preview={val[:35]!r})"
         )
@@ -2222,20 +2324,20 @@ def send_text_to_antigravity_window(
         ops["sleep"](0.22)
         _trace(f"Ctrl+I sent -> sleep 220ms -> fg={ops['get_foreground']()}")
 
-        # 2. Check existing input content via sentinel-probed Ctrl+A -> Ctrl+C
+        # 2. Check existing input content via text-free probe Ctrl+A -> Ctrl+C
         pre_copy_ok, pre_text = _copy_focused("pre_check", 0.30, select_delay_s=0.08)
         is_code, line_count = _looks_like_code_or_file_buffer(pre_text)
         if is_code:
             _deselect_to_end()
-            ops["set_clip"](text)
+            _call_set_clip(text, transient=False)
             _trace(f"ABORT: code editor heuristic triggered (lines={line_count})")
             return False, _srv_t(lang, "agCodeEditorAborted", lines=line_count), "aborted_code_editor"
 
         if pre_text.strip() == "":
-            _trace("branch=EMPTY -> deselect_to_end -> set_clip -> Ctrl+V")
+            _trace("branch=EMPTY -> deselect_to_end -> set_clip(transient) -> Ctrl+V")
             # 3a. Empty (or copy timed out): ALWAYS collapse selection + Ctrl+End BEFORE pasting so any hidden draft is never overwritten
             _deselect_to_end()
-            if not ops["set_clip"](text):
+            if not _call_set_clip(text, transient=True):
                 _trace("ABORT: set_clip(text) failed")
                 return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
             ops["sleep"](0.035)
@@ -2264,7 +2366,7 @@ def send_text_to_antigravity_window(
                     f"norm_got_len={len(norm_after)} first_diff_idx={diff_idx}"
                 )
                 _deselect_to_end()
-                ops["set_clip"](text)
+                _call_set_clip(text, transient=False)
                 msg = _srv_t(lang, "agVerifyFailed", title=title)
                 if not after_ok or len(norm_after) != len(norm_expected):
                     msg = f"{msg} [post={after_ok}:{len(norm_after)}/{len(norm_expected)}]"
@@ -2275,6 +2377,7 @@ def send_text_to_antigravity_window(
             ops["sleep"](0.04)
             ops["send_key"](VK_RETURN)
             _trace("ENTER sent")
+            _restore_or_clear_clipboard()
             if caller_hwnd and caller_hwnd != hwnd:
                 ops["schedule_restore"](1.8, caller_hwnd, hwnd)
                 _trace(f"schedule_restore(1.8s -> hwnd={caller_hwnd})")
@@ -2295,13 +2398,14 @@ def send_text_to_antigravity_window(
                 _trace("Shift+Enter sent before append paste")
             else:
                 append_text = f"\n{text}"
-        if not ops["set_clip"](append_text):
+        if not _call_set_clip(append_text, transient=True):
             _trace("ABORT: set_clip(append_text) failed")
             return False, _srv_t(lang, "agClipboardErr"), "clipboard_error"
         ops["sleep"](0.035)
         ops["send_ctrl"](VK_V)
-        ops["sleep"](0.08)
-        _trace("Ctrl+V (append) sent -> done")
+        ops["sleep"](0.10)
+        _trace("Ctrl+V (append) sent")
+        _restore_or_clear_clipboard()
         return True, title, "appended"
     finally:
         if switched_layout and orig_hkl:

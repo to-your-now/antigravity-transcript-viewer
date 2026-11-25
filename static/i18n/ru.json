@@ -151,7 +151,20 @@
     "traceCopied": "✓ Скопировано",
     "traceClose": "Закрыть лог",
     "traceToggleBtn": "LOG",
-    "traceToggleTitle": "Показать или скрыть лог последней вставки в Antigravity"
+    "traceToggleTitle": "Показать или скрыть лог последней вставки в Antigravity",
+    "quoteSelectionBtn": "↪ В композер",
+    "quoteSelectionBtnStep": "↪ В композер #{step}",
+    "quoteSelectionTitle": "Вставить выделенный фрагмент в поле ввода с привязкой к шагу (и проекту/логу, если открыта другая сессия)",
+    "quoteStepPrefix": "[Шаг #{step}]",
+    "quoteStepsPrefix": "[Шаги #{from}–#{to}]",
+    "quoteLogFallbackPrefix": "[Цитата из лога]",
+    "quoteOtherProjectHeader": "[Проект: {project} · {stepRef}]",
+    "quoteOlderSessionHeader": "[Прошлая сессия · проект: {project} · {stepRef}]",
+    "quoteProjectPathLine": "📁 Путь проекта: {path}",
+    "quoteLogPathLine": "📄 Лог: {path}",
+    "quoteStepOnlyWord": "Шаг #{step}",
+    "quoteStepsOnlyWord": "Шаги #{from}–#{to}",
+    "quoteSummaryWord": "Оглавление / сводка"
   },
   "cmdMap": {
     "modalTitle": "📊 Карта всех выполненных команд и событий",

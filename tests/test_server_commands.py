@@ -90,7 +90,14 @@ class ExecuteConsoleCommandTests(unittest.TestCase):
 
 
 class AntigravitySmartPasteTests(unittest.TestCase):
-    def _make_mock_ops(self, *, pre_text: str = "", force_verify_text=None, fail_first_copy: bool = False):
+    def _make_mock_ops(
+        self,
+        *,
+        pre_text: str = "",
+        force_verify_text=None,
+        fail_first_copy: bool = False,
+        initial_clip: str = "old clipboard",
+    ):
         VK_RETURN = 0x0D
         VK_END = 0x23
         VK_RIGHT = 0x27
@@ -102,7 +109,8 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         state = {
             "fg": 1001,  # Browser viewer window HWND
             "ag": 2002,  # Antigravity window HWND
-            "clip": "old clipboard",
+            "clip": initial_clip,
+            "probe": False,
             "seq": 10,
             "field": pre_text,
             "selected_all": False,
@@ -110,6 +118,8 @@ class AntigravitySmartPasteTests(unittest.TestCase):
             "events": [],
             "restored": [],
             "copy_calls": 0,
+            "probe_calls": 0,
+            "clip_writes": [],
         }
 
         def find_window(p="", t=""):
@@ -130,8 +140,10 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         def restore_hkl(h, hkl):
             state["events"].append(("hkl_restore", h, hkl))
 
-        def set_clip(txt):
+        def set_clip(txt, *, transient=False):
             state["clip"] = txt
+            state["probe"] = False
+            state["clip_writes"].append((txt, bool(transient)))
             state["seq"] += 1
             return True
 
@@ -140,7 +152,18 @@ class AntigravitySmartPasteTests(unittest.TestCase):
 
         def clear_clip():
             state["clip"] = ""
+            state["probe"] = False
             state["seq"] += 1
+
+        def set_probe():
+            state["clip"] = ""
+            state["probe"] = True
+            state["probe_calls"] += 1
+            state["seq"] += 1
+            return True
+
+        def has_probe():
+            return bool(state["probe"])
 
         def clip_seq():
             return state["seq"]
@@ -168,9 +191,11 @@ class AntigravitySmartPasteTests(unittest.TestCase):
                     return
                 if state["copy_calls"] == 2 and force_verify_text is not None:
                     state["clip"] = force_verify_text
+                    state["probe"] = False
                     state["seq"] += 1
                 elif state["field"]:
                     state["clip"] = state["field"]
+                    state["probe"] = False
                     state["seq"] += 1
             elif vk == VK_V:
                 if state["field"] == "" or state["selected_all"]:
@@ -198,6 +223,8 @@ class AntigravitySmartPasteTests(unittest.TestCase):
             "set_clip": set_clip,
             "get_clip": get_clip,
             "clear_clip": clear_clip,
+            "set_probe": set_probe,
+            "has_probe": has_probe,
             "clip_seq": clip_seq,
             "send_key": send_key,
             "send_ctrl": send_ctrl,
@@ -221,7 +248,7 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         self.assertGreaterEqual(ln, 6)
 
     def test_empty_input_verifies_submits_and_schedules_browser_restore(self) -> None:
-        state, ops = self._make_mock_ops(pre_text="")
+        state, ops = self._make_mock_ops(pre_text="", initial_clip="user previous clip")
         trace_lines = []
         ok, _info, status = server.send_text_to_antigravity_window(
             "Check tests and commit", lang="en", _win_ops=ops, trace_out=trace_lines
@@ -233,10 +260,24 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         self.assertEqual(state["restored"][0][1], 1001)
         self.assertEqual(state["restored"][0][2], 2002)
         self.assertEqual(state["events"][-1], ("hkl_restore", 2002, 0x0419))
+        self.assertGreaterEqual(state["probe_calls"], 2)
+        self.assertIn(("Check tests and commit", True), state["clip_writes"])
+        self.assertFalse(any("__AGY_CLIP_PROBE_" in txt for txt, _ in state["clip_writes"]))
+        self.assertEqual(state["clip"], "user previous clip")
+        self.assertEqual(state["clip_writes"][-1], ("user previous clip", True))
+        self.assertFalse(state["probe"])
         joined_trace = "\n".join(trace_lines)
         self.assertIn("focus_window:", joined_trace)
         self.assertIn("post_check_1: OK", joined_trace)
-        self.assertIn("ENTER sent", joined_trace)
+        self.assertIn("clipboard restored", joined_trace)
+
+        # When clipboard was originally empty, it stays empty after send
+        state_empty, ops_empty = self._make_mock_ops(pre_text="", initial_clip="")
+        ok_e, _ie, st_e = server.send_text_to_antigravity_window("Check", lang="en", _win_ops=ops_empty)
+        self.assertTrue(ok_e)
+        self.assertEqual(st_e, "sent")
+        self.assertEqual(state_empty["clip"], "")
+        self.assertFalse(state_empty["probe"])
 
     def test_verify_mismatch_aborts_enter_and_preserves_clipboard(self) -> None:
         state, ops = self._make_mock_ops(pre_text="", force_verify_text="")
@@ -249,9 +290,10 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         self.assertNotIn(("key", "ENTER"), state["events"])
         self.assertEqual(state["restored"], [])
         self.assertEqual(state["clip"], "Important prompt")
+        self.assertEqual(state["clip_writes"][-1], ("Important prompt", False))
 
     def test_non_empty_draft_appends_at_end_without_enter_or_restore(self) -> None:
-        state, ops = self._make_mock_ops(pre_text="First draft line\u200b")
+        state, ops = self._make_mock_ops(pre_text="First draft line\u200b", initial_clip="keep me")
         ok, _info, status = server.send_text_to_antigravity_window(
             "Second part", lang="ru", _win_ops=ops
         )
@@ -263,14 +305,19 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         self.assertIn(("shift", "ENTER"), state["events"])
         self.assertNotIn(("key", "ENTER"), state["events"])
         self.assertEqual(state["restored"], [])
+        self.assertIn(("Second part", True), state["clip_writes"])
+        self.assertEqual(state["clip"], "keep me")
+        self.assertEqual(state["clip_writes"][-1], ("keep me", True))
+        self.assertFalse(state["probe"])
 
-        # Existing trailing newline must not insert a redundant Shift+Enter
-        state_nl, ops_nl = self._make_mock_ops(pre_text="Line 1\n")
+        # Existing trailing newline must not insert a redundant Shift+Enter (and empty initial clip stays cleared)
+        state_nl, ops_nl = self._make_mock_ops(pre_text="Line 1\n", initial_clip="")
         ok_nl, _i, st_nl = server.send_text_to_antigravity_window("Line 2", lang="en", _win_ops=ops_nl)
         self.assertTrue(ok_nl)
         self.assertEqual(st_nl, "appended")
         self.assertEqual(state_nl["field"], "Line 1\nLine 2")
         self.assertNotIn(("shift", "ENTER"), state_nl["events"])
+        self.assertEqual(state_nl["clip"], "")
 
     def test_failed_pre_copy_never_overwrites_existing_draft(self) -> None:
         state, ops = self._make_mock_ops(pre_text="Existing user draft", fail_first_copy=True)
@@ -282,6 +329,22 @@ class AntigravitySmartPasteTests(unittest.TestCase):
         self.assertTrue(state["field"].startswith("Existing user draft"), "Old draft must never be overwritten even if pre-copy fails")
         self.assertIn("New text", state["field"])
         self.assertNotIn(("key", "ENTER"), state["events"])
+        self.assertFalse(state["probe"])
+        self.assertEqual(state["clip"], "New text")
+        self.assertEqual(state["clip_writes"][-1], ("New text", False))
+
+    def test_clipboard_ignore_formats_defined_and_no_text_probe_sent(self) -> None:
+        names = {name for name, _payload in server._CLIP_EXCLUDE_NAMES}
+        self.assertEqual(
+            names,
+            {
+                "ExcludeClipboardContentFromMonitorProcessing",
+                "CanIncludeInClipboardHistory",
+                "CanUploadToCloudClipboard",
+                "Clipboard Viewer Ignore",
+            },
+        )
+        self.assertEqual(server._CLIP_PROBE_FORMAT_NAME, "AntigravityTranscriptViewerProbe")
 
     def test_rich_text_zwsp_normalization_verifies_and_sends(self) -> None:
         state, ops = self._make_mock_ops(pre_text="", force_verify_text="\u200bCheck tests\r\n\ufeff")

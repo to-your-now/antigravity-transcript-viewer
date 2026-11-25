@@ -96,6 +96,7 @@
     promptInput: document.getElementById("promptInput"),
     composerStatus: document.getElementById("composerStatus"),
     composerLogRow: document.getElementById("composerLogRow"),
+    quoteToComposerBtn: document.getElementById("quoteToComposerBtn"),
     toggleComposerTraceBtn: document.getElementById("toggleComposerTraceBtn"),
     composerSendBtn: document.getElementById("composerSendBtn"),
     composerTraceBar: document.getElementById("composerTraceBar"),
@@ -7772,6 +7773,7 @@
     state.firstUnreadStepIndex = null;
     _lastShowBottom = false;
     syncJumpBottomButtonState(false);
+    if (els.quoteToComposerBtn) els.quoteToComposerBtn.classList.add("hidden");
     els.feedWrap.scrollTop = els.feedWrap.scrollHeight;
     _lastScrollFrameTop = els.feedWrap.scrollTop;
     syncVirtualWindow({ forceRender: true, upgradeSkeletons: true });
@@ -8005,6 +8007,7 @@
     state.firstUnreadStepIndex = null;
     _lastShowBottom = false;
     syncJumpBottomButtonState(false);
+    if (els.quoteToComposerBtn) els.quoteToComposerBtn.classList.add("hidden");
     _suppressHashChange = true;
     try {
       history.replaceState(
@@ -9825,11 +9828,8 @@
     return out;
   }
 
-  document.addEventListener("copy", (e) => {
-    const act = document.activeElement;
-    if (act && (act.tagName === "INPUT" || act.tagName === "TEXTAREA" || act.isContentEditable)) return;
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !e.clipboardData) return;
+  function extractFeedSelectionText(sel) {
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return { text: "", customized: false };
     const parts = [];
     let customized = false;
     for (let i = 0; i < sel.rangeCount; i++) {
@@ -9843,10 +9843,145 @@
         if (plain) parts.push(plain);
       }
     }
+    return { text: parts.join("\n"), customized };
+  }
+
+  document.addEventListener("copy", (e) => {
+    const act = document.activeElement;
+    if (act && (act.tagName === "INPUT" || act.tagName === "TEXTAREA" || act.isContentEditable)) return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !e.clipboardData) return;
+    const { text, customized } = extractFeedSelectionText(sel);
     if (!customized) return;
-    e.clipboardData.setData("text/plain", parts.join("\n"));
+    e.clipboardData.setData("text/plain", text);
     e.preventDefault();
   });
+
+  function resolveSelectionStepBounds(sel) {
+    if (!sel || sel.rangeCount === 0 || !els.feed) return { startStep: "", endStep: "" };
+    const toEl = (node) => (node ? (node.nodeType === 1 ? node : node.parentElement) : null);
+    let minNum = Infinity;
+    let maxNum = -Infinity;
+    let firstRaw = "";
+    let lastRaw = "";
+
+    const recordStep = (rawStep) => {
+      const s = String(rawStep ?? "").trim();
+      if (!s) return;
+      const n = Number(s);
+      if (Number.isFinite(n)) {
+        if (n < minNum) minNum = n;
+        if (n > maxNum) maxNum = n;
+      } else {
+        if (!firstRaw) firstRaw = s;
+        lastRaw = s;
+      }
+    };
+
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const r = sel.getRangeAt(i);
+      const startEl = toEl(r.startContainer);
+      const endEl = toEl(r.endContainer);
+      const resStart = startEl && startEl.closest ? startEl.closest(".tool-result") : null;
+      const resEnd = endEl && endEl.closest ? endEl.closest(".tool-result") : null;
+      if (resStart && resStart === resEnd) {
+        const outChip = resStart.querySelector(".tool-result-head .step-num-chip[data-copy-step]");
+        if (outChip && outChip.dataset.copyStep) {
+          recordStep(outChip.dataset.copyStep);
+          continue;
+        }
+      }
+      const cardStart = startEl && startEl.closest ? startEl.closest(".step[data-step-index]") : null;
+      const cardEnd = endEl && endEl.closest ? endEl.closest(".step[data-step-index]") : null;
+      if (cardStart && cardEnd && cardStart === cardEnd) {
+        recordStep(cardStart.dataset.stepIndex);
+        continue;
+      }
+      const cards = els.feed.querySelectorAll(".step[data-step-index]");
+      for (const c of cards) {
+        try {
+          if (r.intersectsNode(c)) recordStep(c.dataset.stepIndex);
+        } catch (_) {}
+      }
+      if (minNum === Infinity && !firstRaw) {
+        if (cardStart) recordStep(cardStart.dataset.stepIndex);
+        if (cardEnd) recordStep(cardEnd.dataset.stepIndex);
+      }
+    }
+
+    if (minNum !== Infinity) {
+      return { startStep: String(minNum), endStep: String(maxNum) };
+    }
+    return { startStep: firstRaw, endStep: lastRaw || firstRaw };
+  }
+
+  function formatQuoteForComposer(opts = {}) {
+    const raw = String(opts.text || "").replace(/\r\n?/g, "\n").trim();
+    if (!raw) return "";
+
+    const startStep =
+      opts.startStep !== undefined && opts.startStep !== null && String(opts.startStep).trim() !== ""
+        ? String(opts.startStep).trim()
+        : "";
+    const endStep =
+      opts.endStep !== undefined && opts.endStep !== null && String(opts.endStep).trim() !== ""
+        ? String(opts.endStep).trim()
+        : startStep;
+
+    const hasRange = Boolean(startStep && endStep && startStep !== endStep);
+    const hasSingle = Boolean(startStep && !hasRange);
+
+    const activeId = String(opts.activeId || "").trim();
+    const latestId = String(opts.latestId || "").trim();
+    const project = String(opts.project || "general").trim() || "general";
+    const latestProject = String(opts.latestProject || "").trim();
+    const projectRoot = String(opts.projectRoot || "").trim();
+    const logPath = String(opts.logPath || "").trim();
+    const title = String(opts.title || "").replace(/\s+/g, " ").trim();
+
+    const sameSession = Boolean(activeId && latestId && activeId === latestId);
+    const isDifferentProject = Boolean(
+      !sameSession &&
+        latestProject &&
+        project.toLowerCase() !== latestProject.toLowerCase()
+    );
+    const includeExternalContext = Boolean(activeId && latestId && !sameSession);
+
+    const headerLines = [];
+    if (includeExternalContext) {
+      const stepRef = hasRange
+        ? t("composer.quoteStepsOnlyWord", { from: startStep, to: endStep })
+        : hasSingle
+          ? t("composer.quoteStepOnlyWord", { step: startStep })
+          : t("composer.quoteSummaryWord");
+      headerLines.push(
+        isDifferentProject
+          ? t("composer.quoteOtherProjectHeader", { project, stepRef })
+          : t("composer.quoteOlderSessionHeader", { project, stepRef })
+      );
+      if (projectRoot) {
+        headerLines.push(t("composer.quoteProjectPathLine", { path: projectRoot }));
+      }
+      const shortTitle = title ? ` («${title.slice(0, 72)}${title.length > 72 ? "…" : ""}»)` : "";
+      if (logPath) {
+        headerLines.push(t("composer.quoteLogPathLine", { path: `${logPath}${shortTitle}` }));
+      } else if (activeId) {
+        headerLines.push(t("composer.quoteLogPathLine", { path: `conv=${activeId}${shortTitle}` }));
+      }
+    } else if (hasRange) {
+      headerLines.push(t("composer.quoteStepsPrefix", { from: startStep, to: endStep }));
+    } else if (hasSingle) {
+      headerLines.push(t("composer.quoteStepPrefix", { step: startStep }));
+    } else {
+      headerLines.push(t("composer.quoteLogFallbackPrefix"));
+    }
+
+    const quotedBody = raw
+      .split("\n")
+      .map((line) => (line ? `> ${line}` : ">"))
+      .join("\n");
+    return `${headerLines.join("\n")}\n${quotedBody}`;
+  }
 
   // Localized focus-gated mouse wheel scrolling: inner boxes attach attachInnerScrollGuard() individually
   // so main #feedWrap keeps native compositor-thread smooth scrolling everywhere else.
@@ -10573,6 +10708,123 @@
   });
   els.promptInput.addEventListener("blur", flushPendingSseSteps);
 
+  let _cachedFeedQuote = null;
+  let _quoteSelectionTimer = 0;
+
+  function getFeedSelectionQuoteInfo() {
+    if (!els.feed) return null;
+    const act = document.activeElement;
+    if (act && (act.tagName === "INPUT" || act.tagName === "TEXTAREA" || act.isContentEditable)) {
+      return null;
+    }
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+
+    let touchesFeed = false;
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const r = sel.getRangeAt(i);
+      const anc = r.commonAncestorContainer;
+      const ancEl = anc ? (anc.nodeType === 1 ? anc : anc.parentElement) : null;
+      if (!ancEl) continue;
+      if (ancEl.closest && ancEl.closest("input, textarea, select, [contenteditable='true']")) {
+        return null;
+      }
+      if (els.feed.contains(ancEl) || (ancEl.contains && ancEl.contains(els.feed) && r.intersectsNode && r.intersectsNode(els.feed))) {
+        touchesFeed = true;
+        break;
+      }
+    }
+    if (!touchesFeed) return null;
+
+    const { text: extracted } = extractFeedSelectionText(sel);
+    const cleaned = String(extracted || "").replace(/\r\n?/g, "\n").trim();
+    if (!cleaned) return null;
+    const { startStep, endStep } = resolveSelectionStepBounds(sel);
+    return { text: cleaned, startStep, endStep };
+  }
+
+  function syncQuoteSelectionButton(forceHide = false) {
+    if (!els.quoteToComposerBtn) return;
+    if (forceHide) {
+      _cachedFeedQuote = null;
+      els.quoteToComposerBtn.classList.add("hidden");
+      return;
+    }
+    const info = getFeedSelectionQuoteInfo();
+    _cachedFeedQuote = info;
+    if (!info) {
+      els.quoteToComposerBtn.classList.add("hidden");
+      return;
+    }
+    const stepLabel =
+      info.startStep && info.endStep && info.startStep !== info.endStep
+        ? `${info.startStep}–${info.endStep}`
+        : info.startStep || "";
+    els.quoteToComposerBtn.textContent = stepLabel
+      ? t("composer.quoteSelectionBtnStep", { step: stepLabel })
+      : t("composer.quoteSelectionBtn");
+    els.quoteToComposerBtn.title = t("composer.quoteSelectionTitle");
+    els.quoteToComposerBtn.classList.remove("hidden");
+  }
+
+  function scheduleQuoteSelectionSync() {
+    clearTimeout(_quoteSelectionTimer);
+    _quoteSelectionTimer = setTimeout(() => syncQuoteSelectionButton(false), 35);
+  }
+
+  function insertQuoteIntoComposer(quoteText) {
+    if (!quoteText || !els.promptInput) return;
+    if (els.appRoot && els.appRoot.classList.contains("composer-collapsed")) {
+      applyComposerCollapsed(false);
+    }
+    const existing = String(els.promptInput.value || "");
+    const trimmedRight = existing.replace(/[ \t\r\n]+$/, "");
+    const nextVal = trimmedRight ? `${trimmedRight}\n\n${quoteText}\n\n` : `${quoteText}\n\n`;
+    els.promptInput.value = nextVal;
+    _lastComposerTypeMs = Date.now();
+    els.promptInput.focus();
+    try {
+      const endPos = nextVal.length;
+      els.promptInput.setSelectionRange(endPos, endPos);
+    } catch (_) {}
+    els.promptInput.scrollTop = els.promptInput.scrollHeight;
+  }
+
+  if (els.quoteToComposerBtn) {
+    els.quoteToComposerBtn.addEventListener("mousedown", (e) => {
+      // Prevent clearing browser selection before click handler reads/uses it
+      e.preventDefault();
+    });
+    els.quoteToComposerBtn.addEventListener("click", () => {
+      const info = getFeedSelectionQuoteInfo() || _cachedFeedQuote;
+      if (!info) {
+        syncQuoteSelectionButton(true);
+        return;
+      }
+      const latest = Array.isArray(state.transcripts) && state.transcripts.length ? state.transcripts[0] : null;
+      const formatted = formatQuoteForComposer({
+        text: info.text,
+        startStep: info.startStep,
+        endStep: info.endStep,
+        activeId: state.activeId || "",
+        latestId: latest?.id || "",
+        project: state.activeMeta?.project || "",
+        latestProject: latest?.project || "",
+        projectRoot: state.projectRoot || "",
+        logPath: state.activeLogPath || state.activeMeta?.path || "",
+        title: state.activeMeta?.title || "",
+      });
+      insertQuoteIntoComposer(formatted);
+      try {
+        window.getSelection()?.removeAllRanges?.();
+      } catch (_) {}
+      syncQuoteSelectionButton(true);
+    });
+  }
+
+  document.addEventListener("selectionchange", scheduleQuoteSelectionSync);
+  document.addEventListener("mouseup", scheduleQuoteSelectionSync);
+
   els.promptInput.addEventListener("keydown", (e) => {
     _lastComposerTypeMs = Date.now();
     if (e.key === "Enter" && !e.shiftKey) {
@@ -10624,6 +10876,7 @@
     if (_lastComposerStatusMode) {
       setComposerStatus(_lastComposerStatusMode, _lastComposerWindowTitle);
     }
+    syncQuoteSelectionButton(false);
     renderSearchPopover();
     if (isSearchHistoryOpen()) renderSearchHistoryPopover();
     updateCmdMapButtonLabel();

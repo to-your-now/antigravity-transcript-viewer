@@ -94,8 +94,9 @@ const helpersCode = [
   sliceFunc(appJs, "formatToolArgsForSnippet"),
   sliceFunc(appJs, "extractMatchSnippet"),
   sliceFunc(appJs, "serializeFeedSelectionRange"),
+  sliceFunc(appJs, "formatQuoteForComposer"),
   sliceFunc(appJs, "addSearchHistoryEntry"),
-  `return { state, isCommandErrorStep, pairToolOutputs, getBgTaskResultOutcome, classifyToolCallOutcome, doesToolCallMatchCmdKeys, getStepMatchingCmdKeys, getStepCmdMapScope, buildCommandMapStats, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, filterUnitsByCmdMapScope, getVisibleTurnSearchUnits, getVisibleTurnSearchBlob, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; }, get stepPairedOutputsMap() { return stepPairedOutputsMap; } };`,
+  `return { state, isCommandErrorStep, pairToolOutputs, getBgTaskResultOutcome, classifyToolCallOutcome, doesToolCallMatchCmdKeys, getStepMatchingCmdKeys, getStepCmdMapScope, buildCommandMapStats, formatSpecialBracketTagsInHtml, formatPairedSystemTagsInHtml, renderSystemMessageBody, extractModelNamesFromSettings, updateStepModels, stepModelMap, parseHashNavigation, buildStepShareUrl, findTermOccurrences, parseSearchQuery, evalSearchAst, getPositiveSearchTerms, getTurnSearchBlob, getTurnSearchUnits, filterUnitsByCmdMapScope, getVisibleTurnSearchUnits, getVisibleTurnSearchBlob, stepMatchesFilter, buildStepMetadataAndTaskIndex, resolveTaskLinkDestination, formatToolArgsForSnippet, extractMatchSnippet, serializeFeedSelectionRange, formatQuoteForComposer, addSearchHistoryEntry, get taskIndexMap() { return taskIndexMap; }, get stepToolMetaMap() { return stepToolMetaMap; }, get stepTaskMetaMap() { return stepTaskMetaMap; }, get stepPairedOutputsMap() { return stepPairedOutputsMap; } };`,
 ].join("\n\n");
 
 const api = new Function(helpersCode)();
@@ -1355,6 +1356,71 @@ const makeAnchorRunner = (cards, items) => {
     api.state.searchFocusedOnly = prevSearchFocused;
     api.buildStepMetadataAndTaskIndex(prevSteps);
   }
+}
+
+// 19. Quote-to-composer formatting (latest session vs older project/session context) + #quoteToComposerBtn left of LOG
+{
+  const sameSessionQuote = api.formatQuoteForComposer({
+    text: "Traceback line 1\n  detail 2",
+    startStep: 42,
+    endStep: 42,
+    activeId: "conv-latest-111",
+    latestId: "conv-latest-111",
+    project: "transcript_viewer",
+    latestProject: "transcript_viewer",
+    projectRoot: "/repo/transcript_viewer",
+    logPath: "/logs/conv-latest-111/transcript_full.jsonl",
+  });
+  assert.equal(
+    sameSessionQuote,
+    "[Step #42]\n> Traceback line 1\n>   detail 2",
+    "Active latest session quote uses concise [Step #N] + blockquote without @[Quote]"
+  );
+  assert.ok(!sameSessionQuote.includes("@[Quote"), "Must never emit internal @[Quote] token");
+
+  const multiStepQuote = api.formatQuoteForComposer({
+    text: "first line\n\nlast line",
+    startStep: 41,
+    endStep: 43,
+    activeId: "conv-latest-111",
+    latestId: "conv-latest-111",
+  });
+  assert.equal(multiStepQuote, "[Steps #41–#43]\n> first line\n>\n> last line");
+
+  const otherProjectQuote = api.formatQuoteForComposer({
+    text: "Token monitor alert",
+    startStep: 118,
+    endStep: 118,
+    activeId: "conv-old-222",
+    latestId: "conv-latest-111",
+    project: "gcp-token-monitor",
+    latestProject: "transcript_viewer",
+    projectRoot: "/repo/gcp-token-monitor",
+    logPath: "/logs/conv-old-222/transcript_full.jsonl",
+    title: "Monitor Fix",
+  });
+  assert.ok(otherProjectQuote.startsWith("[Project: gcp-token-monitor · Step #118]\n"));
+  assert.ok(otherProjectQuote.includes("📁 Project root: /repo/gcp-token-monitor\n"));
+  assert.ok(otherProjectQuote.includes("📄 Log: /logs/conv-old-222/transcript_full.jsonl («Monitor Fix»)\n"));
+  assert.ok(otherProjectQuote.endsWith("\n> Token monitor alert"));
+
+  const olderSameProjectQuote = api.formatQuoteForComposer({
+    text: "Yesterday note",
+    startStep: 2823,
+    endStep: 2823,
+    activeId: "conv-old-333",
+    latestId: "conv-latest-111",
+    project: "transcript_viewer",
+    latestProject: "transcript_viewer",
+    projectRoot: "/repo/transcript_viewer",
+    logPath: "/logs/conv-old-333/transcript_full.jsonl",
+  });
+  assert.ok(olderSameProjectQuote.startsWith("[Previous session · Project: transcript_viewer · Step #2823]\n"));
+  assert.ok(olderSameProjectQuote.includes("📄 Log: /logs/conv-old-333/transcript_full.jsonl\n"));
+
+  const qIdx = indexHtml.indexOf('id="quoteToComposerBtn"');
+  const logIdx = indexHtml.indexOf('id="toggleComposerTraceBtn"');
+  assert.ok(qIdx !== -1 && logIdx !== -1 && qIdx < logIdx, "#quoteToComposerBtn must sit inside #composerLogRow directly left of LOG");
 }
 
 console.log("ALL VIEWER FEATURE UNIT TESTS PASSED!");

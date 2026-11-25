@@ -151,7 +151,20 @@
     "traceCopied": "✓ Copied",
     "traceClose": "Close log",
     "traceToggleBtn": "LOG",
-    "traceToggleTitle": "Show or hide last Antigravity paste log"
+    "traceToggleTitle": "Show or hide last Antigravity paste log",
+    "quoteSelectionBtn": "↪ To composer",
+    "quoteSelectionBtnStep": "↪ To composer #{step}",
+    "quoteSelectionTitle": "Insert selected text into composer with step & session context",
+    "quoteStepPrefix": "[Step #{step}]",
+    "quoteStepsPrefix": "[Steps #{from}–#{to}]",
+    "quoteLogFallbackPrefix": "[Log quote]",
+    "quoteOtherProjectHeader": "[Project: {project} · {stepRef}]",
+    "quoteOlderSessionHeader": "[Previous session · Project: {project} · {stepRef}]",
+    "quoteProjectPathLine": "📁 Project root: {path}",
+    "quoteLogPathLine": "📄 Log: {path}",
+    "quoteStepOnlyWord": "Step #{step}",
+    "quoteStepsOnlyWord": "Steps #{from}–#{to}",
+    "quoteSummaryWord": "Summary / TOC"
   },
   "cmdMap": {
     "modalTitle": "📊 Executed Commands & Events Map",
